@@ -8,7 +8,7 @@ on:
 jobs:
   base-convert:
     name: base-convert (build + test)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64, m4pro]
     defaults:
       run:
         working-directory: base-convert
@@ -23,7 +23,7 @@ jobs:
 
   node-binding:
     name: node binding (build + unit tests)
-    runs-on: macos-14
+    runs-on: [self-hosted, macOS, ARM64, m4pro]
     defaults:
       run:
         working-directory: bindings/node
@@ -38,7 +38,7 @@ jobs:
 
   rust-sys-abi:
     name: rust-sys ABI checks
-    runs-on: macos-14
+    runs-on: [self-hosted, macOS, ARM64, m4pro]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

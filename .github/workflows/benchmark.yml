@@ -18,7 +18,7 @@ on:
 
 jobs:
   bench:
-    runs-on: macos-14
+    runs-on: [self-hosted, macOS, ARM64, m4pro]
     steps:
       - uses: actions/checkout@v4
       - name: Fetch engine release
