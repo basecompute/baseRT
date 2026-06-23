@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  base-convert:
+    name: base-convert (build + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: base-convert
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all
+
+  node-binding:
+    name: node binding (build + unit tests)
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: bindings/node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npx tsc
+      - run: npm test          # struct-ABI + helper tests; no engine needed
+
+  rust-sys-abi:
+    name: rust-sys ABI checks
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The sys crate links the engine; pull the latest release if one exists so
+      # the ABI tests can build + run. Skips gracefully before the first release.
+      - name: Fetch engine
+        id: engine
+        run: |
+          mkdir -p build
+          if gh release download --repo ${{ github.repository }} \
+               --pattern 'baseRT-engine-macos-arm64*.tar.gz' -D build 2>/dev/null; then
+            tar -xzf build/baseRT-engine-macos-arm64*.tar.gz -C build
+            echo "have=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "no engine release yet — skipping engine-linked tests"
+            echo "have=0" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: cargo test (baseRT-sys)
+        if: steps.engine.outputs.have == '1'
+        working-directory: bindings/rust/baseRT-sys
+        run: cargo test
+        env:
+          BASERT_LIB_DIR: ${{ github.workspace }}/build

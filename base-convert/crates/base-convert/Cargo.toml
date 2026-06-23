@@ -1,0 +1,30 @@
+[package]
+name = "base-convert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "base-convert"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+indicatif.workspace = true
+half.workspace = true
+ed25519-dalek.workspace = true
+serde_json.workspace = true
+rand_core = { version = "0.6", features = ["getrandom"] }
+base-format.workspace = true
+base-quant.workspace = true
+base-awq.workspace = true
+base-readers.workspace = true
+base-arch.workspace = true
+base-sign.workspace = true
+memmap2.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

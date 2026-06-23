@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/base-format",
+    "crates/base-quant",
+    "crates/base-awq",
+    "crates/base-readers",
+    "crates/base-arch",
+    "crates/base-sign",
+    "crates/base-convert",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/prabod/baseRT"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# Internal crates
+base-format = { path = "crates/base-format" }
+base-quant = { path = "crates/base-quant" }
+base-awq = { path = "crates/base-awq" }
+base-readers = { path = "crates/base-readers" }
+base-arch = { path = "crates/base-arch" }
+base-sign = { path = "crates/base-sign" }
+
+# External
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+memmap2 = "0.9"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+half = { version = "2", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+bitflags = { version = "2", features = ["serde"] }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+indicatif = "0.17"
+rayon = "1"
+tempfile = "3"

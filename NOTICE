@@ -1,0 +1,15 @@
+base
+Copyright 2026 baseRT authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party dependencies
+------------------------
+`base-convert` depends on packages from crates.io declared in its `Cargo.toml`
+files; each retains its own license. The language bindings depend on packages
+from their respective registries (PyPI, npm, crates.io, Swift Package Manager)
+as declared in their manifests.
+
+This repository does not vendor third-party source. The baseRT engine binary,
+distributed separately via GitHub Releases, carries its own NOTICE for the
+components it vendors.

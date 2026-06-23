@@ -1,0 +1,41 @@
+name: Benchmark
+
+# Manually-triggered throughput benchmark against an engine release.
+# GitHub's macos-14 runners are Apple Silicon but shared, so numbers are
+# noisier than a dedicated machine — use for smoke/relative checks. For
+# publishable numbers run benchmarks/scripts/run_bench.sh on dedicated hardware.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: "URL to a .base model to benchmark"
+        required: true
+      reps:
+        description: "reps per test"
+        required: false
+        default: "5"
+
+jobs:
+  bench:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch engine release
+        run: |
+          mkdir -p build
+          gh release download --repo ${{ github.repository }} \
+            --pattern 'baseRT-engine-macos-arm64*.tar.gz' -D build
+          tar -xzf build/baseRT-engine-macos-arm64*.tar.gz -C build
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Fetch model
+        run: |
+          mkdir -p models
+          curl -fsSL "${{ inputs.model_url }}" -o models/model.base
+      - name: Run benchmark
+        run: REPS="${{ inputs.reps }}" benchmarks/scripts/run_bench.sh models/model.base
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmarks/results/*.csv

@@ -1,0 +1,4 @@
+module CBaseRT {
+    header "shim.h"
+    export *
+}
