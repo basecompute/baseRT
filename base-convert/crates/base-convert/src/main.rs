@@ -58,7 +58,7 @@ struct ConvertArgs {
     synthetic: bool,
 
     /// Canonical-quant profile JSON (e.g.
-    /// `tools/base-convert/profiles/dense-q4mix.json`). When set,
+    /// `profiles/default-q4.json`; see profiles/PROFILES.md). When set,
     /// per-tensor quant decisions come from the profile rules; the
     /// `--target` flag becomes the fallback for tensors the profile's
     /// catch-all `**.weight` rule should otherwise have covered. Sets
