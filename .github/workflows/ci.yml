@@ -5,9 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+# Self-hosted runner safety: a push only happens with write access, but a
+# pull_request can come from an external fork. Gate every job so PR runs execute
+# on the laptop runner ONLY for write-access authors (OWNER/MEMBER/COLLABORATOR);
+# fork PRs from outside contributors are skipped (have a maintainer push the
+# branch into the repo, or re-run after review). Also turn on
+# "Require approval for all outside collaborators" in repo Actions settings
+# before making this repo public.
 jobs:
   base-convert:
     name: base-convert (build + test)
+    if: github.event_name != 'pull_request' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
     runs-on: [self-hosted, macOS, ARM64, m4pro]
     defaults:
       run:
@@ -20,6 +28,7 @@ jobs:
 
   node-binding:
     name: node binding (build + unit tests)
+    if: github.event_name != 'pull_request' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
     runs-on: [self-hosted, macOS, ARM64, m4pro]
     defaults:
       run:
@@ -35,6 +44,7 @@ jobs:
 
   rust-sys-abi:
     name: rust-sys ABI checks
+    if: github.event_name != 'pull_request' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
     runs-on: [self-hosted, macOS, ARM64, m4pro]
     steps:
       - uses: actions/checkout@v4
