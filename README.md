@@ -67,6 +67,29 @@ print(m.generate_text("The capital of France is", max_tokens=64))
 
 Equivalent bindings exist for Node, Rust, and Swift — see [`bindings/`](bindings/).
 
+## Run the OpenAI-compatible server
+
+The engine bundle includes `baseRT_serve`, an OpenAI-compatible HTTP server.
+Run it from the repo root (the engine release unpacks into `build/`, where the
+server auto-detects its `baseRT.metallib`):
+
+```sh
+./build/baseRT_serve --model models/your-model.base --api-key "$(uuidgen)" --port 8080
+```
+
+Then call it like any OpenAI endpoint:
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"your-model.base","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+`baseRT_serve --help` lists the flags (continuous batching, paged-KV, prefix
+cache, rate limiting, etc.). See `SECURITY.md` before exposing it beyond
+localhost. The other bundled CLI tools — `baseRT_chat`, `baseRT_complete`,
+`baseRT_bench`, `baseRT_inspect`, `baseRT_transcribe` — work the same way.
+
 ## Benchmarks
 
 `benchmarks/scripts/` reproduces throughput numbers against the engine binary;
