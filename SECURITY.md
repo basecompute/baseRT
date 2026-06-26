@@ -37,7 +37,7 @@ depend on severity; we will coordinate disclosure with you.
 
 ## Hardening notes for operators
 
-The HTTP server shipped via `baseRT_serve` is intended for trusted
+The HTTP server shipped via `basert-serve` is intended for trusted
 networks. Before exposing it to a public network:
 
 - Always set `--api-key` to a non-empty value. The server will print a

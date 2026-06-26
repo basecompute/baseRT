@@ -3,6 +3,7 @@ use crate::slots::{read_slots, Slot};
 use crate::{Error, Result, BLOB_ALIGNMENT, FORMAT_VERSION, MAGIC, PREFIX_LEN};
 use memmap2::Mmap;
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 /// Zero-copy mmap reader for `.base` files.
@@ -76,6 +77,37 @@ impl BaseReader {
 
     pub fn header(&self) -> &Header {
         &self.header
+    }
+
+    /// Parse only the header without mmapping the whole file. Reads the
+    /// 16-byte prefix to learn `header_len`, then reads exactly the header
+    /// JSON. Cheap enough to scan a directory of multi-GB `.base` files for
+    /// a `list`-style catalog — `open()` would mmap each blob in full.
+    pub fn read_header<P: AsRef<Path>>(path: P) -> Result<Header> {
+        let mut file = File::open(path)?;
+
+        let mut prefix = [0u8; PREFIX_LEN as usize];
+        file.read_exact(&mut prefix).map_err(|e| match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => Error::Truncated,
+            _ => Error::Io(e),
+        })?;
+
+        let magic: [u8; 4] = prefix[0..4].try_into().unwrap();
+        if magic != MAGIC {
+            return Err(Error::BadMagic(magic));
+        }
+        let version = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
+        if version != FORMAT_VERSION {
+            return Err(Error::UnsupportedVersion(version, FORMAT_VERSION));
+        }
+        let header_len = u64::from_le_bytes(prefix[8..16].try_into().unwrap());
+
+        let mut header_bytes = vec![0u8; header_len as usize];
+        file.read_exact(&mut header_bytes).map_err(|e| match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => Error::HeaderOverflow(header_len),
+            _ => Error::Io(e),
+        })?;
+        Ok(Header::from_json_bytes(&header_bytes)?)
     }
 
     pub fn blob_offset(&self) -> u64 {

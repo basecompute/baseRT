@@ -36,7 +36,7 @@ The bindings look for `libbaseRT.dylib` in this order:
 ```python
 import baseRT
 
-with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
+with baseRT.Model("models/Qwen3-0.6B-Q4_0.base") as model:
     # Simple text generation
     text = model.generate_text("Once upon a time", max_tokens=128)
     print(text)
@@ -47,7 +47,7 @@ with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
 ```python
 import baseRT
 
-with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
+with baseRT.Model("models/Qwen3-0.6B-Q4_0.base") as model:
     for token_text in model.stream("The capital of France is", max_tokens=64):
         print(token_text, end="", flush=True)
     print()
@@ -58,7 +58,7 @@ with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
 ```python
 import baseRT
 
-with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
+with baseRT.Model("models/Qwen3-0.6B-Q4_0.base") as model:
     text = model.generate_text(
         "Write a haiku about programming:",
         max_tokens=64,
@@ -76,7 +76,7 @@ with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
 ```python
 import baseRT
 
-with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
+with baseRT.Model("models/Qwen3-0.6B-Q4_0.base") as model:
     def on_token(token_id: int, text: str) -> bool:
         print(text, end="", flush=True)
         return True  # return False to stop early
@@ -91,7 +91,7 @@ with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
 ```python
 import baseRT
 
-with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
+with baseRT.Model("models/Qwen3-0.6B-Q4_0.base") as model:
     # First turn
     stats = model.generate("User: Hi!\nAssistant:", max_tokens=64, callback=print_cb)
 
@@ -108,7 +108,7 @@ with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
 ```python
 import baseRT
 
-with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
+with baseRT.Model("models/Qwen3-0.6B-Q4_0.base") as model:
     cfg = model.config
     print(f"Architecture: {cfg.architecture}")
     print(f"Parameters:   {cfg.dim}d / {cfg.n_layers}L / {cfg.n_heads}H")
@@ -125,7 +125,7 @@ with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
 ```python
 import baseRT
 
-with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
+with baseRT.Model("models/Qwen3-0.6B-Q4_0.base") as model:
     tokens = model.encode("Hello, world!")
     print(f"Token IDs: {tokens}")
 
@@ -157,7 +157,7 @@ with baseRT.Model("models/whisper-base-en.bin") as model:
 ```python
 import baseRT
 
-with baseRT.Model("models/Qwen3-0.6B-Q4_0.gguf") as model:
+with baseRT.Model("models/Qwen3-0.6B-Q4_0.base") as model:
     tokens = model.encode("Hello")
     first_token = model.prefill(tokens)
     print(f"First token: {model.decode_token(first_token)}")

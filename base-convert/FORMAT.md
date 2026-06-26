@@ -552,7 +552,7 @@ When baseRT is pointed at a `.gguf` / `.safetensors` / safetensors-dir, it:
    hash for a directory).
 2. Checks `~/.cache/baseRT/converted/<input_hash>.base`.
 3. If present: mmap and load.
-4. If absent: shell out to `base-convert <input> -o <cache-path>`, show
+4. If absent: shell out to `basert convert <input> -o <cache-path>`, show
    progress, then load.
 
 The cache path can be overridden with `--cache-dir`. `--force-reconvert`

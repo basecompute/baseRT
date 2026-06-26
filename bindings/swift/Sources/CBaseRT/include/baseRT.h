@@ -63,8 +63,8 @@ extern "C" {
 // === Versioning ===
 
 #define BASERT_VERSION_MAJOR 0
-#define BASERT_VERSION_MINOR 2
-#define BASERT_VERSION_PATCH 0
+#define BASERT_VERSION_MINOR 4
+#define BASERT_VERSION_PATCH 1
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
@@ -82,7 +82,7 @@ typedef void *baseRT_model_t;
 
 /// Load a model from a `.base` bundle (or whisper.cpp GGML file).
 /// Other source formats (GGUF, HF safetensors, MLX safetensors) must be
-/// converted offline first via `base-convert`.
+/// converted offline first via `basert convert`.
 /// kernel_library_path: path to the compiled GPU kernel library (on the Metal
 ///   backend, baseRT.metallib), or NULL to auto-detect. Auto-detect order: a
 ///   kernel library next to the build, then a copy embedded in the loaded
@@ -532,7 +532,7 @@ int baseRT_prefill_profile_count(baseRT_model_t model, int index);
 // Run prefill in calibration mode: every linear-layer activation gets a
 // per-input-channel absmax reduction whose result is keyed by canonical
 // tensor name. Output is a JSON sidecar matching the AwqProfile schema
-// consumed by `base-convert --awq-profile <path>`.
+// consumed by `basert convert --awq-profile <path>`.
 //
 // Usage:
 //   baseRT_calibrate_begin(model, "<fingerprint>");

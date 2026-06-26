@@ -5,7 +5,7 @@ Reproduce baseRT throughput numbers on your own hardware.
 ## Prerequisites
 
 1. Download an engine release and unpack it into `build/` at the repo root
-   (see the top-level README's "Getting the engine"). You need `build/baseRT_bench`.
+   (see the top-level README's "Getting the engine"). You need `build/basert-bench`.
 2. Convert a model to `.base` (see `base-convert/`) into `models/`.
 
 ## Run

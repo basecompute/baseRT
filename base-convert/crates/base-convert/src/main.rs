@@ -2,10 +2,26 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-/// Convert GGUF / MLX-safetensors / HF-safetensors models to the `.base`
-/// cache format used by baseRT.
+mod hub;
+
+/// Listed in `basert --help` so the dispatched runtime tools are discoverable
+/// (clap's external-subcommand catch-all is otherwise invisible in help).
+const RUNTIME_TOOLS_HELP: &str = "\
+Runtime tools (forwarded to the matching `basert-<cmd>` binary):
+  serve       Start the OpenAI-compatible HTTP server
+  chat        Interactive chat
+  complete    One-shot text completion
+  bench       Throughput benchmark
+  profile     Profile prefill/decode timing
+  transcribe  Audio transcription
+
+Run `basert <tool> --help` for a tool's own options.";
+
+/// The `basert` CLI: the model hub (pull/list from HuggingFace), the offline
+/// GGUF / MLX-safetensors / HF-safetensors → `.base` converter, and a
+/// launcher for the runtime tools (`basert serve`, `basert chat`, …).
 #[derive(Parser, Debug)]
-#[command(name = "base-convert", version, about)]
+#[command(name = "basert", version, about, after_help = RUNTIME_TOOLS_HELP)]
 struct Args {
     #[command(subcommand)]
     cmd: Cmd,
@@ -23,6 +39,15 @@ enum Cmd {
     Inspect(InspectArgs),
     /// Generate an ed25519 keypair for signing.
     Keygen(KeygenArgs),
+    /// Download a model into the local hub cache (pre-converted `.base` from
+    /// the BaseRT catalog, or an HF repo converted on the fly).
+    Pull(PullArgs),
+    /// List models in the local hub cache (and, with `--remote`, the catalog).
+    List(ListArgs),
+    /// Runtime tools — `serve`, `chat`, `complete`, `bench`, … — forwarded to
+    /// the matching engine binary (`basert-<cmd>`).
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[derive(Parser, Debug)]
@@ -58,7 +83,7 @@ struct ConvertArgs {
     synthetic: bool,
 
     /// Canonical-quant profile JSON (e.g.
-    /// `profiles/default-q4.json`; see profiles/PROFILES.md). When set,
+    /// `base-convert/profiles/default-q4.json`). When set,
     /// per-tensor quant decisions come from the profile rules; the
     /// `--target` flag becomes the fallback for tensors the profile's
     /// catch-all `**.weight` rule should otherwise have covered. Sets
@@ -149,6 +174,38 @@ enum AwqMode {
     None,
 }
 
+#[derive(Parser, Debug)]
+struct PullArgs {
+    /// Model id: `basecompute/<name>` (pre-converted, from the catalog) or
+    /// `org/model` (a raw HF repo, downloaded + converted locally).
+    id: String,
+    /// Override the auto-selected quant profile (path to a profile JSON).
+    #[arg(long)]
+    profile: Option<PathBuf>,
+    /// Target quant scheme for convert-on-pull when no profile applies.
+    #[arg(long, value_enum, default_value_t = TargetScheme::BaseQ4)]
+    target: TargetScheme,
+    /// HF revision / branch / tag.
+    #[arg(long, default_value = "main")]
+    revision: String,
+    /// Re-download / re-convert even if already cached.
+    #[arg(long)]
+    force: bool,
+    /// Resolve and print the plan without downloading anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Parser, Debug)]
+struct ListArgs {
+    /// Also list catalog models that aren't installed yet.
+    #[arg(long)]
+    remote: bool,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    json: bool,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd {
@@ -157,6 +214,9 @@ fn main() -> Result<()> {
         Cmd::Verify(a) => cmd_verify(a),
         Cmd::Inspect(a) => cmd_inspect(a),
         Cmd::Keygen(a) => cmd_keygen(a),
+        Cmd::Pull(a) => hub::cmd_pull(a),
+        Cmd::List(a) => hub::cmd_list(a),
+        Cmd::External(argv) => hub::dispatch_external(argv),
     }
 }
 

@@ -5,8 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+# Binary is `basert` (the public CLI name); the package stays `base-convert`
+# so `cargo build -p base-convert` and crate paths are stable. "baseRT" is the
+# internal runtime name and is not exposed in the public CLI.
 [[bin]]
-name = "base-convert"
+name = "basert"
 path = "src/main.rs"
 
 [dependencies]
@@ -23,8 +26,10 @@ base-awq.workspace = true
 base-readers.workspace = true
 base-arch.workspace = true
 base-sign.workspace = true
+base-hub.workspace = true
 memmap2.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -2,7 +2,7 @@
 # Uzu benchmark — apples-to-apples comparison using serve endpoint
 # Starts uzu serve, calibrates prompt length to hit exact token targets
 # (accounting for chat template overhead), then benchmarks at pp128/pp256/pp512.
-# Matches baseRT_bench methodology: controlled token counts, separate pp and tg.
+# Matches basert-bench methodology: controlled token counts, separate pp and tg.
 #
 # Uzu is an external project (https://github.com/...). UZU_DIR must
 # point to a checkout of it; we don't pick a default because the layout
