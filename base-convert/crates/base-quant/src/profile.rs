@@ -3,7 +3,7 @@
 //! Profiles are reusable JSON configs that name a set of per-tensor
 //! quant rules. The converter takes `--profile <path>` and the
 //! resulting bundle records the profile name in `quant_profile` for
-//! audit. See `tools/base-convert/profiles/*.json`.
+//! audit. See `base-convert/profiles/*.json`.
 //!
 //! Glob syntax (per `CANONICAL_QUANT_SPEC.md`):
 //!   - `*`    matches anything except `.`
@@ -425,7 +425,7 @@ mod tests {
     /// in on-disk profile JSON before they hit the converter.
     #[test]
     fn shipped_default_profiles_parse() {
-        // Profiles live at <repo>/tools/base-convert/profiles/. Walk up
+        // Profiles live at <repo>/base-convert/profiles/. Walk up
         // from CARGO_MANIFEST_DIR (= the base-quant crate) to that path.
         let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         let profiles_dir = std::path::Path::new(&manifest)

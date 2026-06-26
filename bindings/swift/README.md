@@ -7,7 +7,7 @@ package is self-contained and builds against the prebuilt engine.
 ## Requirements
 
 - macOS 13+ / iOS 16+, Swift 5.9+
-- The prebuilt engine: run downloading an engine release (see the top-level README "Getting the engine") in the repo root to produce
+- The prebuilt engine: run `make shared` in the repo root to produce
   `build/libbaseRT.dylib`. The dylib carries the Metal kernels **embedded**,
   so there is no separate `baseRT.metallib` to ship or locate at runtime.
 

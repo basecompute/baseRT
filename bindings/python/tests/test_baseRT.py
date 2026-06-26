@@ -509,7 +509,7 @@ class TestModelLoadError:
         """Loading a nonexistent model should raise either OSError (lib not found)
         or BaseRTError (lib found but model load fails)."""
         with pytest.raises((OSError, BaseRTError)):
-            baseRT.Model("/nonexistent/path/to/model.gguf")
+            baseRT.Model("/nonexistent/path/to/model.base")
 
 
 # -------------------------------------------------------------------------

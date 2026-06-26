@@ -4,7 +4,7 @@ BaseRT -- Python bindings for the BaseRT LLM inference engine (Apple Silicon / M
 Usage:
     import baseRT
 
-    with baseRT.Model("model.gguf") as m:
+    with baseRT.Model("model.base") as m:
         for token in m.generate("Hello, world!", max_tokens=128):
             print(token, end="", flush=True)
 """
@@ -596,7 +596,7 @@ class Model:
 
     Supports use as a context manager::
 
-        with baseRT.Model("model.gguf") as m:
+        with baseRT.Model("model.base") as m:
             print(m.generate_text("Once upon a time"))
     """
 

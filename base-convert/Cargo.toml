@@ -7,6 +7,7 @@ members = [
     "crates/base-readers",
     "crates/base-arch",
     "crates/base-sign",
+    "crates/base-hub",
     "crates/base-convert",
 ]
 
@@ -25,6 +26,7 @@ base-awq = { path = "crates/base-awq" }
 base-readers = { path = "crates/base-readers" }
 base-arch = { path = "crates/base-arch" }
 base-sign = { path = "crates/base-sign" }
+base-hub = { path = "crates/base-hub" }
 
 # External
 anyhow = "1"
@@ -41,3 +43,8 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 indicatif = "0.17"
 rayon = "1"
 tempfile = "3"
+# Sync-only `api::sync` client (ureq 3 → rustls; no tokio/reqwest/OpenSSL).
+# 0.5 is required: it resolves HF's relative `Location` redirects, which 0.3.2
+# could not (HF now 307s `resolve/...` to a relative `/api/resolve-cache/...`).
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+dirs = "5"

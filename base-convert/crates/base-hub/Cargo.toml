@@ -1,0 +1,18 @@
+[package]
+name = "base-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+base-format.workspace = true
+hf-hub.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

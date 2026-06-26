@@ -6,7 +6,7 @@
 # - Writes a flat CSV and a markdown summary.
 #
 # Env knobs:
-#   BASERT_BIN   : path to baseRT_bench    (default: ../../build/baseRT_bench)
+#   BASERT_BIN   : path to basert-bench    (default: ../../build/basert-bench)
 #   MODELS_DIR   : local model directory    (default: ../../models)
 #   LLAMA_BENCH  : path to llama-bench      (default: llama-bench on PATH)
 #   MLX_BENCH    : path to mlx_lm.benchmark (default: uv-run wrapper below)
@@ -23,7 +23,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-BASERT_BIN="${BASERT_BIN:-$REPO_ROOT/build/baseRT_bench}"
+BASERT_BIN="${BASERT_BIN:-$REPO_ROOT/build/basert-bench}"
 MODELS_DIR="${MODELS_DIR:-$REPO_ROOT/models}"
 LLAMA_BENCH="${LLAMA_BENCH:-llama-bench}"
 # Default MLX wrapper: assumes uv is available and pulls mlx-lm in a throwaway env.
@@ -125,7 +125,7 @@ run_baseRT() {
   echo "    baseRT pp${pp}/tg${tg}..."
   local out
   out=$("$BASERT_BIN" "$model_path" -p "$pp" -n "$tg" -r "$REPS" 2>&1) || {
-    echo "      ERROR: baseRT_bench failed"; return
+    echo "      ERROR: basert-bench failed"; return
   }
   parse_baseRT "$out" "$label"
 }

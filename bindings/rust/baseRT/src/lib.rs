@@ -8,7 +8,7 @@
 //! ```no_run
 //! use baseRT::{Model, SamplingConfig};
 //!
-//! let model = Model::load("model.gguf", None, 0).unwrap();
+//! let model = Model::load("model.base", None, 0).unwrap();
 //! let tokens = model.encode("Hello, world!").unwrap();
 //!
 //! let stats = model.generate(&tokens, 256, SamplingConfig::greedy(), |_id, text| {
@@ -180,9 +180,9 @@ impl Drop for Model {
 }
 
 impl Model {
-    /// Load a model from a GGUF file or MLX SafeTensors directory.
+    /// Load a model from a `.base` bundle.
     ///
-    /// - `model_path`: path to the model file or directory.
+    /// - `model_path`: path to the `.base` bundle.
     /// - `kernel_library_path`: optional path to the compiled GPU kernel library
     ///   (on Metal, `baseRT.metallib`). Pass `None` to auto-detect — including
     ///   the copy embedded in the single-file `libbaseRT` dylib.
@@ -646,7 +646,7 @@ impl Model {
     }
 
     /// Get raw tensor dtype string by index (e.g. "F16", "BF16").
-    /// Returns `None` for GGUF models.
+    /// Returns `None` if the tensor has no recorded raw dtype string.
     pub fn tensor_raw_dtype(&self, index: i32) -> Option<String> {
         let ptr = unsafe { baseRT_sys::baseRT_tensor_raw_dtype(self.handle, index) };
         if ptr.is_null() {
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn model_load_nonexistent_path_returns_err() {
-        let result = Model::load("/nonexistent/path/to/model.gguf", None, 0);
+        let result = Model::load("/nonexistent/path/to/model.base", None, 0);
         assert!(result.is_err());
         if let Err(Error::Api(msg)) = &result {
             // The error message should contain something meaningful
@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn model_load_metallib_with_interior_nul_returns_err() {
-        let result = Model::load("model.gguf", Some("bad\0path"), 0);
+        let result = Model::load("model.base", Some("bad\0path"), 0);
         assert!(result.is_err());
         assert!(matches!(result, Err(Error::InvalidString(_))));
     }

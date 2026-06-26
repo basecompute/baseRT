@@ -2,7 +2,7 @@
 # BaseRT on MLX-format models — with 30s cooldown between models to avoid thermal throttling
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BASERT="${BASERT:-$REPO_ROOT/build/baseRT_bench}"
+BASERT="${BASERT:-$REPO_ROOT/build/basert-bench}"
 CACHE="${CACHE:-$HOME/.cache/huggingface/hub}"
 RESULTS="${RESULTS:-/tmp/bench_baseRT_mlx_cool.csv}"
 

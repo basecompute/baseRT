@@ -12,7 +12,7 @@ built engine.
 ## Prerequisites
 
 - Node.js >= 18, macOS with Apple Silicon
-- The prebuilt engine: downloading an engine release (see the top-level README "Getting the engine") in the repo root → `build/libbaseRT.dylib`.
+- The prebuilt engine: `make shared` in the repo root → `build/libbaseRT.dylib`.
   The dylib carries the Metal kernels **embedded**, so there is no separate
   `baseRT.metallib` to locate at runtime.
 

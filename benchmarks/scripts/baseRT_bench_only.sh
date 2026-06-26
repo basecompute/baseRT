@@ -2,7 +2,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MODELS_DIR="${MODELS_DIR:-$REPO_ROOT/models}"
-BASERT="${BASERT:-$REPO_ROOT/build/baseRT_bench}"
+BASERT="${BASERT:-$REPO_ROOT/build/basert-bench}"
 RESULTS="${RESULTS:-/tmp/bench_results_baseRT.csv}"
 
 echo "model,size_mb,engine,test,tok_per_sec,stddev" > "$RESULTS"

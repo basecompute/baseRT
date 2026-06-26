@@ -152,7 +152,7 @@ Three new top-level fields:
 ```jsonc
 {
   "target_backend": "metal",          // metal | cuda_sm89 | cuda_sm90 | rocm_cdna3 | cpu_avx2 | cpu_neon
-  "quant_profile": "gemma4-moe-q4mix-v1",  // identifier of the profile used at convert time
+  "quant_profile": "example-q4mix-v1",  // identifier of the profile used at convert time
   "calibration": { "method": "awq", "tokens": 1024, "dataset": "wikitext-103" }
 }
 ```
@@ -174,14 +174,14 @@ backwards-compat with current `base_q4` bundles):
 
 ## Quant profile JSON
 
-Profiles live in `tools/base-convert/profiles/`. Reusable + diffable.
+Profiles live in `base-convert/profiles/`. Reusable + diffable.
 The converter consumes one via `--profile <path>`; the resulting
 bundle records the profile name in `quant_profile` for audit.
 
 ```jsonc
-// profiles/gemma4-moe-q4mix-v1.json
+// profiles/example-q4mix-v1.json
 {
-  "name": "gemma4-moe-q4mix-v1",
+  "name": "example-q4mix-v1",
   "arch": "gemma4",
   "calibration": { "method": "awq", "tokens": 1024, "dataset": "wikitext-103" },
   "rules": [
