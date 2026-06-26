@@ -29,3 +29,6 @@ bindings/swift/Package.resolved
 .DS_Store
 .vscode/
 .idea/
+
+# MkDocs build output
+site/

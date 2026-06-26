@@ -1,132 +1,119 @@
 # BaseRT
 
-The open **`.base` model format**, the **`basert`** CLI (model hub + converter),
-and the official **language bindings** for the **BaseRT** inference engine — an
-LLM runtime for Apple Silicon (Metal).
+**A fast LLM inference runtime for Apple Silicon (Metal).** Pull a model, chat
+with it, or serve an OpenAI-compatible API — all from one CLI, `basert`.
 
-This repository is the open ecosystem around BaseRT:
+The engine ships as a single self-contained `libbaseRT.dylib` (Metal kernels
+embedded) plus the `basert-*` runtime tools. This repository is the open
+ecosystem around it: the `basert` CLI (model hub + converter), the `.base`
+model format, the public C API, and language bindings for Python, Node, Rust,
+and Swift.
 
-- **`base-convert/`** — the `basert` CLI: a model hub (`pull`/`list` from
-  HuggingFace), an offline converter (GGUF / HuggingFace / MLX → `.base`, with
-  affine quantization Q2–Q8 and optional AWQ calibration), and a launcher that
-  forwards `basert serve`/`chat`/… to the engine runtime tools.
-- **`include/baseRT/`** — the stable public C API (`baseRT.h`, `types.h`).
-- **`bindings/`** — Python, Node, Rust, and Swift bindings over that API.
-- **`benchmarks/`** — scripts to reproduce throughput numbers.
+> 📚 **Full documentation:** [docs/](docs/) (also published as a website — see
+> [`mkdocs.yml`](mkdocs.yml)).
 
-The **engine itself ships as a prebuilt binary** (`libbaseRT.dylib` + `basert-*`
-CLI tools) via [GitHub Releases](../../releases) — see
-[Getting the engine](#getting-the-engine). The compiled Metal kernels are
-embedded in the dylib, so it is a single self-contained file.
+---
 
-## What this is / isn't
+## Quickstart
 
-- **Is:** the format, CLI, headers, and bindings you build on top of the
-  BaseRT engine. Apache-2.0.
-- **Isn't:** the engine source. The runtime is distributed as a binary.
+### 1. Install
 
-## Requirements
-
-- Apple Silicon (M1 or later), macOS 14+.
-- Rust 1.80+ (to build the `basert` CLI).
-- A binding toolchain as needed (Python 3.9+, Node 18+, Swift 5.9+).
-
-## Getting the engine
-
-Download the latest engine release and unpack it where the CLI/bindings can find
-it (default: a `build/` directory at the repo root, or set `BASERT_LIB_PATH`):
+Grab the prebuilt engine and build the `basert` CLI, then put both on your `PATH`:
 
 ```sh
-# fetch the latest release's macOS arm64 bundle
+# Prebuilt engine (libbaseRT.dylib + basert-* tools), into build/
 gh release download --repo prabod/baseRT --pattern 'basert-engine-macos-arm64*.tar.gz'
 mkdir -p build && tar -xzf basert-engine-macos-arm64*.tar.gz -C build
-# build/ now has libbaseRT.dylib (kernels embedded) + basert-* CLI tools + headers
+
+# The basert CLI (model hub + converter + launcher)
+cd base-convert && cargo build --release && cd ..
+
+export PATH="$PWD/build:$PWD/base-convert/target/release:$PATH"
 ```
 
-## The `basert` CLI
+Requires Apple Silicon (M1+), macOS 14+, and Rust 1.80+. See
+[docs/getting-started/installation.md](docs/getting-started/installation.md).
 
-Build it once and put both it and the engine tools on your `PATH`:
+### 2. Pull a model
 
 ```sh
-cd base-convert
-cargo build --release          # produces target/release/basert
-export PATH="$PWD/target/release:$PWD/../build:$PATH"
+basert pull Qwen/Qwen3-4B           # download from HuggingFace + convert to .base
+basert list                          # show installed models
 ```
 
-`basert` is a unified front-end. Model-management commands run natively; runtime
-commands (`serve`, `chat`, `complete`, `bench`, …) are forwarded to the matching
-`basert-<cmd>` engine binary from the release bundle.
+Models are cached under `~/.cache/baseRT/models` (`$BASERT_MODELS_DIR`).
 
-### Pull or convert a model
+### 3. Chat
 
 ```sh
-# Pull straight from HuggingFace (downloads source + converts to .base):
-basert pull Qwen/Qwen3-4B
-
-# …or a pre-converted model from the catalog (downloaded directly, no convert):
-basert pull basecompute/<name>
-
-# …or convert a local GGUF / HF checkpoint:
-basert convert <path-to-gguf-or-hf-dir> \
-    --profile profiles/default-q4.json --output models/your-model.base
-
-basert list                    # show installed models
+basert chat Qwen/Qwen3-4B
 ```
 
-Models live in a per-user cache (`$BASERT_MODELS_DIR`, default
-`~/.cache/baseRT/models`). See [`base-convert/FORMAT.md`](base-convert/FORMAT.md)
-for the `.base` container spec,
-[`base-convert/CANONICAL_QUANT_SPEC.md`](base-convert/CANONICAL_QUANT_SPEC.md)
-for the quantization schemes, and
-[`base-convert/profiles/PROFILES.md`](base-convert/profiles/PROFILES.md) to write
-your own precision policy.
-
-## Run a model (Python)
-
-```python
-import baseRT
-m = baseRT.Model("models/your-model.base")          # kernels embedded; no metallib needed
-print(m.generate_text("The capital of France is", max_tokens=64))
-```
-
-Equivalent bindings exist for Node, Rust, and Swift — see [`bindings/`](bindings/).
-
-## Run the OpenAI-compatible server
-
-The engine bundle includes `basert-serve`, an OpenAI-compatible HTTP server.
-`basert serve` forwards to it (or run `./build/basert-serve` directly — it
-auto-detects its `baseRT.metallib` next to the executable):
+### 4. Serve an OpenAI-compatible API
 
 ```sh
-basert serve --model models/your-model.base --api-key "$(uuidgen)" --port 8080
+basert serve --model Qwen/Qwen3-4B --api-key "$(uuidgen)" --port 8080
 ```
-
-Then call it like any OpenAI endpoint:
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"your-model.base","messages":[{"role":"user","content":"Hello!"}]}'
+  -d '{"model":"Qwen3-4B","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-`basert serve --help` lists the flags (continuous batching, paged-KV, prefix
-cache, rate limiting, etc.). See `SECURITY.md` before exposing it beyond
-localhost. The other runtime tools — `basert chat`, `basert complete`,
-`basert bench`, `basert inspect`, `basert transcribe` — work the same way.
+### 5. Or call it from your language
 
-## Benchmarks
+```python
+import baseRT
+m = baseRT.Model("models/your-model.base")   # kernels embedded; no metallib needed
+print(m.generate_text("The capital of France is", max_tokens=64))
+```
 
-`benchmarks/scripts/` reproduces throughput numbers against the engine binary;
-example results are in `benchmarks/results/`. See [`benchmarks/README.md`](benchmarks/README.md).
+Node, Rust, and Swift bindings work the same way — see
+[docs/bindings/](docs/bindings/index.md).
 
-## Contributing
+---
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). Issues and focused PRs welcome —
-new model mappings for the converter and binding improvements especially.
+## The `basert` CLI
 
-## Security
+`basert` is a single front-end. Model-management commands run natively; runtime
+commands are forwarded to the matching `basert-<cmd>` engine binary:
 
-See [`SECURITY.md`](SECURITY.md). Report vulnerabilities privately.
+| Command | What it does |
+| --- | --- |
+| `basert pull <id>` | Download from HuggingFace (convert-on-pull) or the catalog |
+| `basert list` | List installed models (`--remote` to include the catalog) |
+| `basert convert <src>` | Convert a local GGUF / HF / MLX checkpoint to `.base` |
+| `basert chat <model>` | Interactive chat |
+| `basert serve --model <m>` | OpenAI-compatible HTTP server |
+| `basert complete <model>` | One-shot completion (text / image / audio) |
+| `basert bench <model>` | Throughput benchmark |
+| `basert inspect <model>` | Dump a `.base` header + tensor inventory |
+| `basert sign` / `verify` / `keygen` | ed25519 signing of `.base` bundles |
+
+Full flag reference: [docs/cli/reference.md](docs/cli/reference.md).
+
+## What's in this repo
+
+- **`base-convert/`** — the `basert` CLI (Rust): model hub (`base-hub`),
+  converter, and launcher. Includes the `.base` format spec
+  ([FORMAT.md](base-convert/FORMAT.md)), the quantization spec
+  ([CANONICAL_QUANT_SPEC.md](base-convert/CANONICAL_QUANT_SPEC.md)), and the
+  generic quant profiles.
+- **`include/baseRT/`** — the stable public C API (`baseRT.h`, `types.h`).
+- **`bindings/`** — Python, Node, Rust, Swift.
+- **`benchmarks/`** — scripts + reference results.
+- **`docs/`** — the documentation site.
+
+The **engine binary is the product**; its source is private. Everything here is
+Apache-2.0. See [docs/reference/engine-releases.md](docs/reference/engine-releases.md).
+
+## Links
+
+- 📖 [Documentation](docs/index.md)
+- 🔌 [Server API](docs/reference/server-api.md)
+- 🧱 [`.base` format](base-convert/FORMAT.md)
+- 🔒 [Security](SECURITY.md) · 🤝 [Contributing](CONTRIBUTING.md)
 
 ## License
 

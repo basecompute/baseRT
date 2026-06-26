@@ -1518,8 +1518,8 @@ enum Canonical {
 }
 
 /// nomic-bert HF safetensors → canonical `.base` names. Targets the
-/// same names the GGUF `NomicBertMapper` emits so the runtime
-/// (`src/core/models/bert.cpp`) sees one form regardless of source.
+/// same names the GGUF `NomicBertMapper` emits so the runtime's BERT
+/// loader sees one form regardless of source.
 fn nomic_bert_hf_rename(name: &str) -> Option<String> {
     match name {
         "embeddings.word_embeddings.weight" => return Some("embed_tokens.weight".into()),
