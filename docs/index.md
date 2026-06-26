@@ -55,11 +55,11 @@ basert serve --model Qwen/Qwen3-4B --api-key "$(uuidgen)"   # OpenAI server
 | `.base` files | The on-disk model format the runtime loads. |
 | Bindings | Python / Node / Rust / Swift over the C API (`baseRT.h`). |
 
-!!! note "Open core"
-    The **engine binary is the product** and its source is private. This
-    repository — the CLI, format, headers, bindings, and docs — is open
-    (Apache-2.0). The engine is consumed as a
-    [prebuilt release](reference/engine-releases.md).
+!!! note "Open ecosystem"
+    The engine ships as a prebuilt binary; this repository — the CLI, format,
+    headers, bindings, and docs — is open source (Apache-2.0). The engine is
+    consumed as a [prebuilt release](reference/engine-releases.md), so you never
+    need to build it yourself.
 
 ## Requirements
 

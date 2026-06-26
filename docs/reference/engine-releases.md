@@ -2,8 +2,9 @@
 
 The BaseRT engine is distributed as a prebuilt binary bundle under
 [Releases](https://github.com/prabod/baseRT/releases). This repository — the
-CLI, format, headers, bindings, and docs — is open; the engine binary is the
-product. You never need to build the engine from source.
+CLI, format, headers, bindings, and docs — is open source (Apache-2.0); the
+engine is provided as a ready-to-use binary, so you never need to build it from
+source.
 
 ## What a release contains
 

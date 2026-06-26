@@ -115,8 +115,8 @@ Full flag reference: [docs/cli/reference.md](docs/cli/reference.md).
 - **`benchmarks/`** — scripts + reference results.
 - **`docs/`** — the documentation site.
 
-The **engine binary is the product**; its source is private. Everything here is
-Apache-2.0. See [docs/reference/engine-releases.md](docs/reference/engine-releases.md).
+The engine ships as a prebuilt binary; everything in this repository is open
+source (Apache-2.0). See [docs/reference/engine-releases.md](docs/reference/engine-releases.md).
 
 ## Links
 
