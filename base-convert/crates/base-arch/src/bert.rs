@@ -152,8 +152,8 @@ impl GgufMapper for NomicBertMapper {
                 let rest = n.strip_prefix("blk.")?;
                 let (layer_str, suffix) = rest.split_once('.')?;
                 let layer: u32 = layer_str.parse().ok()?;
-                // BERT-specific suffixes keep their GGUF name; runtime
-                // (src/core/models/bert.cpp) queries the same names
+                // BERT-specific suffixes keep their GGUF name; the
+                // runtime's BERT loader queries the same names
                 // verbatim with a `layers.N.` prefix.
                 let canonical = match suffix {
                     "attn_qkv.weight" => "self_attn.qkv_proj.weight",
