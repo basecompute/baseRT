@@ -1,12 +1,39 @@
 # Installation
 
+## One-shot install (recommended)
+
+```sh
+curl -LsSf https://raw.githubusercontent.com/prabod/baseRT/main/install.sh | sh
+```
+
+This downloads the prebuilt engine bundle (the `libbaseRT.dylib`, the `basert`
+CLI, and the `basert-*` runtime tools) into `~/.basert` and adds it to your
+`PATH`. Restart your shell afterward, then:
+
+```sh
+basert pull Qwen/Qwen3-0.6B
+basert chat Qwen/Qwen3-0.6B
+```
+
+Overrides (set as environment variables before running):
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `BASERT_INSTALL_DIR` | Install location | `~/.basert` |
+| `BASERT_VERSION` | Specific release tag (e.g. `v0.5.0`) | latest |
+| `BASERT_NO_MODIFY_PATH` | Set to `1` to skip editing shell profiles | unset |
+
+Requires Apple Silicon (M1+) and macOS 14+. The installer is macOS/arm64 only.
+
+## Manual install
+
 BaseRT has two parts you put on your `PATH`:
 
 1. **The engine** — `libbaseRT.dylib` plus the `basert-*` runtime tools,
    distributed as a prebuilt release.
 2. **The `basert` CLI** — built from this repository (`base-convert`).
 
-## Requirements
+### Requirements
 
 - Apple Silicon (M1 or later), macOS 14+.
 - Rust 1.80+ (to build the CLI).

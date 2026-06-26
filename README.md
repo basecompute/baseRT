@@ -18,21 +18,31 @@ and Swift.
 
 ### 1. Install
 
-Grab the prebuilt engine and build the `basert` CLI, then put both on your `PATH`:
+```sh
+curl -LsSf https://raw.githubusercontent.com/prabod/baseRT/main/install.sh | sh
+```
+
+This downloads the prebuilt engine + the `basert` CLI to `~/.basert` and adds it
+to your `PATH`. Requires Apple Silicon (M1+) and macOS 14+. Restart your shell
+afterward (or `export PATH="$HOME/.basert:$PATH"`).
+
+<details>
+<summary>Build from source instead</summary>
 
 ```sh
 # Prebuilt engine (libbaseRT.dylib + basert-* tools), into build/
 gh release download --repo prabod/baseRT --pattern 'basert-engine-macos-arm64*.tar.gz'
 mkdir -p build && tar -xzf basert-engine-macos-arm64*.tar.gz -C build
 
-# The basert CLI (model hub + converter + launcher)
+# The basert CLI (model hub + converter + launcher) — needs Rust 1.80+
 cd base-convert && cargo build --release && cd ..
 
 export PATH="$PWD/build:$PWD/base-convert/target/release:$PATH"
 ```
+</details>
 
-Requires Apple Silicon (M1+), macOS 14+, and Rust 1.80+. See
-[docs/getting-started/installation.md](docs/getting-started/installation.md).
+See [docs/getting-started/installation.md](docs/getting-started/installation.md)
+for details.
 
 ### 2. Pull a model
 
