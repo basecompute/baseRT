@@ -83,7 +83,7 @@ struct ConvertArgs {
     synthetic: bool,
 
     /// Canonical-quant profile JSON (e.g.
-    /// `base-convert/profiles/default-q4.json`). When set,
+    /// `tools/base-convert/profiles/dense-q4mix.json`). When set,
     /// per-tensor quant decisions come from the profile rules; the
     /// `--target` flag becomes the fallback for tensors the profile's
     /// catch-all `**.weight` rule should otherwise have covered. Sets
@@ -1518,8 +1518,8 @@ enum Canonical {
 }
 
 /// nomic-bert HF safetensors → canonical `.base` names. Targets the
-/// same names the GGUF `NomicBertMapper` emits so the runtime's BERT
-/// loader sees one form regardless of source.
+/// same names the GGUF `NomicBertMapper` emits so the runtime
+/// (`src/core/models/bert.cpp`) sees one form regardless of source.
 fn nomic_bert_hf_rename(name: &str) -> Option<String> {
     match name {
         "embeddings.word_embeddings.weight" => return Some("embed_tokens.weight".into()),
