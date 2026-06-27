@@ -19,7 +19,7 @@ and Swift.
 ### 1. Install
 
 ```sh
-curl -LsSf https://raw.githubusercontent.com/basecompute/baseRT/main/install.sh | sh
+curl -LsSf https://basecompute.co/install.sh | sh
 ```
 
 This downloads the prebuilt engine + the `basert` CLI to `~/.basert` and adds it
