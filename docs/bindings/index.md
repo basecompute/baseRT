@@ -6,10 +6,10 @@ wrappers for four languages. All of them link the single `libbaseRT.dylib`
 
 | Language | Package | Import | Source |
 | --- | --- | --- | --- |
-| [Python](python.md) | `baseRT` | `import baseRT` | [`bindings/python`](https://github.com/prabod/baseRT/tree/main/bindings/python) |
-| [Node](node.md) | `@baseRT/node` | `import { BaseRTModel }` | [`bindings/node`](https://github.com/prabod/baseRT/tree/main/bindings/node) |
-| [Rust](rust.md) | `baseRT` | `use baseRT::…` | [`bindings/rust`](https://github.com/prabod/baseRT/tree/main/bindings/rust) |
-| [Swift](swift.md) | `BaseRT` | `import BaseRT` | [`bindings/swift`](https://github.com/prabod/baseRT/tree/main/bindings/swift) |
+| [Python](python.md) | `baseRT` | `import baseRT` | [`bindings/python`](https://github.com/basecompute/baseRT/tree/main/bindings/python) |
+| [Node](node.md) | `@baseRT/node` | `import { BaseRTModel }` | [`bindings/node`](https://github.com/basecompute/baseRT/tree/main/bindings/node) |
+| [Rust](rust.md) | `baseRT` | `use baseRT::…` | [`bindings/rust`](https://github.com/basecompute/baseRT/tree/main/bindings/rust) |
+| [Swift](swift.md) | `BaseRT` | `import BaseRT` | [`bindings/swift`](https://github.com/basecompute/baseRT/tree/main/bindings/swift) |
 
 ## Finding the engine
 

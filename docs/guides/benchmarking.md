@@ -23,7 +23,7 @@ The output reports prefill tokens/sec (prompt processing) and decode tokens/sec
 
 ## Reproducible benchmark scripts
 
-The [`benchmarks/`](https://github.com/prabod/baseRT/tree/main/benchmarks)
+The [`benchmarks/`](https://github.com/basecompute/baseRT/tree/main/benchmarks)
 directory has scripts that drive `basert bench` across models and context
 lengths, plus reference results under `benchmarks/results/`. They expect the
 engine bundle unpacked into `build/` (so `build/basert-bench` exists) — see

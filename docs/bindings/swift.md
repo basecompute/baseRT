@@ -37,5 +37,5 @@ let stats = model.generate(tokens: tokens, maxTokens: 256) { token in
 }
 ```
 
-See [`bindings/swift`](https://github.com/prabod/baseRT/tree/main/bindings/swift)
+See [`bindings/swift`](https://github.com/basecompute/baseRT/tree/main/bindings/swift)
 for the full API.

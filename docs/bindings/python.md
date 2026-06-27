@@ -61,5 +61,5 @@ m = baseRT.Model("models/whisper-base.base")
 # pass PCM samples / audio per the transcribe() signature
 ```
 
-See [`bindings/python`](https://github.com/prabod/baseRT/tree/main/bindings/python)
+See [`bindings/python`](https://github.com/basecompute/baseRT/tree/main/bindings/python)
 for the full surface and tests.

@@ -5,9 +5,9 @@ rules. `basert convert --profile <path>` applies it; the bundle records the
 profile name for audit.
 
 The generic profiles ship in
-[`base-convert/profiles/`](https://github.com/prabod/baseRT/tree/main/base-convert/profiles)
+[`base-convert/profiles/`](https://github.com/basecompute/baseRT/tree/main/base-convert/profiles)
 (`default-q4`, `default-q8`, and scale-dtype variants). Full guidance is in
-[`profiles/PROFILES.md`](https://github.com/prabod/baseRT/blob/main/base-convert/profiles/PROFILES.md).
+[`profiles/PROFILES.md`](https://github.com/basecompute/baseRT/blob/main/base-convert/profiles/PROFILES.md).
 
 ## Schema
 

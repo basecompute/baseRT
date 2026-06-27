@@ -3,7 +3,7 @@
 ## One-shot install (recommended)
 
 ```sh
-curl -LsSf https://raw.githubusercontent.com/prabod/baseRT/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/basecompute/baseRT/main/install.sh | sh
 ```
 
 This downloads the prebuilt engine bundle (the `libbaseRT.dylib`, the `basert`
@@ -48,7 +48,7 @@ kernels embedded), the `basert-*` tools, `baseRT.metallib`, and the public
 headers.
 
 ```sh
-gh release download --repo prabod/baseRT --pattern 'basert-engine-macos-arm64*.tar.gz'
+gh release download --repo basecompute/baseRT --pattern 'basert-engine-macos-arm64*.tar.gz'
 mkdir -p build && tar -xzf basert-engine-macos-arm64*.tar.gz -C build
 # build/ now has libbaseRT.dylib + basert-serve, basert-chat, … + baseRT.metallib + include/
 ```

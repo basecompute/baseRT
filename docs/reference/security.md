@@ -1,7 +1,7 @@
 # Security
 
 The full policy — including how to report vulnerabilities privately — is in
-[`SECURITY.md`](https://github.com/prabod/baseRT/blob/main/SECURITY.md) at the
+[`SECURITY.md`](https://github.com/basecompute/baseRT/blob/main/SECURITY.md) at the
 repo root. This page summarizes the operational essentials.
 
 ## Running the server safely
@@ -32,5 +32,5 @@ loadable (by design for development); gate on `verify` in production.
 ## Reporting
 
 Report vulnerabilities privately per
-[`SECURITY.md`](https://github.com/prabod/baseRT/blob/main/SECURITY.md). Please
+[`SECURITY.md`](https://github.com/basecompute/baseRT/blob/main/SECURITY.md). Please
 don't open public issues for security reports.
