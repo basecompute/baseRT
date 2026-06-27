@@ -1,7 +1,7 @@
 #!/bin/sh
 # BaseRT one-shot installer.
 #
-#   curl -LsSf https://raw.githubusercontent.com/prabod/baseRT/main/install.sh | sh
+#   curl -LsSf https://raw.githubusercontent.com/basecompute/baseRT/main/install.sh | sh
 #
 # Downloads the latest prebuilt engine bundle (libbaseRT.dylib + the basert CLI
 # and runtime tools) and installs it to ~/.basert, then adds it to your PATH.
@@ -12,7 +12,7 @@
 #   BASERT_NO_MODIFY_PATH  set to 1 to skip editing shell profiles
 set -eu
 
-REPO="prabod/baseRT"
+REPO="basecompute/baseRT"
 ASSET_PREFIX="basert-engine-macos-arm64"
 INSTALL_DIR="${BASERT_INSTALL_DIR:-$HOME/.basert}"
 

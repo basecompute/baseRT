@@ -19,7 +19,7 @@ and Swift.
 ### 1. Install
 
 ```sh
-curl -LsSf https://raw.githubusercontent.com/prabod/baseRT/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/basecompute/baseRT/main/install.sh | sh
 ```
 
 This downloads the prebuilt engine + the `basert` CLI to `~/.basert` and adds it
@@ -31,7 +31,7 @@ afterward (or `export PATH="$HOME/.basert:$PATH"`).
 
 ```sh
 # Prebuilt engine (libbaseRT.dylib + basert-* tools), into build/
-gh release download --repo prabod/baseRT --pattern 'basert-engine-macos-arm64*.tar.gz'
+gh release download --repo basecompute/baseRT --pattern 'basert-engine-macos-arm64*.tar.gz'
 mkdir -p build && tar -xzf basert-engine-macos-arm64*.tar.gz -C build
 
 # The basert CLI (model hub + converter + launcher) — needs Rust 1.80+

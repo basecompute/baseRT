@@ -8,7 +8,7 @@ canonical spec; this page is an overview.
 
 The authoritative quantization specification lives in the repo:
 
-- **[`base-convert/CANONICAL_QUANT_SPEC.md`](https://github.com/prabod/baseRT/blob/main/base-convert/CANONICAL_QUANT_SPEC.md)**
+- **[`base-convert/CANONICAL_QUANT_SPEC.md`](https://github.com/basecompute/baseRT/blob/main/base-convert/CANONICAL_QUANT_SPEC.md)**
   — dtypes, group sizes, scale dtypes, symmetric/asymmetric rules, and the
   per-tensor header fields.
 

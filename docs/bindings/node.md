@@ -49,5 +49,5 @@ const model = new BaseRTModel("models/your-model.base");
 // transcription are exposed on the model instance.
 ```
 
-See [`bindings/node`](https://github.com/prabod/baseRT/tree/main/bindings/node)
+See [`bindings/node`](https://github.com/basecompute/baseRT/tree/main/bindings/node)
 for the full API and the struct-ABI tests.

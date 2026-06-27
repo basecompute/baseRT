@@ -48,5 +48,5 @@ let stats = model.generate(&tokens, 256, Default::default(), |_id, text| {
 println!("\n{} tokens", stats.generated_tokens);
 ```
 
-See [`bindings/rust`](https://github.com/prabod/baseRT/tree/main/bindings/rust)
+See [`bindings/rust`](https://github.com/basecompute/baseRT/tree/main/bindings/rust)
 for the full API, the `static` feature, and examples.

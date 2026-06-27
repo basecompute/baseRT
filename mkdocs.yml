@@ -1,8 +1,8 @@
 site_name: BaseRT
 site_description: A fast LLM inference runtime for Apple Silicon (Metal).
-site_url: https://prabod.github.io/baseRT/
-repo_url: https://github.com/prabod/baseRT
-repo_name: prabod/baseRT
+site_url: https://basecompute.github.io/baseRT/
+repo_url: https://github.com/basecompute/baseRT
+repo_name: basecompute/baseRT
 edit_uri: edit/main/docs/
 
 theme:

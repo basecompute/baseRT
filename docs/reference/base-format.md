@@ -12,7 +12,7 @@ You produce `.base` files with [`basert convert`](../guides/converting.md) or
 
 The authoritative container specification lives in the repo:
 
-- **[`base-convert/FORMAT.md`](https://github.com/prabod/baseRT/blob/main/base-convert/FORMAT.md)**
+- **[`base-convert/FORMAT.md`](https://github.com/basecompute/baseRT/blob/main/base-convert/FORMAT.md)**
   — header schema, tensor table, slot layout, and the on-disk byte layout.
 
 ## Inspecting a bundle
