@@ -1,7 +1,13 @@
 name: Docs
 
 # Build the MkDocs site and publish it to GitHub Pages.
-# Enable Pages once in repo Settings → Pages → Source: GitHub Actions.
+#
+# The `build` job always runs and validates the docs (`mkdocs build --strict`).
+# The `deploy` job is gated behind the repo variable `ENABLE_PAGES` so it does
+# not fail while Pages is unavailable (GitHub Pages requires a public repo on
+# this plan). To turn the live site on once the repo is public:
+#   1. Settings → Pages → Source: GitHub Actions
+#   2. Settings → Secrets and variables → Actions → Variables: ENABLE_PAGES=true
 
 on:
   push:
@@ -38,6 +44,8 @@ jobs:
 
   deploy:
     needs: build
+    # Skipped (not failed) until Pages is enabled and ENABLE_PAGES=true.
+    if: vars.ENABLE_PAGES == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
