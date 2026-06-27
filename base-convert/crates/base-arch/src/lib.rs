@@ -76,6 +76,24 @@ pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMappe
     }
 }
 
+/// Every HF `model_type` value [`hf_mapper_for_model_type`] accepts. Kept in
+/// lockstep with that match so a pre-flight support check (and its error
+/// message) has a single source of truth for what convert-on-pull supports.
+pub const SUPPORTED_HF_MODEL_TYPES: &[&str] = &[
+    "llama",
+    "qwen2",
+    "qwen3",
+    "qwen2_moe",
+    "qwen3_moe",
+    "nomic_bert",
+    "gemma",
+    "gemma2",
+    "gemma3",
+    "gemma3_text",
+    "gemma4",
+    "gemma4_text",
+];
+
 pub trait GgufMapper: Sync {
     /// Canonical arch name stored in the `.base` header's `arch` field.
     fn canonical_arch(&self) -> &'static str;
@@ -278,5 +296,23 @@ impl ArchConfig {
             m.insert("rope_local_theta".into(), json!(self.rope_local_theta));
         }
         m
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SUPPORTED_HF_MODEL_TYPES` must list exactly what the dispatch match
+    /// accepts — every advertised type resolves, and nothing else creeps in.
+    #[test]
+    fn supported_list_matches_dispatch() {
+        for mt in SUPPORTED_HF_MODEL_TYPES {
+            assert!(
+                hf_mapper_for_model_type(mt).is_some(),
+                "advertised model_type {mt:?} has no mapper"
+            );
+        }
+        assert!(hf_mapper_for_model_type("not-a-real-arch").is_none());
     }
 }

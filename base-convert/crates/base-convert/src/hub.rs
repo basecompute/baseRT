@@ -323,6 +323,36 @@ fn choose_profile(
     Ok((target_str(args.target).to_string(), None, None))
 }
 
+/// Read `model_type` from a fetched `config.json` and fail early when no
+/// converter supports it — so an unsupported repo errors before its weights
+/// are downloaded. `text_config.model_type` is consulted as a fallback for
+/// multimodal configs that nest the language-model arch there.
+fn check_supported_arch(config_path: &Path, repo: &str, revision: &str) -> Result<()> {
+    let bytes = std::fs::read(config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    let cfg: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {} as JSON", config_path.display()))?;
+
+    let model_type = cfg
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .or_else(|| cfg.pointer("/text_config/model_type").and_then(|v| v.as_str()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("{repo}@{revision}: config.json has no model_type field")
+        })?;
+
+    if base_arch::hf_mapper_for_model_type(model_type).is_some() {
+        return Ok(());
+    }
+
+    bail!(
+        "{repo}@{revision}: model_type {model_type:?} is not supported by convert-on-pull.\n\
+         Supported architectures: {}.\n\
+         Pre-converted models are available via `basert list --remote`.",
+        base_arch::SUPPORTED_HF_MODEL_TYPES.join(", ")
+    )
+}
+
 /// Download the wanted source files into hf-hub's snapshot dir and return it.
 fn download_source(repo: &str, revision: &str, fetcher: &dyn Fetcher) -> Result<PathBuf> {
     let files = fetcher.list_files(repo, revision)?;
@@ -338,6 +368,10 @@ fn download_source(repo: &str, revision: &str, fetcher: &dyn Fetcher) -> Result<
 
     // Anchor the snapshot dir on config.json, then fetch the rest beside it.
     let cfg = fetcher.get_file(repo, revision, "config.json")?;
+    // Pre-flight: reject unsupported architectures from config.json alone,
+    // before downloading multi-GB safetensors. Mirrors the model_type read
+    // in `convert_hf` so the gate matches the eventual conversion.
+    check_supported_arch(&cfg, repo, revision)?;
     let snapshot = cfg
         .parent()
         .map(|p| p.to_path_buf())
@@ -484,18 +518,39 @@ mod tests {
         // Lay out a fake HF repo: <root>/org/model/<files>.
         let repo_dir = tmp.path().join("org").join("model");
         std::fs::create_dir_all(&repo_dir).unwrap();
-        for f in [
-            "config.json",
-            "model.safetensors",
-            "tokenizer.json",
-            "pytorch_model.bin",
-        ] {
+        std::fs::write(repo_dir.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
+        for f in ["model.safetensors", "tokenizer.json", "pytorch_model.bin"] {
             std::fs::write(repo_dir.join(f), b"x").unwrap();
         }
         let fetcher = MockFetcher::new(tmp.path());
 
         let snapshot = download_source("org/model", "main", &fetcher).unwrap();
         assert_eq!(snapshot, repo_dir);
+    }
+
+    #[test]
+    fn download_source_rejects_unsupported_arch_before_weights() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("org").join("exotic");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join("config.json"), br#"{"model_type":"mamba"}"#).unwrap();
+        std::fs::write(repo_dir.join("model.safetensors"), b"x").unwrap();
+        let fetcher = MockFetcher::new(tmp.path());
+
+        let err = download_source("org/exotic", "main", &fetcher).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mamba"), "{msg}");
+        assert!(msg.contains("not supported"), "{msg}");
+        // The supported set is surfaced so the user knows what works.
+        assert!(msg.contains("llama"), "{msg}");
+    }
+
+    #[test]
+    fn check_supported_arch_reads_nested_text_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.json");
+        std::fs::write(&cfg, br#"{"text_config":{"model_type":"gemma4_text"}}"#).unwrap();
+        check_supported_arch(&cfg, "org/m", "main").unwrap();
     }
 
     #[test]
