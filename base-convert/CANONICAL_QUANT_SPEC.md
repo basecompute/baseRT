@@ -1,14 +1,11 @@
 # Canonical Quantization Spec — `base_q2` … `base_q8`
 
 Companion to `FORMAT.md`. Pins the on-disk layout, scale dtypes, and
-per-tensor flexibility for the canonical bit-widths shipped under
-`feat/awq-canonical-quant`. Replaces the dual-kernel
-(MLX-passthrough + GGUF-passthrough) strategy of v1.0.
+per-tensor flexibility for the canonical bit-widths.
 
 ## Goals
 
-- One canonical kernel family per bit-width per backend. No `is_mlx`
-  branches in the runtime forward.
+- One canonical kernel family per bit-width per backend.
 - Source format restricted to **fp16 / bf16 / fp32**. Already-quantized
   sources are rejected with a clear error — no silent quant-to-quant
   re-pack (it's lossy and contradicts the bit budget). Users with a
@@ -152,7 +149,7 @@ Three new top-level fields:
 ```jsonc
 {
   "target_backend": "metal",          // metal | cuda_sm89 | cuda_sm90 | rocm_cdna3 | cpu_avx2 | cpu_neon
-  "quant_profile": "example-q4mix-v1",  // identifier of the profile used at convert time
+  "quant_profile": "gemma4-moe-q4mix-v1",  // identifier of the profile used at convert time
   "calibration": { "method": "awq", "tokens": 1024, "dataset": "wikitext-103" }
 }
 ```
@@ -174,14 +171,14 @@ backwards-compat with current `base_q4` bundles):
 
 ## Quant profile JSON
 
-Profiles live in `base-convert/profiles/`. Reusable + diffable.
+Profiles live in `tools/base-convert/profiles/`. Reusable + diffable.
 The converter consumes one via `--profile <path>`; the resulting
 bundle records the profile name in `quant_profile` for audit.
 
 ```jsonc
-// profiles/example-q4mix-v1.json
+// profiles/gemma4-moe-q4mix-v1.json
 {
-  "name": "example-q4mix-v1",
+  "name": "gemma4-moe-q4mix-v1",
   "arch": "gemma4",
   "calibration": { "method": "awq", "tokens": 1024, "dataset": "wikitext-103" },
   "rules": [
@@ -213,23 +210,12 @@ dense models.
   them as `dtype=base_q4, group_size=64, scale_dtype=f16, symmetric=false,
   layout=metal_lane_strided_q4, target_backend=metal`.
 - Existing `base_q8` bundles upgrade similarly.
-- **Phase 5 #6 (shipped 2026-05-01)**: scale_dtype=bf16 is now the runtime
-  default for q4/q5/q6/q8. The runtime dispatches to `_sbf16` GEMV/GEMM
-  kernel siblings and reads scales+biases as bf16. The 8 production
-  profiles flipped scale_dtype f16→bf16 in this phase. Norms continue
-  to be pinned at f16 in profiles pending the norm-flip migration
-  (which requires a follow-up sweep of ~50 direct-pipeline norm
-  dispatch sites). Legacy f16-scale variants remain available via
-  `default-q4-f16scale.json` / `default-q8-f16scale.json` for rollback.
-  PPL gate: Llama-3.2-1B-Q4 bf16=18.35 vs f16=18.13 (+1.17%, just over
-  strict 1% but well within q4-vs-fp16 budget).
-- The `passthrough_gguf` / `gguf_super` escape hatch is **deprecated**
-  and the associated runtime kernels (`gemv_q8_0`, `simd_gemm_q8_0`,
-  `moe_simd_gemm_q4_k`, `gemv_wide_q8_0`, `simd_gemm_small_q8_0`,
-  `embedding_lookup_q8_0`, `gemv_q8_0_head_rmsnorm`, etc.) have been
-  deleted across Phase 5 (PR #33 + the q8_0 orphan sweep).
-- The `is_mlx` field on `DTypeDescriptor` and all `if (dt.is_mlx)`
-  runtime branches have been deleted (Phase 5 #2).
+- `scale_dtype=bf16` is the default for `base_q4`/`q5`/`q6`/`q8`: scales and
+  biases are stored as bf16. Norms are stored at f16. The `*-f16scale.json`
+  profiles (`default-q4-f16scale.json`, `default-q8-f16scale.json`) select
+  f16 scales instead.
+- The source checkpoint must be fp16/bf16/fp32. Re-quantizing an
+  already-quantized checkpoint (e.g. a GGUF Q4_K) is not a supported target.
 
 ## Validation criterion
 

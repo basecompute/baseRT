@@ -287,8 +287,8 @@ mod tests {
         assert_eq!(hf.rope_theta, g.rope_theta);
         assert_eq!(hf.rms_norm_eps, g.rms_norm_eps);
         assert_eq!(hf.tie_word_embeddings, g.tie_word_embeddings);
-        // The four fields that PR #29 fixed. Without those fixes the
-        // GGUF path emitted zero / wrong values while HF was correct.
+        // These four fields must agree between the GGUF and HF paths
+        // (a mismatch means the GGUF path emitted zero / wrong values).
         assert_eq!(hf.num_experts, 128);
         assert_eq!(g.num_experts, 128);
         assert_eq!(hf.num_experts_per_tok, g.num_experts_per_tok);

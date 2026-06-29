@@ -107,8 +107,8 @@ void baseRT_set_kv_bits(int bits);
 /// Paged mode allocates KV in fixed-size blocks (per-model page size: 16
 /// default, 8 for models with head_dim>=256) and addresses each layer's
 /// slab through a CSR block table. Required foundation for multi-sequence
-/// continuous batching (PR2) and prefix caching (PR3). Process-wide;
-/// persists across loads. Must be called before baseRT_load_model.
+/// continuous batching and prefix caching. Process-wide; persists across
+/// loads. Must be called before baseRT_load_model.
 void baseRT_set_paged_kv(int enable);
 
 /// Override the maximum batch size for baseRT_batch_decode_step.
@@ -119,8 +119,8 @@ void baseRT_set_paged_kv(int enable);
 /// persists across loads. Capped at prefill_chunk at load time.
 void baseRT_set_max_batch_size(int n);
 
-/// Enable the prefix cache (PR-C): a RadixCache over the paged BlockPool that
-/// shares the KV of common prompt prefixes across requests, so the scheduler
+/// Enable the prefix cache: shares the KV of common prompt prefixes across
+/// requests (via a radix tree over the paged block pool), so the scheduler
 /// can skip re-prefilling a shared system prompt / chat history. No effect
 /// unless --paged-kv is also on. Process-wide; persists across loads. Must be
 /// called before baseRT_load_model. Drive it via the baseRT_prefix_* API.
@@ -195,10 +195,9 @@ typedef struct baseRT_sequence_s *baseRT_sequence_t;
 /// The model must be loaded with --paged-kv (`baseRT_set_paged_kv(1)`) —
 /// returns NULL with BASERT_ERR_UNSUPPORTED otherwise.
 ///
-/// PR2 v1 limitation: sequences are not safe to use concurrently on a single
-/// model (the engine's dispatch state is shared). Schedule them sequentially —
-/// one `baseRT_sequence_generate` call at a time per model. PR2 v2 will add a
-/// scheduler + kernel batched dispatch for true concurrent generation.
+/// Limitation: sequences are not safe to use concurrently on a single model
+/// (dispatch state is shared). Schedule them sequentially — one
+/// `baseRT_sequence_generate` call at a time per model.
 baseRT_sequence_t baseRT_sequence_create(baseRT_model_t model);
 
 /// Generate tokens for `seq` starting from `prompt_tokens`. Resets the
@@ -217,11 +216,10 @@ BaseRTGenerationStats baseRT_sequence_generate_continue(baseRT_sequence_t seq, c
 /// Release the sequence's blocks back to the pool and free the handle.
 void baseRT_sequence_free(baseRT_sequence_t seq);
 
-/// PR2 v2 batched decode: drives ONE batched decode step across N sequences.
-/// Each sequence writes its `new_tokens[i]` to its own KV cache slot (via the
-/// FC_BATCHED-aware kv-write kernels) and the attention kernels read each
-/// seq's KV using its own block table. Throughput win comes from batching the
-/// otherwise-sequential per-seq dispatches into one Metal command buffer.
+/// Batched decode: drives ONE batched decode step across N sequences. Each
+/// sequence writes its `new_tokens[i]` to its own KV cache slot, and attention
+/// reads each sequence's KV via its own block table. Throughput comes from
+/// batching the otherwise-sequential per-sequence dispatches into one pass.
 ///
 /// Requires the model to be loaded with `--paged-kv`. The N sequences must
 /// all belong to the same model handle.
@@ -264,26 +262,21 @@ int baseRT_batch_decode_step(baseRT_model_t model, baseRT_sequence_t *seqs, int 
 int baseRT_batch_decode_loop(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs, const uint32_t *first_tokens,
                              int max_steps, uint32_t eos_token, uint32_t *out_tokens, int *out_lengths);
 
-/// PR2 v3: mixed prefill+decode batch step. Each sequence i ingests
+/// Mixed prefill+decode batch step. Each sequence i ingests
 /// `in_token_counts[i]` new tokens from `in_tokens` (a flat row-major
 /// buffer of `sum(in_token_counts)` tokens) and contributes one new argmax
 /// output to `out_tokens[i]`. `in_token_counts[i] == 1` is a decode step;
 /// `in_token_counts[i] > 1` is a prefill chunk that ingests the prompt
 /// continuation before sampling.
 ///
-/// Implementation: scheduler v2 host glue. Partitions the batch into a
-/// **prefill subset** (L_i > 1) and a **decode subset** (L_i == 1). Prefill
-/// seqs are advanced serially through the single-seq paged path (one
-/// `encode_prefill` per seq, chunked by `max_prefill_chunk` if needed).
-/// The decode subset is then advanced through one FC_BATCHED dispatch via
-/// `baseRT_batch_decode_step`. End-user benefit: one API call advances both
-/// kinds of seqs in the same scheduler tick — decode seqs don't have to
-/// wait for the user to drain their prefill via a separate code path.
+/// The batch is partitioned into a **prefill subset** (L_i > 1) and a
+/// **decode subset** (L_i == 1). Prefill sequences are advanced one at a time
+/// through the single-sequence paged path (chunked by `max_prefill_chunk` if
+/// needed); the decode subset is then advanced through one batched step. One
+/// API call advances both kinds of sequences in the same scheduler tick.
 ///
-/// True in-batch fusion (all lanes through `PrefillV2[Batched]` + a single
-/// FC_BATCHED rope+kv-write with per-seq L_i via cu_seqlens_q) is **not**
-/// what this API does — it requires extending `rope_*_kv_write_batch` to
-/// honor cu_seqlens_q, which is a separate kernel-template change.
+/// Prefill and decode lanes are advanced in the same call but are not fused
+/// into a single kernel pass; each runs its own dispatch within the step.
 ///
 /// Requires `--paged-kv`. The N sequences must belong to the same model.
 /// Decode subset count must be <= `baseRT_set_max_batch_size(n)` (default 1).
@@ -295,21 +288,19 @@ int baseRT_batch_decode_loop(baseRT_model_t model, baseRT_sequence_t *seqs, int 
 int baseRT_batch_step(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs, const uint32_t *in_tokens,
                       const int *in_token_counts, uint32_t *out_tokens);
 
-/// PR2 v3 fused-path variant of baseRT_batch_step: drives ONE unified
-/// engine forward pass through PrefillV2[Batched] + FC_VARLEN rope+kv-write
-/// across all seqs (instead of the sequential sub-dispatch in
+/// Fused-path variant of baseRT_batch_step: drives ONE unified forward pass
+/// across all sequences (instead of the sequential sub-dispatch in
 /// baseRT_batch_step). Each seq i contributes `in_token_counts[i]` rows to a
-/// packed [sum_L, dim] residual stream; the engine reads per-seq state via
-/// `cu_seqlens_q[B+1]` populated by this entry point. After the last layer
-/// the output stage gathers the last row per seq (positions `cu[i+1]-1`)
-/// into the first B rows of residual, runs M=B lm_head GEMM, and argmax.
+/// packed [sum_L, dim] residual stream with variable-length attention. After
+/// the last layer the output stage gathers the last row per sequence, runs a
+/// B-row output projection, and takes the argmax per sequence.
 ///
 /// Same C API contract as baseRT_batch_step (B seqs, flat in_tokens,
 /// in_token_counts[B], one argmax per seq via out_tokens[B]); same
 /// requirements (--paged-kv, all seqs from this model, n_seqs <= max).
-/// **NOT supported on every architecture** -- the engine VARLEN routing is
-/// currently wired only for Qwen3 (qkv_in_batch_gate + head_norm_rope_neox_kv_write).
-/// Other archs fall through to a runtime UNSUPPORTED error.
+/// **NOT supported on every architecture** -- batched VARLEN routing is
+/// currently available for Qwen3. Other architectures return a runtime
+/// UNSUPPORTED error.
 ///
 /// Returns BASERT_OK on success, BASERT_ERR_UNSUPPORTED if VARLEN attention
 /// can't be dispatched at the given head_dim/seq_len (falls back to
@@ -329,9 +320,8 @@ int baseRT_batch_step_fused(baseRT_model_t model, baseRT_sequence_t *seqs, int n
 ///                  receives seq i's decoded tokens (length out_lengths[i]).
 ///   out_lengths  : [n_seqs] per-seq actual decoded length (<= max_steps).
 ///
-/// Requires `--paged-kv`. Same arch support as baseRT_batch_step_fused
-/// (Qwen3-style llama.cpp path, gemma.cpp head_norm path, Llama 3.2-style
-/// emit_rope_qkv_write path).
+/// Requires `--paged-kv`. Same architecture support as
+/// `baseRT_batch_step_fused` (Qwen3, Gemma, Llama 3.2).
 int baseRT_batch_step_fused_loop(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs,
                                  const uint32_t *first_in_tokens, const int *first_in_token_counts, int max_steps,
                                  uint32_t eos_token, uint32_t *out_tokens, int *out_lengths);
@@ -352,7 +342,7 @@ int baseRT_batch_step_fused_logits(baseRT_model_t model, baseRT_sequence_t *seqs
 /// `n_seqs` must match the batch of the preceding step and be <= max_batch_size.
 int baseRT_read_batch_logits(baseRT_model_t model, int n_seqs, void *out_logits_f16);
 
-// === Prefix cache (PR-C) — scheduler-driven primitives ===
+// === Prefix cache — scheduler-driven primitives ===
 //
 // A scheduler (e.g. the continuous-batching BatchEngine) reuses the KV of a
 // shared prompt prefix across requests. Per request:

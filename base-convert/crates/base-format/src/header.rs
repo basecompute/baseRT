@@ -111,9 +111,8 @@ impl<'de> Deserialize<'de> for TensorFlags {
 /// byte-exact roundtrippable through the writer; reading + dispatch
 /// remain identical.
 ///
-/// `PassthroughGguf` is the v1 escape hatch — deprecated under the
-/// canonical-quant migration; runtime kernels backing it (`gemv_q8_0`,
-/// `moe_simd_gemm_q4_k`, etc.) are scheduled for removal in Phase 5.
+/// `PassthroughGguf` is a deprecated escape hatch retained for backward
+/// compatibility; new conversions use the canonical quant path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuantScheme {
     #[serde(rename = "base_q2")]

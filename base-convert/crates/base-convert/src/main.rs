@@ -277,8 +277,7 @@ fn cmd_convert(args: ConvertArgs) -> Result<()> {
 /// remap tensor names to canonical .base convention, re-quantize to the
 /// target scheme, write the .base file.
 ///
-/// No AWQ at this phase — plain round-trip-through-f32 then re-quantize.
-/// AWQ lands once a minimal forward pass is wired (Phase 1.5).
+/// Plain round-trip-through-f32 then re-quantize (no AWQ on this path).
 fn convert_gguf(
     input: &std::path::Path,
     output: &std::path::Path,

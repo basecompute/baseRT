@@ -4,9 +4,8 @@
 //! runs AWQ search to find per-channel scales, applies the rotation,
 //! packs through the canonical RTN packer, and verifies that the
 //! AWQ path beats plain RTN on reconstruction MSE for the salient
-//! channels. This is the contract Phase 5 (legacy kernel deletion)
-//! relies on: the canonical path matches or beats the v1.0 quant
-//! quality at the same bit budget.
+//! channels — the canonical path must match or beat plain RTN quality
+//! at the same bit budget.
 
 use base_awq::{awq_apply, AwqConfig};
 use base_format::ScaleDtype;
