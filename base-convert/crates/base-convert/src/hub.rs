@@ -206,7 +206,7 @@ fn auto_pull_and_resolve(reg: &MergedRegistry, id: &str, want_variant: Option<&s
 
     // Re-scan and return the freshly-installed artifact (registered under the
     // pulled id, which may differ from the requested one).
-    let reg2 = MergedRegistry::bundled()?;
+    let reg2 = MergedRegistry::load()?;
     if let Some(v) = want_variant {
         if let Some(p) = reg2.local.installed_path(&pull_id, v) {
             return Ok(p);
@@ -222,7 +222,7 @@ fn auto_pull_and_resolve(reg: &MergedRegistry, id: &str, want_variant: Option<&s
 /// converting the source repo — so `basert chat`/`serve <id>` Just Works.
 fn resolve_hub_model(token: &str) -> Result<PathBuf> {
     let (id, variant) = token.split_once(':').map_or((token, None), |(i, v)| (i, Some(v)));
-    let reg = MergedRegistry::bundled()?;
+    let reg = MergedRegistry::load()?;
 
     if let Some(v) = variant {
         if let Some(p) = reg.local.installed_path(id, v) {
@@ -296,7 +296,7 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
 }
 
 pub fn cmd_pull(args: PullArgs) -> Result<()> {
-    let reg = MergedRegistry::bundled()?;
+    let reg = MergedRegistry::load()?;
     let root = reg.root.clone();
     let want = quant_token(&args);
     let r = reg.resolve(&args.id, &args.revision, Some(&want), args.force)?;
@@ -627,7 +627,7 @@ fn write_sidecar_for(
 }
 
 pub fn cmd_list(args: ListArgs) -> Result<()> {
-    let reg = MergedRegistry::bundled()?;
+    let reg = MergedRegistry::load()?;
     let rows = reg.list(args.remote)?;
 
     if args.json {

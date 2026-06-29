@@ -194,6 +194,14 @@ impl CatalogRegistry {
         })
     }
 
+    /// Load the hosted catalog (cached under `cache_dir`), falling back to the
+    /// bundled copy offline. Never fails — see [`Catalog::load`].
+    pub fn load(cache_dir: &Path) -> Self {
+        Self {
+            catalog: Catalog::load(cache_dir),
+        }
+    }
+
     pub fn from_catalog(catalog: Catalog) -> Self {
         Self { catalog }
     }
@@ -254,10 +262,20 @@ impl MergedRegistry {
         }
     }
 
-    /// Build from the cache root + bundled catalog.
+    /// Build from the cache root + bundled catalog. Used by tests and any
+    /// offline-only path; production code paths should prefer [`Self::load`].
     pub fn bundled() -> Result<Self> {
         let root = cache::models_dir()?;
         Ok(Self::new(root, CatalogRegistry::bundled()?))
+    }
+
+    /// Build from the cache root + the hosted catalog (cached + bundled
+    /// fallback). This is the CLI entry point so a catalog update is picked up
+    /// without a new binary. Errors only if the models dir can't be resolved.
+    pub fn load() -> Result<Self> {
+        let root = cache::models_dir()?;
+        let catalog = CatalogRegistry::load(&root);
+        Ok(Self::new(root, catalog))
     }
 
     /// Resolve an id to a concrete [`ModelRef`].
