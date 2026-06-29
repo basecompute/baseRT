@@ -127,33 +127,114 @@ fn looks_like_hub_id(token: &str) -> bool {
     id.contains('/')
 }
 
-/// Resolve a hub model reference (`org/model` or `org/model:variant`) to the
-/// installed `.base` artifact path. Errors when the id is hub-shaped but not
-/// installed, or ambiguous across variants, so the user gets an actionable
-/// message instead of a runtime "file not found".
-fn resolve_hub_model(token: &str) -> Result<PathBuf> {
-    let (id, variant) = token.split_once(':').map_or((token, None), |(i, v)| (i, Some(v)));
-    let reg = MergedRegistry::bundled()?;
-
-    if let Some(v) = variant {
-        return reg.local.installed_path(id, v).with_context(|| {
-            format!("model `{id}:{v}` is not installed — run `basert pull {id}` or see `basert list`")
-        });
+/// Map a requested id to the id we should actually pull, preferring a
+/// pre-converted artifact in the basecompute org. `Qwen/Qwen3-0.6B` →
+/// `basecompute/Qwen3-0.6B` when that's catalogued; otherwise the id is
+/// returned unchanged (convert-on-pull from the source repo).
+fn preconverted_id(reg: &MergedRegistry, id: &str) -> String {
+    if id.starts_with("basecompute/") {
+        return id.to_string();
     }
+    let name = id.rsplit('/').next().unwrap_or(id);
+    let candidate = format!("basecompute/{name}");
+    if reg.catalog.resolve(&candidate).is_some() {
+        candidate
+    } else {
+        id.to_string()
+    }
+}
 
+/// Map a quant tag (`q4`, `q8`, …) to the matching convert target.
+fn target_from_quant(tag: &str) -> TargetScheme {
+    match tag {
+        "q2" => TargetScheme::BaseQ2,
+        "q3" => TargetScheme::BaseQ3,
+        "q5" => TargetScheme::BaseQ5,
+        "q6" => TargetScheme::BaseQ6,
+        "q8" => TargetScheme::BaseQ8,
+        "bf16" => TargetScheme::Bf16,
+        "mxfp4" => TargetScheme::Mxfp4,
+        "nvfp4" => TargetScheme::Nvfp4,
+        _ => TargetScheme::BaseQ4,
+    }
+}
+
+/// The installed artifact path for `id`, if exactly one variant is present.
+/// `Ok(None)` when not installed; errors when several variants exist (the
+/// caller must disambiguate with `id:<variant>`).
+fn installed_single_path(reg: &MergedRegistry, id: &str) -> Result<Option<PathBuf>> {
     let installed = reg.local.list()?;
     let hits: Vec<&ModelEntry> = installed.iter().filter(|r| r.id == id).collect();
     match hits.as_slice() {
-        [] => bail!("model `{id}` is not installed — run `basert pull {id}` or see `basert list`"),
-        [one] => one
-            .path
-            .clone()
-            .with_context(|| format!("installed model `{id}` has no artifact path")),
+        [] => Ok(None),
+        [one] => Ok(Some(
+            one.path
+                .clone()
+                .with_context(|| format!("installed model `{id}` has no artifact path"))?,
+        )),
         many => {
             let variants = many.iter().map(|r| r.variant.as_str()).collect::<Vec<_>>().join(", ");
             bail!("model `{id}` has multiple installed variants ({variants}) — specify one as `{id}:<variant>`")
         }
     }
+}
+
+/// Fetch a not-yet-installed model on demand, then return its artifact path.
+/// Prefers the pre-converted basecompute mirror; otherwise converts the source
+/// repo on pull. Progress (download + quantization) is shown by `cmd_pull`.
+fn auto_pull_and_resolve(reg: &MergedRegistry, id: &str, want_variant: Option<&str>) -> Result<PathBuf> {
+    let pull_id = preconverted_id(reg, id);
+    let target = want_variant
+        .map(|v| target_from_quant(&quant_tag(v)))
+        .unwrap_or(TargetScheme::BaseQ4);
+
+    if pull_id != id {
+        eprintln!("{id}: not installed — using pre-converted {pull_id}");
+    } else {
+        eprintln!("{id}: not installed — fetching (download + convert if needed)");
+    }
+
+    cmd_pull(PullArgs {
+        id: pull_id.clone(),
+        profile: None,
+        target,
+        revision: "main".to_string(),
+        force: false,
+        dry_run: false,
+    })
+    .with_context(|| format!("auto-fetching {pull_id}"))?;
+
+    // Re-scan and return the freshly-installed artifact (registered under the
+    // pulled id, which may differ from the requested one).
+    let reg2 = MergedRegistry::bundled()?;
+    if let Some(v) = want_variant {
+        if let Some(p) = reg2.local.installed_path(&pull_id, v) {
+            return Ok(p);
+        }
+    }
+    installed_single_path(&reg2, &pull_id)?
+        .with_context(|| format!("fetched {pull_id} but could not locate the installed artifact"))
+}
+
+/// Resolve a hub model reference (`org/model` or `org/model:variant`) to the
+/// installed `.base` artifact path. When the model isn't installed yet it is
+/// fetched on demand — preferring the pre-converted basecompute mirror, else
+/// converting the source repo — so `basert chat`/`serve <id>` Just Works.
+fn resolve_hub_model(token: &str) -> Result<PathBuf> {
+    let (id, variant) = token.split_once(':').map_or((token, None), |(i, v)| (i, Some(v)));
+    let reg = MergedRegistry::bundled()?;
+
+    if let Some(v) = variant {
+        if let Some(p) = reg.local.installed_path(id, v) {
+            return Ok(p);
+        }
+        return auto_pull_and_resolve(&reg, id, Some(v));
+    }
+
+    if let Some(p) = installed_single_path(&reg, id)? {
+        return Ok(p);
+    }
+    auto_pull_and_resolve(&reg, id, None)
 }
 
 /// Rewrite every hub-id-shaped argument to the installed `.base` path so that
@@ -695,6 +776,35 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), b"q8-bytes");
         // A provenance sidecar was written.
         assert!(root.join("basecompute/m/default-q8/hub.json").exists());
+    }
+
+    #[test]
+    fn preconverted_id_prefers_basecompute_mirror() {
+        let reg = MergedRegistry::bundled().unwrap();
+        // A source-org id with a catalogued basecompute counterpart maps to it.
+        assert_eq!(
+            preconverted_id(&reg, "Qwen/Qwen3-0.6B"),
+            "basecompute/Qwen3-0.6B"
+        );
+        // An already-basecompute id is unchanged.
+        assert_eq!(
+            preconverted_id(&reg, "basecompute/Qwen3-0.6B"),
+            "basecompute/Qwen3-0.6B"
+        );
+        // No catalogued counterpart → fall back to the source repo (convert-on-pull).
+        assert_eq!(
+            preconverted_id(&reg, "someorg/Definitely-Not-Catalogued-XYZ"),
+            "someorg/Definitely-Not-Catalogued-XYZ"
+        );
+    }
+
+    #[test]
+    fn target_from_quant_maps_known_tags() {
+        assert!(matches!(target_from_quant("q8"), TargetScheme::BaseQ8));
+        assert!(matches!(target_from_quant("q4"), TargetScheme::BaseQ4));
+        assert!(matches!(target_from_quant("bf16"), TargetScheme::Bf16));
+        // Unknown → q4 default.
+        assert!(matches!(target_from_quant("weird"), TargetScheme::BaseQ4));
     }
 
     #[test]
