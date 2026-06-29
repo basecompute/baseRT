@@ -13,6 +13,8 @@ sha2.workspace = true
 base-format.workspace = true
 hf-hub.workspace = true
 dirs.workspace = true
+# Generic HTTPS GET for the hosted catalog (same ureq 3 / rustls stack as hf-hub).
+ureq = "3"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,12 +1,38 @@
 //! The curated catalog of pre-converted `.base` models hosted in the basecompute
-//! HF org. Bundled into the binary via `include_str!` and parsed at startup;
-//! a future hosted catalog can serve the same schema at a URL.
+//! HF org.
+//!
+//! The catalog is fetched from a hosted URL at runtime ([`Catalog::load`]) so
+//! it can be updated without shipping a new binary; the copy bundled via
+//! `include_str!` is the offline/last-resort fallback. Resolution order is:
+//! fresh on-disk cache → hosted fetch → stale cache → bundled.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::time::Duration;
 
 /// Catalog shipped in the binary. Points only at public HF artifacts.
 const BUNDLED: &str = include_str!("../catalog.json");
+
+/// Hosted catalog, served raw from the public mirror's tree. Override with
+/// `$BASERT_CATALOG_URL`; set `$BASERT_CATALOG_OFFLINE` to skip the network and
+/// use the cache/bundled copy.
+pub const DEFAULT_CATALOG_URL: &str =
+    "https://raw.githubusercontent.com/basecompute/baseRT/main/base-convert/crates/base-hub/catalog.json";
+
+/// Filename of the on-disk catalog cache, under the models dir.
+const CACHE_FILE: &str = ".catalog-cache.json";
+/// How long a cached catalog is served before re-fetching.
+const CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Network budget for a catalog fetch — kept tight so the CLI never hangs.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn catalog_url() -> String {
+    std::env::var("BASERT_CATALOG_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_CATALOG_URL.to_string())
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Catalog {
@@ -64,6 +90,75 @@ impl Catalog {
         Ok(serde_json::from_str(s)?)
     }
 
+    /// Load the catalog for runtime use. Prefers a fresh hosted copy so the
+    /// catalog can change without a new binary release. Never fails: any error
+    /// (no network, bad JSON, …) falls through to the cache, then the bundled
+    /// copy. `cache_dir` is typically the models dir.
+    pub fn load(cache_dir: &Path) -> Self {
+        let cache = cache_dir.join(CACHE_FILE);
+        if std::env::var_os("BASERT_CATALOG_OFFLINE").is_some() {
+            return Self::cache_or_bundled(&cache);
+        }
+        // A fresh cache short-circuits the network so most commands pay nothing.
+        if let Some(c) = Self::fresh_cache(&cache) {
+            return c;
+        }
+        match Self::fetch(&catalog_url()) {
+            Some(c) => {
+                let _ = Self::write_cache(&cache, &c);
+                c
+            }
+            None => Self::cache_or_bundled(&cache),
+        }
+    }
+
+    /// Parse the cache regardless of age, then fall back to the bundled copy,
+    /// then to an empty catalog (load never fails).
+    fn cache_or_bundled(cache: &Path) -> Self {
+        Self::parse_file(cache)
+            .or_else(|| Self::bundled().ok())
+            .unwrap_or_else(|| Catalog {
+                schema: 1,
+                updated: String::new(),
+                models: Vec::new(),
+            })
+    }
+
+    fn fresh_cache(cache: &Path) -> Option<Self> {
+        let age = std::fs::metadata(cache)
+            .and_then(|m| m.modified())
+            .ok()?
+            .elapsed()
+            .ok()?;
+        (age < CACHE_TTL).then(|| Self::parse_file(cache)).flatten()
+    }
+
+    fn parse_file(path: &Path) -> Option<Self> {
+        Self::from_json(&std::fs::read_to_string(path).ok()?).ok()
+    }
+
+    fn write_cache(cache: &Path, cat: &Catalog) -> std::io::Result<()> {
+        if let Some(dir) = cache.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let bytes = serde_json::to_vec_pretty(cat).unwrap_or_default();
+        std::fs::write(cache, bytes)
+    }
+
+    /// Fetch + parse the hosted catalog. Returns `None` on any network/parse
+    /// error, or if the payload isn't a schema-valid catalog (so we never cache
+    /// or serve a CDN error page).
+    fn fetch(url: &str) -> Option<Self> {
+        let mut resp = ureq::get(url)
+            .config()
+            .timeout_global(Some(FETCH_TIMEOUT))
+            .build()
+            .call()
+            .ok()?;
+        let body = resp.body_mut().read_to_string().ok()?;
+        Self::from_json(&body).ok().filter(|c| c.schema >= 1)
+    }
+
     /// Find an entry by exact id, then case-insensitively.
     pub fn find(&self, id: &str) -> Option<&CatalogEntry> {
         self.models
@@ -81,6 +176,32 @@ mod tests {
     fn bundled_catalog_parses() {
         let cat = Catalog::bundled().expect("bundled catalog should parse");
         assert_eq!(cat.schema, 1);
+    }
+
+    #[test]
+    fn cache_roundtrip_and_bundled_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join(".catalog-cache.json");
+
+        // No cache yet → falls back to the populated bundled catalog.
+        let c = Catalog::cache_or_bundled(&cache);
+        assert!(!c.models.is_empty(), "bundled fallback should be populated");
+
+        // Write a small catalog to the cache and read it back as fresh.
+        let mini = Catalog::from_json(
+            r#"{"schema":1,"updated":"x","models":[
+                {"id":"basecompute/Test","hf_repo":"basecompute/Test",
+                 "arch":"llama","quant":"default-q4"}]}"#,
+        )
+        .unwrap();
+        Catalog::write_cache(&cache, &mini).unwrap();
+
+        let fresh = Catalog::fresh_cache(&cache).expect("just-written cache is fresh");
+        assert_eq!(fresh.models.len(), 1);
+        assert_eq!(fresh.models[0].id, "basecompute/Test");
+
+        // With a valid cache present, cache_or_bundled prefers it over bundled.
+        assert_eq!(Catalog::cache_or_bundled(&cache).models.len(), 1);
     }
 
     #[test]
