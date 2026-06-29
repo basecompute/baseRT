@@ -257,46 +257,6 @@
       "sha256": "682586936a9f29bb37055e2ff2ec724d1328435dec4b94a566793eb20bbd3d1c"
     },
     {
-      "id": "basecompute/TinyLlama-1.1B-Chat-v1.0",
-      "hf_repo": "basecompute/TinyLlama-1.1B-Chat-v1.0",
-      "file": "TinyLlama-1.1B-Chat-v1.0-Q4.base",
-      "source_repo": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-      "arch": "llama",
-      "quant": "default-q4",
-      "size": 620695552,
-      "sha256": "68e8e5a5cb958b11e4500dc6833deacefcc70ed742a0fb3d8632e2f49d3484dc"
-    },
-    {
-      "id": "basecompute/TinyLlama-1.1B-Chat-v1.0",
-      "hf_repo": "basecompute/TinyLlama-1.1B-Chat-v1.0",
-      "file": "TinyLlama-1.1B-Chat-v1.0-Q8.base",
-      "source_repo": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-      "arch": "llama",
-      "quant": "default-q8",
-      "size": 1136300032,
-      "sha256": "55182c65b7cb4c5f1f45bd39771adf361251770764f10666e8b4e4b647883e8e"
-    },
-    {
-      "id": "basecompute/SmolLM2-1.7B-Instruct",
-      "hf_repo": "basecompute/SmolLM2-1.7B-Instruct",
-      "file": "SmolLM2-1.7B-Instruct-Q4.base",
-      "source_repo": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
-      "arch": "llama",
-      "quant": "default-q4",
-      "size": 964825088,
-      "sha256": "09c4dffbc6379f20cbe31d63d874a2963cd572b0dcbb9526234e733d3a4051c8"
-    },
-    {
-      "id": "basecompute/SmolLM2-1.7B-Instruct",
-      "hf_repo": "basecompute/SmolLM2-1.7B-Instruct",
-      "file": "SmolLM2-1.7B-Instruct-Q8.base",
-      "source_repo": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
-      "arch": "llama",
-      "quant": "default-q8",
-      "size": 1766985728,
-      "sha256": "a7c3653125ffa548221ac9d33e658c09746854515eecbeab1943073e62d293a3"
-    },
-    {
       "id": "basecompute/Mistral-7B-Instruct-v0.3",
       "hf_repo": "basecompute/Mistral-7B-Instruct-v0.3",
       "file": "Mistral-7B-Instruct-v0.3-Q4.base",
@@ -315,26 +275,6 @@
       "quant": "default-q8",
       "size": 7476748288,
       "sha256": "3f2b5589475dd5da34b3433abec085b16d56818dba22748b08d39bd169f5243b"
-    },
-    {
-      "id": "basecompute/Ministral-8B-Instruct-2410",
-      "hf_repo": "basecompute/Ministral-8B-Instruct-2410",
-      "file": "Ministral-8B-Instruct-2410-Q4.base",
-      "source_repo": "mistralai/Ministral-8B-Instruct-2410",
-      "arch": "llama",
-      "quant": "default-q4",
-      "size": 4519763968,
-      "sha256": "32804841f1395f3e4faf028849d6dfcae190c716578bd29e6c2510cc6eaa945d"
-    },
-    {
-      "id": "basecompute/Ministral-8B-Instruct-2410",
-      "hf_repo": "basecompute/Ministral-8B-Instruct-2410",
-      "file": "Ministral-8B-Instruct-2410-Q8.base",
-      "source_repo": "mistralai/Ministral-8B-Instruct-2410",
-      "arch": "llama",
-      "quant": "default-q8",
-      "size": 8278908928,
-      "sha256": "cdd104a18efa331bdb0e8cb71460f6f6db7bbb4be3b73dfd011759da72a01bc0"
     }
   ]
 }
