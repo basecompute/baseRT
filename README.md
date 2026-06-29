@@ -115,8 +115,9 @@ Full flag reference: [docs/cli/reference.md](docs/cli/reference.md).
 - **`benchmarks/`** — scripts + reference results.
 - **`docs/`** — the documentation site.
 
-The engine ships as a prebuilt binary; everything in this repository is open
-source (Apache-2.0). See [docs/reference/engine-releases.md](docs/reference/engine-releases.md).
+Everything in this repository is open source (Apache-2.0). The engine ships as
+a separate prebuilt binary under a proprietary license — see
+[docs/reference/engine-releases.md](docs/reference/engine-releases.md).
 
 ## Links
 
@@ -127,4 +128,7 @@ source (Apache-2.0). See [docs/reference/engine-releases.md](docs/reference/engi
 
 ## License
 
-Apache-2.0. See `LICENSE` and `NOTICE`.
+This repository (the CLI, `.base` format, public headers, and bindings) is
+licensed under Apache-2.0 — see `LICENSE` and `NOTICE`. The prebuilt engine
+binary distributed via [Releases](https://github.com/basecompute/baseRT/releases)
+is proprietary and ships under its own license.
