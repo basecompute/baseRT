@@ -169,7 +169,7 @@ pub fn cmd_pull(args: PullArgs) -> Result<()> {
     match r {
         ModelRef::Local { id, variant, path } => {
             eprintln!(
-                "✓ {id} [{variant}] already installed: {}\n  (use --force to re-pull)",
+                "{id} [{variant}] already installed: {}\n  (use --force to re-pull)",
                 path.display()
             );
             Ok(())
@@ -240,7 +240,7 @@ fn pull_catalog(root: &Path, r: &ModelRef) -> Result<()> {
         None,
         Some(got_sha),
     )?;
-    eprintln!("✓ installed {id} [{variant}] → {}", out.display());
+    eprintln!("installed {id} [{variant}] → {}", out.display());
     Ok(())
 }
 
@@ -293,7 +293,7 @@ fn pull_and_convert(
         Some(&variant),
         sha,
     )?;
-    eprintln!("✓ installed {id} [{variant}] → {}", out.display());
+    eprintln!("installed {id} [{variant}] → {}", out.display());
     Ok(())
 }
 
