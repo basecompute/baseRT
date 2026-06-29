@@ -64,11 +64,13 @@ RTN pack; `bf16`/`f16` tensors are unaffected.
 | `--awq-profile <path>` | Precomputed AWQ activation-stats sidecar. |
 | `--synthetic` | Generate a dummy bundle (CI/testing; no file read). |
 
-!!! warning "Quantizing from already-quantized inputs"
-    The spec expects fp16/bf16/fp32 sources. Converting from an already-quantized
-    GGUF (Q4_K_M, Q8_0, …) or MLX 4-bit/8-bit compounds error. An explicit
-    override flag exists for users who don't have the fp16 checkpoint locally —
-    see `basert convert --help`.
+> [!WARNING]
+> **Quantizing from already-quantized inputs**
+>
+> The spec expects fp16/bf16/fp32 sources. Converting from an already-quantized
+> GGUF (Q4_K_M, Q8_0, …) or MLX 4-bit/8-bit compounds error. An explicit
+> override flag exists for users who don't have the fp16 checkpoint locally —
+> see `basert convert --help`.
 
 ## Inspecting the result
 

@@ -9,8 +9,8 @@ ecosystem around it: the `basert` CLI (model hub + converter), the `.base`
 model format, the public C API, and language bindings for Python, Node, Rust,
 and Swift.
 
-> **Full documentation:** [docs/](docs/) (also published as a website — see
-> [`mkdocs.yml`](mkdocs.yml)).
+> **Full documentation:** [docs/](docs/), also published at
+> [basecompute.co/docs](https://basecompute.co/docs).
 
 ---
 

@@ -21,18 +21,14 @@ Metal kernels embedded; there is no separate `.metallib` to ship.
 
 ## Get started
 
-<div class="grid cards" markdown>
-
-- :material-download: **[Installation](getting-started/installation.md)** — get
+- **[Installation](getting-started/installation.md)** — get
   the engine + the `basert` CLI on your `PATH`.
-- :material-rocket-launch: **[Quickstart](getting-started/quickstart.md)** —
+- **[Quickstart](getting-started/quickstart.md)** —
   pull a model and chat in under a minute.
-- :material-console: **[CLI reference](cli/reference.md)** — every command and
+- **[CLI reference](cli/reference.md)** — every command and
   flag.
-- :material-api: **[Server API](reference/server-api.md)** — the
+- **[Server API](reference/server-api.md)** — the
   OpenAI-compatible endpoints.
-
-</div>
 
 ## At a glance
 
@@ -55,11 +51,13 @@ basert serve --model Qwen/Qwen3-4B --api-key "$(uuidgen)"   # OpenAI server
 | `.base` files | The on-disk model format the runtime loads. |
 | Bindings | Python / Node / Rust / Swift over the C API (`baseRT.h`). |
 
-!!! note "Open ecosystem"
-    The engine ships as a prebuilt binary; this repository — the CLI, format,
-    headers, bindings, and docs — is open source (Apache-2.0). The engine is
-    consumed as a [prebuilt release](reference/engine-releases.md), so you never
-    need to build it yourself.
+> [!NOTE]
+> **Open ecosystem**
+>
+> The engine ships as a prebuilt binary; this repository — the CLI, format,
+> headers, bindings, and docs — is open source (Apache-2.0). The engine is
+> consumed as a [prebuilt release](reference/engine-releases.md), so you never
+> need to build it yourself.
 
 ## Requirements
 

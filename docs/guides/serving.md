@@ -27,10 +27,12 @@ See the full list of endpoints in the [Server API reference](../reference/server
 | `--max-tokens <N>` | `2048` | Default max generation tokens. |
 | `--metallib <path>` | auto | Path to `baseRT.metallib` (auto-detected next to the binary). |
 
-!!! tip "Set `--max-context` for long-context models"
-    The KV cache is allocated up front from `--max-context`. Models trained for
-    long context (Gemma 4 / Qwen3 MoE = 32k+) need this set explicitly; requests
-    exceeding it are rejected with `context_length_exceeded`.
+> [!TIP]
+> **Set `--max-context` for long-context models**
+>
+> The KV cache is allocated up front from `--max-context`. Models trained for
+> long context (Gemma 4 / Qwen3 MoE = 32k+) need this set explicitly; requests
+> exceeding it are rejected with `context_length_exceeded`.
 
 ## Throughput: batching & caching
 
@@ -77,10 +79,12 @@ restarts. `SIGINT`/`SIGTERM` exit immediately.
 rotation — `logrotate copytruncate` (Linux) or `newsyslog` with the `F` flag
 (macOS).
 
-!!! danger "Before exposing beyond localhost"
-    Always set `--api-key`, bind carefully with `--host`, and read
-    [Security](../reference/security.md). The server is intended for trusted
-    environments.
+> [!CAUTION]
+> **Before exposing beyond localhost**
+>
+> Always set `--api-key`, bind carefully with `--host`, and read
+> [Security](../reference/security.md). The server is intended for trusted
+> environments.
 
 ## Quick test
 
