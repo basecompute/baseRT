@@ -9,7 +9,7 @@ ecosystem around it: the `basert` CLI (model hub + converter), the `.base`
 model format, the public C API, and language bindings for Python, Node, Rust,
 and Swift.
 
-> 📚 **Full documentation:** [docs/](docs/) (also published as a website — see
+> **Full documentation:** [docs/](docs/) (also published as a website — see
 > [`mkdocs.yml`](mkdocs.yml)).
 
 ---
@@ -120,10 +120,10 @@ source (Apache-2.0). See [docs/reference/engine-releases.md](docs/reference/engi
 
 ## Links
 
-- 📖 [Documentation](docs/index.md)
-- 🔌 [Server API](docs/reference/server-api.md)
-- 🧱 [`.base` format](base-convert/FORMAT.md)
-- 🔒 [Security](SECURITY.md) · 🤝 [Contributing](CONTRIBUTING.md)
+- [Documentation](docs/index.md)
+- [Server API](docs/reference/server-api.md)
+- [`.base` format](base-convert/FORMAT.md)
+- [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md)
 
 ## License
 
