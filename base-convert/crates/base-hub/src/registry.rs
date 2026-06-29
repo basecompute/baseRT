@@ -262,12 +262,33 @@ impl MergedRegistry {
 
     /// Resolve an id to a concrete [`ModelRef`].
     ///
-    /// With `force`, the already-installed shortcut is skipped so the model
-    /// is re-fetched/re-converted. A bare HF `org/model` id that isn't in the
-    /// catalog falls through to convert-on-pull.
-    pub fn resolve(&self, id: &str, revision: &str, force: bool) -> Result<ModelRef> {
+    /// `want_quant` is the quant the caller is after (`q4`, `q8`, …); when set,
+    /// the already-installed shortcut only fires for *that* quant — so asking
+    /// for q8 never silently returns an installed q4. With `force`, the
+    /// shortcut is skipped entirely so the model is re-fetched/re-converted.
+    /// A bare HF `org/model` id that isn't in the catalog falls through to
+    /// convert-on-pull.
+    pub fn resolve(
+        &self,
+        id: &str,
+        revision: &str,
+        want_quant: Option<&str>,
+        force: bool,
+    ) -> Result<ModelRef> {
         if !force {
-            if let Some(ModelRef::Catalog { variant, .. }) = self.catalog.resolve(id) {
+            // Variants installed by every pull path are named `default-<quant>`
+            // (or the catalog entry's own quant). When the caller names a quant,
+            // honour exactly that one.
+            if let Some(want) = want_quant {
+                let variant = format!("default-{want}");
+                if let Some(path) = self.local.installed_path(id, &variant) {
+                    return Ok(ModelRef::Local {
+                        id: id.to_string(),
+                        variant,
+                        path,
+                    });
+                }
+            } else if let Some(ModelRef::Catalog { variant, .. }) = self.catalog.resolve(id) {
                 if let Some(path) = self.local.installed_path(id, &variant) {
                     return Ok(ModelRef::Local {
                         id: id.to_string(),
@@ -334,7 +355,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let reg = MergedRegistry::new(tmp.path(), catalog_with_one());
 
-        match reg.resolve("basecompute/demo", "main", false).unwrap() {
+        match reg.resolve("basecompute/demo", "main", None, false).unwrap() {
             ModelRef::Catalog {
                 hf_repo, variant, ..
             } => {
@@ -344,13 +365,35 @@ mod tests {
             other => panic!("expected Catalog, got {other:?}"),
         }
         match reg
-            .resolve("meta-llama/Llama-3.2-1B", "main", false)
+            .resolve("meta-llama/Llama-3.2-1B", "main", None, false)
             .unwrap()
         {
             ModelRef::HuggingFace { repo, .. } => assert_eq!(repo, "meta-llama/Llama-3.2-1B"),
             other => panic!("expected HuggingFace, got {other:?}"),
         }
-        assert!(reg.resolve("single-segment", "main", false).is_err());
+        assert!(reg.resolve("single-segment", "main", None, false).is_err());
+    }
+
+    #[test]
+    fn resolve_installed_shortcut_is_quant_aware() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = MergedRegistry::new(tmp.path(), catalog_with_one());
+        // Only the q4 variant is on disk.
+        let vdir = cache::variant_dir(tmp.path(), "basecompute/demo", "default-q4").unwrap();
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(cache::base_artifact_path(&vdir), b"installed-q4").unwrap();
+
+        // Asking for q4 → the installed artifact.
+        assert!(matches!(
+            reg.resolve("basecompute/demo", "main", Some("q4"), false).unwrap(),
+            ModelRef::Local { .. }
+        ));
+        // Asking for q8 must NOT return the installed q4 — it falls through to
+        // the catalog so the right quant gets fetched.
+        assert!(matches!(
+            reg.resolve("basecompute/demo", "main", Some("q8"), false).unwrap(),
+            ModelRef::Catalog { .. }
+        ));
     }
 
     #[test]
@@ -387,13 +430,13 @@ mod tests {
         std::fs::create_dir_all(&vdir).unwrap();
         std::fs::write(cache::base_artifact_path(&vdir), b"not a real base").unwrap();
 
-        match reg.resolve("basecompute/demo", "main", false).unwrap() {
+        match reg.resolve("basecompute/demo", "main", None, false).unwrap() {
             ModelRef::Local { variant, .. } => assert_eq!(variant, "default-q4"),
             other => panic!("expected Local, got {other:?}"),
         }
         // With force, the local shortcut is skipped.
         assert!(matches!(
-            reg.resolve("basecompute/demo", "main", true).unwrap(),
+            reg.resolve("basecompute/demo", "main", None, true).unwrap(),
             ModelRef::Catalog { .. }
         ));
     }
