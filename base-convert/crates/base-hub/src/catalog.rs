@@ -137,12 +137,24 @@ impl Catalog {
         Self::from_json(&std::fs::read_to_string(path).ok()?).ok()
     }
 
+    /// Write the cache atomically: serialize to a per-process temp file, then
+    /// rename over the target. The rename is atomic on the same filesystem, so
+    /// a concurrent `basert` process never observes a half-written cache and
+    /// two writers just resolve to last-one-wins (both payloads are valid).
     fn write_cache(cache: &Path, cat: &Catalog) -> std::io::Result<()> {
         if let Some(dir) = cache.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let bytes = serde_json::to_vec_pretty(cat).unwrap_or_default();
-        std::fs::write(cache, bytes)
+        let tmp = cache.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, bytes)?;
+        match std::fs::rename(&tmp, cache) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
     }
 
     /// Fetch + parse the hosted catalog. Returns `None` on any network/parse
@@ -166,6 +178,32 @@ impl Catalog {
             .find(|e| e.id == id)
             .or_else(|| self.models.iter().find(|e| e.id.eq_ignore_ascii_case(id)))
     }
+
+    /// Check the catalog is internally consistent: every entry well-formed, and
+    /// no duplicate `(id, quant)` pair (which would shadow in `find`/listing).
+    /// Run by tests/CI to catch a malformed catalog edit before it ships and
+    /// before clients fetch it.
+    pub fn validate(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for e in &self.models {
+            if e.id.is_empty() {
+                anyhow::bail!("catalog entry with empty id (hf_repo {:?})", e.hf_repo);
+            }
+            if e.hf_repo.is_empty() {
+                anyhow::bail!("{}: empty hf_repo", e.id);
+            }
+            if !e.file.ends_with(".base") {
+                anyhow::bail!("{}: file {:?} is not a .base", e.id, e.file);
+            }
+            if e.quant.is_empty() {
+                anyhow::bail!("{}: empty quant", e.id);
+            }
+            if !seen.insert((e.id.as_str(), e.quant.as_str())) {
+                anyhow::bail!("duplicate catalog entry: {} [{}]", e.id, e.quant);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +214,25 @@ mod tests {
     fn bundled_catalog_parses() {
         let cat = Catalog::bundled().expect("bundled catalog should parse");
         assert_eq!(cat.schema, 1);
+    }
+
+    #[test]
+    fn bundled_catalog_is_valid() {
+        Catalog::bundled()
+            .unwrap()
+            .validate()
+            .expect("bundled catalog must be internally consistent");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_id_quant() {
+        let dup = Catalog::from_json(
+            r#"{"schema":1,"models":[
+                {"id":"basecompute/X","hf_repo":"basecompute/X","file":"a.base","quant":"default-q4"},
+                {"id":"basecompute/X","hf_repo":"basecompute/X","file":"b.base","quant":"default-q4"}]}"#,
+        )
+        .unwrap();
+        assert!(dup.validate().is_err(), "duplicate (id,quant) must fail");
     }
 
     #[test]
