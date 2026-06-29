@@ -84,6 +84,26 @@ mod tests {
     }
 
     #[test]
+    fn bundled_catalog_is_populated_and_resolves_default_q4() {
+        let cat = Catalog::bundled().unwrap();
+        assert!(!cat.models.is_empty(), "bundled catalog should not be empty");
+        // Every entry carries the fields the resolver/installer need.
+        for e in &cat.models {
+            assert!(e.id.starts_with("basecompute/"), "id: {}", e.id);
+            assert!(e.file.ends_with(".base"), "file: {}", e.file);
+            assert!(e.arch.is_some(), "arch missing for {}", e.id);
+            assert!(e.sha256.is_some(), "sha256 missing for {}", e.id);
+        }
+        // find() returns the first id match — entries are ordered q4-first so
+        // the recommended default is q4.
+        let e = cat
+            .find("basecompute/Llama-3.2-1B-Instruct")
+            .expect("Llama-3.2-1B-Instruct should be catalogued");
+        assert_eq!(e.quant, "default-q4");
+        assert_eq!(e.arch.as_deref(), Some("llama"));
+    }
+
+    #[test]
     fn find_matches_exact_and_ci() {
         let cat = Catalog::from_json(
             r#"{"schema":1,"updated":"x","models":[

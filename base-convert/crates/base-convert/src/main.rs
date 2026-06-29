@@ -1085,7 +1085,14 @@ fn convert_generic(
 
     let mut writer = BaseWriter::create(output, header).context("create writer")?;
 
+    let pb = indicatif::ProgressBar::new(mapped.len() as u64);
+    pb.set_style(
+        indicatif::ProgressStyle::with_template("  quantizing [{bar:28}] {pos}/{len} {msg}")
+            .expect("valid progress template")
+            .progress_chars("=>-"),
+    );
     for (src_name, canonical) in &mapped {
+        pb.set_message(canonical.clone());
         let shape = provider.source_shape(src_name)?;
 
         let mut f32s = provider
@@ -1310,7 +1317,10 @@ fn convert_generic(
         };
 
         writer.add_tensor(TensorPayload { entry, data });
+        pb.inc(1);
     }
+    pb.finish_and_clear();
+    eprintln!("  quantized {} tensors", mapped.len());
 
     // Multimodal towers — preserve their HF names verbatim and route
     // them into the mmproj sub-bundle. Tower weights stay on the same
