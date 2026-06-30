@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-06-29",
+  "updated": "2026-07-01",
   "models": [
     {
       "id": "basecompute/Qwen3-0.6B",
@@ -275,6 +275,46 @@
       "quant": "default-q8",
       "size": 7476748288,
       "sha256": "3f2b5589475dd5da34b3433abec085b16d56818dba22748b08d39bd169f5243b"
+    },
+    {
+      "id": "basecompute/Qwen3-4B-Instruct-2507",
+      "hf_repo": "basecompute/Qwen3-4B-Instruct-2507",
+      "file": "Qwen3-4B-Instruct-2507-Q4.base",
+      "source_repo": "Qwen/Qwen3-4B-Instruct-2507",
+      "arch": "qwen",
+      "quant": "default-q4",
+      "size": 2829521920,
+      "sha256": "4523c9d3f10dc77bd6e82a78dee495f0a5241f0a4a1eb3902216ec0df6bf94b9"
+    },
+    {
+      "id": "basecompute/Qwen3-4B-Instruct-2507",
+      "hf_repo": "basecompute/Qwen3-4B-Instruct-2507",
+      "file": "Qwen3-4B-Instruct-2507-Q8.base",
+      "source_repo": "Qwen/Qwen3-4B-Instruct-2507",
+      "arch": "qwen",
+      "quant": "default-q8",
+      "size": 4155544576,
+      "sha256": "09f7ac220735baf95d4effcf85417c8c8eadf69a42d21e48edcf33924ea55a40"
+    },
+    {
+      "id": "basecompute/Qwen3-4B-Thinking-2507",
+      "hf_repo": "basecompute/Qwen3-4B-Thinking-2507",
+      "file": "Qwen3-4B-Thinking-2507-Q4.base",
+      "source_repo": "Qwen/Qwen3-4B-Thinking-2507",
+      "arch": "qwen",
+      "quant": "default-q4",
+      "size": 2829521920,
+      "sha256": "81185cd73a47087a1f730238f690c57729993287b9503a36f5370a21366a13fa"
+    },
+    {
+      "id": "basecompute/Qwen3-4B-Thinking-2507",
+      "hf_repo": "basecompute/Qwen3-4B-Thinking-2507",
+      "file": "Qwen3-4B-Thinking-2507-Q8.base",
+      "source_repo": "Qwen/Qwen3-4B-Thinking-2507",
+      "arch": "qwen",
+      "quant": "default-q8",
+      "size": 4155544576,
+      "sha256": "930d78ec853410b68a433bfb8f608fe389566936899bf0a9dbc867618d80bce4"
     }
   ]
 }
