@@ -4,8 +4,7 @@
 
 BaseRT runs large language models locally on Apple Silicon. Pull a model from
 HuggingFace, chat with it, or serve an OpenAI-compatible API — all through one
-CLI, `basert`. The engine is a single self-contained `libbaseRT.dylib` with the
-Metal kernels embedded; there is no separate `.metallib` to ship.
+CLI, `basert`.
 
 ## Why BaseRT
 
