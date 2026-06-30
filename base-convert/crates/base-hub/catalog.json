@@ -1,0 +1,320 @@
+{
+  "schema": 1,
+  "updated": "2026-07-01",
+  "models": [
+    {
+      "id": "basecompute/Qwen3-0.6B",
+      "hf_repo": "basecompute/Qwen3-0.6B",
+      "file": "Qwen3-0.6B-Q4.base",
+      "source_repo": "Qwen/Qwen3-0.6B",
+      "arch": "qwen",
+      "quant": "default-q4",
+      "size": 430114816,
+      "sha256": "aeb9a2b16c1a5519895f99eec67e3d7c3347851d778a3663cfe80242ae87817e"
+    },
+    {
+      "id": "basecompute/Qwen3-0.6B",
+      "hf_repo": "basecompute/Qwen3-0.6B",
+      "file": "Qwen3-0.6B-Q8.base",
+      "source_repo": "Qwen/Qwen3-0.6B",
+      "arch": "qwen",
+      "quant": "default-q8",
+      "size": 782403584,
+      "sha256": "a562fd2b682206a208fb938df6951849a70829b4228b604ccdf381327a716370"
+    },
+    {
+      "id": "basecompute/Qwen3-4B",
+      "hf_repo": "basecompute/Qwen3-4B",
+      "file": "Qwen3-4B-Q4.base",
+      "source_repo": "Qwen/Qwen3-4B",
+      "arch": "qwen",
+      "quant": "default-q4",
+      "size": 2270401536,
+      "sha256": "df660a56b61bb68b940da100f9ad345a93d396df1955387e2f41f317e130e696"
+    },
+    {
+      "id": "basecompute/Qwen3-4B",
+      "hf_repo": "basecompute/Qwen3-4B",
+      "file": "Qwen3-4B-Q8.base",
+      "source_repo": "Qwen/Qwen3-4B",
+      "arch": "qwen",
+      "quant": "default-q8",
+      "size": 4155544576,
+      "sha256": "7898a470ac96c67b97e6330eb0f2b5fc00475247880a66e12b7640d9cc169b9a"
+    },
+    {
+      "id": "basecompute/Qwen3-30B-A3B-Thinking-2507",
+      "hf_repo": "basecompute/Qwen3-30B-A3B-Thinking-2507",
+      "file": "Qwen3-30B-A3B-Thinking-2507-Q4.base",
+      "source_repo": "Qwen/Qwen3-30B-A3B-Thinking-2507",
+      "arch": "qwen3_moe",
+      "quant": "default-q4",
+      "size": 17182330880,
+      "sha256": "52b5666ee1026b12d1d7c234ec5eedeb4deed1949caeb0c0f1e53e6d0259042e"
+    },
+    {
+      "id": "basecompute/Qwen3-30B-A3B-Thinking-2507",
+      "hf_repo": "basecompute/Qwen3-30B-A3B-Thinking-2507",
+      "file": "Qwen3-30B-A3B-Thinking-2507-Q8.base",
+      "source_repo": "Qwen/Qwen3-30B-A3B-Thinking-2507",
+      "arch": "qwen3_moe",
+      "quant": "default-q8",
+      "size": 31493787648,
+      "sha256": "5df2136010dcfedc36be6229770ad066b60fe5ec58825795bac9a6738b5567e8"
+    },
+    {
+      "id": "basecompute/gemma-3-1b-it",
+      "hf_repo": "basecompute/gemma-3-1b-it",
+      "file": "gemma-3-1b-it-Q4.base",
+      "source_repo": "google/gemma-3-1b-it",
+      "arch": "gemma3",
+      "quant": "default-q4",
+      "size": 579602688,
+      "sha256": "149ec28b4df637adda54064af2d7df753a3d55e500fcb710aef4c169a12ef387"
+    },
+    {
+      "id": "basecompute/gemma-3-1b-it",
+      "hf_repo": "basecompute/gemma-3-1b-it",
+      "file": "gemma-3-1b-it-Q8.base",
+      "source_repo": "google/gemma-3-1b-it",
+      "arch": "gemma3",
+      "quant": "default-q8",
+      "size": 1047890176,
+      "sha256": "d8e31808182c9e232660484dd5baa47d9fb711bc6e3ff48484dbaecf62a4238c"
+    },
+    {
+      "id": "basecompute/Llama-3.2-1B-Instruct",
+      "hf_repo": "basecompute/Llama-3.2-1B-Instruct",
+      "file": "Llama-3.2-1B-Instruct-Q4.base",
+      "source_repo": "meta-llama/Llama-3.2-1B-Instruct",
+      "arch": "llama",
+      "quant": "default-q4",
+      "size": 701861888,
+      "sha256": "292fe9db91c3a0da29e4d7e049eecc6fc30b0b9e009df3775b0f4894bac1a65e"
+    },
+    {
+      "id": "basecompute/Llama-3.2-1B-Instruct",
+      "hf_repo": "basecompute/Llama-3.2-1B-Instruct",
+      "file": "Llama-3.2-1B-Instruct-Q8.base",
+      "source_repo": "meta-llama/Llama-3.2-1B-Instruct",
+      "arch": "llama",
+      "quant": "default-q8",
+      "size": 1281118208,
+      "sha256": "67765adbe195378cda62ecea46c3cb2a6ab82d13709f4643f1abb0a70561c799"
+    },
+    {
+      "id": "basecompute/Llama-3.2-3B-Instruct",
+      "hf_repo": "basecompute/Llama-3.2-3B-Instruct",
+      "file": "Llama-3.2-3B-Instruct-Q4.base",
+      "source_repo": "meta-llama/Llama-3.2-3B-Instruct",
+      "arch": "llama",
+      "quant": "default-q4",
+      "size": 1814222848,
+      "sha256": "a0d5be46b5e13ce488e351cb8d769d3402250ee8adf3ff1fa41e70328f1fac8a"
+    },
+    {
+      "id": "basecompute/Llama-3.2-3B-Instruct",
+      "hf_repo": "basecompute/Llama-3.2-3B-Instruct",
+      "file": "Llama-3.2-3B-Instruct-Q8.base",
+      "source_repo": "meta-llama/Llama-3.2-3B-Instruct",
+      "arch": "llama",
+      "quant": "default-q8",
+      "size": 3320125440,
+      "sha256": "fe94e68856346a8016f83d142b5fac16555e180a6409f357b749e7f708ec7dea"
+    },
+    {
+      "id": "basecompute/gemma-4-E2B-it",
+      "hf_repo": "basecompute/gemma-4-E2B-it",
+      "file": "gemma-4-E2B-it-Q4.base",
+      "arch": "gemma4",
+      "quant": "default-q4",
+      "size": 2941140992,
+      "sha256": "785c3527ab6d33e4d2a1976e63ecc2bf13ceb0cab5b00ce375fd9cec2a971bc0"
+    },
+    {
+      "id": "basecompute/gemma-4-E2B-it",
+      "hf_repo": "basecompute/gemma-4-E2B-it",
+      "file": "gemma-4-E2B-it-Q8.base",
+      "arch": "gemma4",
+      "quant": "default-q8",
+      "size": 5334106112,
+      "sha256": "3e9a9c8629756b2513cf2de35e6a3c18604374085b999b7841c128d542af52d9"
+    },
+    {
+      "id": "basecompute/gemma-4-E4B-it",
+      "hf_repo": "basecompute/gemma-4-E4B-it",
+      "file": "gemma-4-E4B-it-Q4.base",
+      "arch": "gemma4",
+      "quant": "default-q4",
+      "size": 4558422016,
+      "sha256": "68348e8a9d4d0a00f9fe9e3ea80835f9d45d2165e1fc407f68366bf72b64bb8f"
+    },
+    {
+      "id": "basecompute/gemma-4-E4B-it",
+      "hf_repo": "basecompute/gemma-4-E4B-it",
+      "file": "gemma-4-E4B-it-Q8.base",
+      "arch": "gemma4",
+      "quant": "default-q8",
+      "size": 8297676800,
+      "sha256": "c293bd1e3479b293fab353783af6d96dc285d3b07b688034eb544e36c99c9ef7"
+    },
+    {
+      "id": "basecompute/gemma-4-26B-A4B-it",
+      "hf_repo": "basecompute/gemma-4-26B-A4B-it",
+      "file": "gemma-4-26B-A4B-it-Q4.base",
+      "arch": "gemma4",
+      "quant": "default-q4",
+      "size": 16108079360,
+      "sha256": "efabbac27832f43d17eaac05c9a5c32545c9a02bea975836f038d32de8368782"
+    },
+    {
+      "id": "basecompute/gemma-4-26B-A4B-it",
+      "hf_repo": "basecompute/gemma-4-26B-A4B-it",
+      "file": "gemma-4-26B-A4B-it-Q8.base",
+      "arch": "gemma4",
+      "quant": "default-q8",
+      "size": 26656278784,
+      "sha256": "c2f13d6d299cb8a18e5c41929d974c348846214d37e2acbdf4865e8a71a4e411"
+    },
+    {
+      "id": "basecompute/nomic-embed-text-v1.5",
+      "hf_repo": "basecompute/nomic-embed-text-v1.5",
+      "file": "nomic-embed-text-v1.5-Q4.base",
+      "source_repo": "nomic-ai/nomic-embed-text-v1.5",
+      "arch": "nomic-bert",
+      "quant": "default-q4",
+      "size": 78218752,
+      "sha256": "23b7ca9d4026bdf5c8b6d53faa761be66e6c475acdd7c59ebdc0447f2b231175"
+    },
+    {
+      "id": "basecompute/nomic-embed-text-v1.5",
+      "hf_repo": "basecompute/nomic-embed-text-v1.5",
+      "file": "nomic-embed-text-v1.5-Q8.base",
+      "source_repo": "nomic-ai/nomic-embed-text-v1.5",
+      "arch": "nomic-bert",
+      "quant": "default-q8",
+      "size": 142296576,
+      "sha256": "6239447345780bcf8af6bd410eaa4468bec55059899ccde63f86c060425fe422"
+    },
+    {
+      "id": "basecompute/Qwen3-1.7B",
+      "hf_repo": "basecompute/Qwen3-1.7B",
+      "file": "Qwen3-1.7B-Q4.base",
+      "source_repo": "Qwen/Qwen3-1.7B",
+      "arch": "qwen",
+      "quant": "default-q4",
+      "size": 1150128128,
+      "sha256": "a761c553797d0fb5aaf79878a66ed410a8a52bd311983a1310d9e8f3c70eab81"
+    },
+    {
+      "id": "basecompute/Qwen3-1.7B",
+      "hf_repo": "basecompute/Qwen3-1.7B",
+      "file": "Qwen3-1.7B-Q8.base",
+      "source_repo": "Qwen/Qwen3-1.7B",
+      "arch": "qwen",
+      "quant": "default-q8",
+      "size": 2102464512,
+      "sha256": "f54c1ed6a8cf757a70d9006df3a95c05f7b68de11157bf8e5a7dd671e0fb5bcc"
+    },
+    {
+      "id": "basecompute/Qwen3-8B",
+      "hf_repo": "basecompute/Qwen3-8B",
+      "file": "Qwen3-8B-Q4.base",
+      "source_repo": "Qwen/Qwen3-8B",
+      "arch": "qwen",
+      "quant": "default-q4",
+      "size": 4614987776,
+      "sha256": "da84d54a5c55d3c1c4c52064cac1d0fd2104584bf1a12cdb8e4179d91a797144"
+    },
+    {
+      "id": "basecompute/Qwen3-8B",
+      "hf_repo": "basecompute/Qwen3-8B",
+      "file": "Qwen3-8B-Q8.base",
+      "source_repo": "Qwen/Qwen3-8B",
+      "arch": "qwen",
+      "quant": "default-q8",
+      "size": 8454250496,
+      "sha256": "37785e5d3bcaacb4a3c8caf298d972d5812cfdbf4c6b800db28cfa5db5477ad6"
+    },
+    {
+      "id": "basecompute/Llama-3.1-8B-Instruct",
+      "hf_repo": "basecompute/Llama-3.1-8B-Instruct",
+      "file": "Llama-3.1-8B-Instruct-Q4.base",
+      "source_repo": "meta-llama/Llama-3.1-8B-Instruct",
+      "arch": "llama",
+      "quant": "default-q4",
+      "size": 4524154880,
+      "sha256": "5d46c1a7e9247f095ee2e9955b1cae8bcea383d4417ecc3b26c5ce6fdd3babdc"
+    },
+    {
+      "id": "basecompute/Llama-3.1-8B-Instruct",
+      "hf_repo": "basecompute/Llama-3.1-8B-Instruct",
+      "file": "Llama-3.1-8B-Instruct-Q8.base",
+      "source_repo": "meta-llama/Llama-3.1-8B-Instruct",
+      "arch": "llama",
+      "quant": "default-q8",
+      "size": 8288215040,
+      "sha256": "682586936a9f29bb37055e2ff2ec724d1328435dec4b94a566793eb20bbd3d1c"
+    },
+    {
+      "id": "basecompute/Mistral-7B-Instruct-v0.3",
+      "hf_repo": "basecompute/Mistral-7B-Instruct-v0.3",
+      "file": "Mistral-7B-Instruct-v0.3-Q4.base",
+      "source_repo": "mistralai/Mistral-7B-Instruct-v0.3",
+      "arch": "llama",
+      "quant": "default-q4",
+      "size": 4079362048,
+      "sha256": "dbece3c8846afc89e282a98796b7651227557e7eb1645de139e12917b04d175d"
+    },
+    {
+      "id": "basecompute/Mistral-7B-Instruct-v0.3",
+      "hf_repo": "basecompute/Mistral-7B-Instruct-v0.3",
+      "file": "Mistral-7B-Instruct-v0.3-Q8.base",
+      "source_repo": "mistralai/Mistral-7B-Instruct-v0.3",
+      "arch": "llama",
+      "quant": "default-q8",
+      "size": 7476748288,
+      "sha256": "3f2b5589475dd5da34b3433abec085b16d56818dba22748b08d39bd169f5243b"
+    },
+    {
+      "id": "basecompute/Qwen3-4B-Instruct-2507",
+      "hf_repo": "basecompute/Qwen3-4B-Instruct-2507",
+      "file": "Qwen3-4B-Instruct-2507-Q4.base",
+      "source_repo": "Qwen/Qwen3-4B-Instruct-2507",
+      "arch": "qwen",
+      "quant": "default-q4",
+      "size": 2829521920,
+      "sha256": "4523c9d3f10dc77bd6e82a78dee495f0a5241f0a4a1eb3902216ec0df6bf94b9"
+    },
+    {
+      "id": "basecompute/Qwen3-4B-Instruct-2507",
+      "hf_repo": "basecompute/Qwen3-4B-Instruct-2507",
+      "file": "Qwen3-4B-Instruct-2507-Q8.base",
+      "source_repo": "Qwen/Qwen3-4B-Instruct-2507",
+      "arch": "qwen",
+      "quant": "default-q8",
+      "size": 4155544576,
+      "sha256": "09f7ac220735baf95d4effcf85417c8c8eadf69a42d21e48edcf33924ea55a40"
+    },
+    {
+      "id": "basecompute/Qwen3-4B-Thinking-2507",
+      "hf_repo": "basecompute/Qwen3-4B-Thinking-2507",
+      "file": "Qwen3-4B-Thinking-2507-Q4.base",
+      "source_repo": "Qwen/Qwen3-4B-Thinking-2507",
+      "arch": "qwen",
+      "quant": "default-q4",
+      "size": 2829521920,
+      "sha256": "81185cd73a47087a1f730238f690c57729993287b9503a36f5370a21366a13fa"
+    },
+    {
+      "id": "basecompute/Qwen3-4B-Thinking-2507",
+      "hf_repo": "basecompute/Qwen3-4B-Thinking-2507",
+      "file": "Qwen3-4B-Thinking-2507-Q8.base",
+      "source_repo": "Qwen/Qwen3-4B-Thinking-2507",
+      "arch": "qwen",
+      "quant": "default-q8",
+      "size": 4155544576,
+      "sha256": "930d78ec853410b68a433bfb8f608fe389566936899bf0a9dbc867618d80bce4"
+    }
+  ]
+}

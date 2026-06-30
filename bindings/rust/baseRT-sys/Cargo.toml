@@ -1,0 +1,14 @@
+[package]
+name = "baseRT-sys"
+version = "0.2.0"
+edition = "2021"
+description = "Raw FFI bindings for the BaseRT LLM inference engine"
+license = "Apache-2.0"
+links = "baseRT"
+build = "build.rs"
+
+[features]
+default = []
+# Link the static engine archive (libbaseRT_engine.a) + frameworks instead of
+# the single libbaseRT.dylib. Default is dynamic (one self-contained dylib).
+static = []

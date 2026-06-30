@@ -1,0 +1,33 @@
+{
+  "name": "default-q4",
+  "arch": "*",
+  "rules": [
+    {"pattern": "model.embed_tokens.weight", "dtype": "f16"},
+    {"pattern": "embed_tokens.weight", "dtype": "f16"},
+    {"pattern": "**.input_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.input_norm.weight", "dtype": "f16"},
+    {"pattern": "**.post_attention_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.post_attn_norm.weight", "dtype": "f16"},
+    {"pattern": "**.post_attention_norm.weight", "dtype": "f16"},
+    {"pattern": "**.post_ffw_norm.weight", "dtype": "f16"},
+    {"pattern": "**.pre_ffw_norm.weight", "dtype": "f16"},
+    {"pattern": "**.per_layer_post_norm.weight", "dtype": "f16"},
+    {"pattern": "per_layer_proj_norm.weight", "dtype": "f16"},
+    {"pattern": "**.q_norm.weight", "dtype": "f16"},
+    {"pattern": "**.k_norm.weight", "dtype": "f16"},
+    {"pattern": "**.attn_q_norm.weight", "dtype": "f16"},
+    {"pattern": "**.attn_k_norm.weight", "dtype": "f16"},
+    {"pattern": "**.layer_out_scale.weight", "dtype": "f16"},
+    {"pattern": "**.ffn_norm.weight", "dtype": "f16"},
+    {"pattern": "**.attn_norm.weight", "dtype": "f16"},
+    {"pattern": "model.norm.weight", "dtype": "f16"},
+    {"pattern": "final_norm.weight", "dtype": "f16"},
+    {"pattern": "output_norm.weight", "dtype": "f16"},
+    {"pattern": "**.{q,k,v,o}_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.{gate,up,down}_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "lm_head.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "output.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.bias", "dtype": "f16"}
+  ]
+}
