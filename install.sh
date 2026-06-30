@@ -5,16 +5,20 @@
 #
 # Downloads the latest prebuilt engine bundle (libbaseRT.dylib + the basert CLI
 # and runtime tools) and installs it to ~/.basert, then adds it to your PATH.
+# Re-running upgrades in place; it skips the download when you're already on the
+# target release.
 #
 # Environment overrides:
 #   BASERT_INSTALL_DIR   install location           (default: $HOME/.basert)
 #   BASERT_VERSION       release tag, e.g. v0.5.0   (default: latest)
+#   BASERT_FORCE         set to 1 to reinstall even if already up to date
 #   BASERT_NO_MODIFY_PATH  set to 1 to skip editing shell profiles
 set -eu
 
 REPO="basecompute/baseRT"
 ASSET_PREFIX="basert-engine-macos-arm64"
 INSTALL_DIR="${BASERT_INSTALL_DIR:-$HOME/.basert}"
+STAMP="$INSTALL_DIR/.release"
 
 say()  { printf '\033[1;34mbasert\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33mbasert\033[0m %s\n' "$1" >&2; }
@@ -31,7 +35,7 @@ arch="$(uname -m)"
 [ "$os" = "Darwin" ] || err "BaseRT requires macOS (Apple Silicon). Detected: $os"
 [ "$arch" = "arm64" ] || err "BaseRT requires Apple Silicon (arm64). Detected: $arch"
 
-# --- resolve the release + asset URL -----------------------------------------
+# --- resolve the release (one API call) --------------------------------------
 if [ -n "${BASERT_VERSION:-}" ]; then
   api="https://api.github.com/repos/$REPO/releases/tags/$BASERT_VERSION"
   say "resolving release $BASERT_VERSION"
@@ -39,26 +43,47 @@ else
   api="https://api.github.com/repos/$REPO/releases/latest"
   say "resolving latest release"
 fi
+json="$(curl -fsSL "$api")" || err "could not reach the GitHub release API."
 
-# Find the browser_download_url for the macOS arm64 tarball (no jq dependency).
-url="$(curl -fsSL "$api" \
+# tag_name of the resolved release (no jq dependency).
+tag="$(printf '%s' "$json" | grep -o '"tag_name"[^,]*' | grep -o '"[^"]*"$' | tr -d '"' | head -n1)"
+[ -n "$tag" ] || tag="${BASERT_VERSION:-unknown}"
+
+# --- skip if already up to date ----------------------------------------------
+if [ "${BASERT_FORCE:-0}" != "1" ] && [ -x "$INSTALL_DIR/basert" ] \
+   && [ -f "$STAMP" ] && [ "$(cat "$STAMP" 2>/dev/null || true)" = "$tag" ]; then
+  say "already on $tag at $INSTALL_DIR — nothing to do (set BASERT_FORCE=1 to reinstall)."
+  exit 0
+fi
+
+# Find the browser_download_url for the macOS arm64 tarball.
+url="$(printf '%s' "$json" \
   | grep -o '"browser_download_url"[^,]*' \
   | grep -o 'https://[^"]*'"$ASSET_PREFIX"'[^"]*\.tar\.gz' \
   | head -n1 || true)"
-[ -n "$url" ] || err "no \"$ASSET_PREFIX-*.tar.gz\" asset found in the release. \
+[ -n "$url" ] || err "no \"$ASSET_PREFIX-*.tar.gz\" asset found in release $tag. \
 A newer release may be required."
 
-# --- download + extract ------------------------------------------------------
+# --- download ----------------------------------------------------------------
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 say "downloading $(basename "$url")"
 curl -fSL --progress-bar "$url" -o "$tmp/bundle.tar.gz"
 
+# --- clean install -----------------------------------------------------------
+# Remove the previous bundle's artifacts first so a file dropped in a newer
+# release can't linger as an orphan. Only the known bundle contents are touched
+# (the bundle is flat: libbaseRT.dylib, baseRT.metallib, basert, basert-*,
+# include/), so an unrelated file in a custom INSTALL_DIR is left alone.
 mkdir -p "$INSTALL_DIR"
-# Bundle is flat (libbaseRT.dylib, baseRT.metallib, basert, basert-*, include/).
+rm -f  "$INSTALL_DIR"/basert "$INSTALL_DIR"/basert-* "$INSTALL_DIR"/baseRT_* \
+       "$INSTALL_DIR"/libbaseRT.dylib "$INSTALL_DIR"/baseRT.metallib
+rm -rf "$INSTALL_DIR"/include
+
 tar -xzf "$tmp/bundle.tar.gz" -C "$INSTALL_DIR"
 chmod +x "$INSTALL_DIR"/basert* 2>/dev/null || true
-say "installed to $INSTALL_DIR"
+printf '%s\n' "$tag" > "$STAMP"
+say "installed $tag to $INSTALL_DIR"
 
 if [ ! -x "$INSTALL_DIR/basert" ]; then
   warn "this release bundle does not include the 'basert' launcher; only the"
