@@ -69,6 +69,8 @@ basert serve --model Qwen/Qwen3-4B
 basert chat  ~/.cache/baseRT/models/Qwen/Qwen3-4B/default-q4/model.base
 ```
 
-!!! note "`chat` vs `serve` argument style"
-    `chat`/`complete` take the model **positionally**; `serve` takes it via
-    `--model` (repeatable, to load several models at once).
+> [!NOTE]
+> **`chat` vs `serve` argument style**
+>
+> `chat`/`complete` take the model **positionally**; `serve` takes it via
+> `--model` (repeatable, to load several models at once).

@@ -82,7 +82,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-!!! note
-    The exact request/response fields follow the OpenAI schema. Endpoints like
-    `/v1/files`, `/v1/batches`, and LoRA management depend on server flags
-    (`--files-dir`) and the loaded model's capabilities.
+> [!NOTE]
+> The exact request/response fields follow the OpenAI schema. Endpoints like
+> `/v1/files`, `/v1/batches`, and LoRA management depend on server flags
+> (`--files-dir`) and the loaded model's capabilities.

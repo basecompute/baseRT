@@ -4,10 +4,12 @@ BaseRT can sign `.base` bundles with ed25519 so you can detect tampering or
 corruption before a model reaches a host. The signature covers the file header
 plus a SHA-256 of the weight blob — a bit-flip anywhere invalidates it.
 
-!!! note "Out-of-band today"
-    The runtime does **not** currently verify signatures at load time (planned
-    for a future release). Until then, signing is an operator-side workflow you
-    run in your release pipeline.
+> [!NOTE]
+> **Out-of-band today**
+>
+> The runtime does **not** currently verify signatures at load time (planned
+> for a future release). Until then, signing is an operator-side workflow you
+> run in your release pipeline.
 
 ## Generate a keypair
 

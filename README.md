@@ -3,14 +3,12 @@
 **A fast LLM inference runtime for Apple Silicon (Metal).** Pull a model, chat
 with it, or serve an OpenAI-compatible API — all from one CLI, `basert`.
 
-The engine ships as a single self-contained `libbaseRT.dylib` (Metal kernels
-embedded) plus the `basert-*` runtime tools. This repository is the open
-ecosystem around it: the `basert` CLI (model hub + converter), the `.base`
-model format, the public C API, and language bindings for Python, Node, Rust,
-and Swift.
+This repository is the open ecosystem around the engine: the `basert` CLI
+(model hub + converter), the `.base` model format, the public C API, and
+language bindings for Python, Node, Rust, and Swift.
 
-> **Full documentation:** [docs/](docs/) (also published as a website — see
-> [`mkdocs.yml`](mkdocs.yml)).
+> **Full documentation:** [docs/](docs/), also published at
+> [basecompute.co/docs](https://basecompute.co/docs).
 
 ---
 

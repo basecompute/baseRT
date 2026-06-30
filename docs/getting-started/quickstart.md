@@ -27,9 +27,11 @@ You can also pull a smaller model to start:
 basert pull Qwen/Qwen3-0.6B
 ```
 
-!!! tip "Gated or private repos"
-    Set `HF_TOKEN` (or log in with the HuggingFace CLI) before pulling gated
-    models. BaseRT uses the standard token chain.
+> [!TIP]
+> **Gated or private repos**
+>
+> Set `HF_TOKEN` (or log in with the HuggingFace CLI) before pulling gated
+> models. BaseRT uses the standard token chain.
 
 ## Chat
 
