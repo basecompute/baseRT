@@ -1,0 +1,21 @@
+[package]
+name = "base-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+memmap2.workspace = true
+half.workspace = true
+sha2.workspace = true
+bitflags.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+xxhash-rust = { workspace = true }

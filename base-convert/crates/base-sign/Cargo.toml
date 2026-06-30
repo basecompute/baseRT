@@ -1,0 +1,19 @@
+[package]
+name = "base-sign"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base-format.workspace = true
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[dev-dependencies]
+tempfile.workspace = true

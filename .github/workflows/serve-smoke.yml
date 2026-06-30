@@ -1,0 +1,46 @@
+name: Server smoke
+
+# Manually-triggered: start baseRT_serve from an engine release and assert it
+# answers an OpenAI /v1/chat/completions request. Needs an engine release and a
+# .base model URL.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: "URL to a .base model"
+        required: true
+
+jobs:
+  serve:
+    runs-on: [self-hosted, macOS, ARM64, m4pro]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch engine release
+        run: |
+          mkdir -p build
+          gh release download --repo ${{ github.repository }} \
+            --pattern 'baseRT-engine-macos-arm64*.tar.gz' -D build
+          tar -xzf build/baseRT-engine-macos-arm64*.tar.gz -C build
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Fetch model
+        run: |
+          mkdir -p models
+          curl -fsSL "${{ inputs.model_url }}" -o models/model.base
+      - name: Start server + assert a completion
+        run: |
+          KEY="ci-$RANDOM"
+          ./build/baseRT_serve --model models/model.base --api-key "$KEY" --port 8080 \
+            > serve.log 2>&1 &
+          SV=$!
+          trap 'kill $SV 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            curl -fsS -H "Authorization: Bearer $KEY" http://127.0.0.1:8080/v1/models >/dev/null 2>&1 && break
+            sleep 2
+          done
+          RESP=$(curl -fsS -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+            -d '{"model":"model.base","messages":[{"role":"user","content":"Hello!"}],"max_tokens":16,"temperature":0}' \
+            http://127.0.0.1:8080/v1/chat/completions)
+          echo "$RESP"
+          echo "$RESP" | python3 -c "import sys,json; c=json.load(sys.stdin)['choices'][0]['message']['content']; assert c, 'empty completion'; print('OK:', repr(c[:60]))"

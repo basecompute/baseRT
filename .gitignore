@@ -1,0 +1,34 @@
+# Engine binaries (downloaded from Releases)
+/build/
+*.dylib
+*.metallib
+
+# Models
+/models/
+
+# Rust
+**/target/
+Cargo.lock
+!base-convert/Cargo.lock
+
+# Node
+bindings/node/node_modules/
+bindings/node/dist/
+
+# Python
+__pycache__/
+*.pyc
+bindings/python/*.egg-info/
+.pytest_cache/
+
+# Swift
+bindings/swift/.build/
+bindings/swift/Package.resolved
+
+# macOS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# MkDocs build output
+site/

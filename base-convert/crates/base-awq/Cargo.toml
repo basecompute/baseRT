@@ -1,0 +1,18 @@
+[package]
+name = "base-awq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+rayon.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+base-format.workspace = true
+base-quant.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

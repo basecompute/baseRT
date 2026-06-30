@@ -1,0 +1,17 @@
+{
+  "name": "default-q8",
+  "arch": "*",
+  "rules": [
+    {"pattern": "model.embed_tokens.weight", "dtype": "f16"},
+    {"pattern": "**.input_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.post_attention_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.q_norm.weight", "dtype": "f16"},
+    {"pattern": "**.k_norm.weight", "dtype": "f16"},
+    {"pattern": "model.norm.weight", "dtype": "f16"},
+    {"pattern": "**.{q,k,v,o}_proj.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 128},
+    {"pattern": "**.{gate,up,down}_proj.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 128},
+    {"pattern": "lm_head.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 128},
+    {"pattern": "**.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 128},
+    {"pattern": "**.bias", "dtype": "f16"}
+  ]
+}
