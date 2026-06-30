@@ -15,6 +15,20 @@ basert serve --model Qwen/Qwen3-4B --model Qwen/Qwen3-0.6B --api-key "$KEY"
 
 See the full list of endpoints in the [Server API reference](../reference/server-api.md).
 
+## Choosing a quant build
+
+Pick which quant variant to serve with an inline `:variant` on the id, or the
+`--variant` flag. Dense models ship `default-q4` and `default-q8`; MoE models are
+q4-only.
+
+```sh
+basert serve basecompute/gemma-4-E2B-it:default-q8 --max-context 16000
+# equivalently:
+basert serve basecompute/gemma-4-E2B-it --variant default-q8 --max-context 16000
+```
+
+`basert list` shows installed variants; an uninstalled one is pulled on demand.
+
 ## Core flags
 
 | Flag | Default | Purpose |

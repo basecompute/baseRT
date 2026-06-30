@@ -119,6 +119,19 @@ See [Signing & verification](../guides/signing.md).
 
 These exec `basert-<cmd>`. Full flags in their guides.
 
+**Selecting a quant variant.** For the model-taking commands (`serve`, `chat`,
+`complete`, `bench`, `profile`), choose which quant build to load with an inline
+`:variant` on the hub id, or the `--variant` flag:
+
+```sh
+basert serve basecompute/gemma-4-E2B-it:default-q8
+basert serve basecompute/gemma-4-E2B-it --variant default-q8   # equivalent
+```
+
+Run `basert list` to see installed variants (`default-q4`, `default-q8`, …). An
+uninstalled variant is fetched on demand. The inline `:variant` wins if both are
+given.
+
 ### `basert serve`
 
 OpenAI-compatible HTTP server. See [Serving an API](../guides/serving.md).
