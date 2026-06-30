@@ -60,7 +60,9 @@ basert chat Qwen/Qwen3-4B
 ### 4. Serve an OpenAI-compatible API
 
 ```sh
-basert serve --model Qwen/Qwen3-4B --api-key "$(uuidgen)" --port 8080
+basert serve Qwen/Qwen3-4B --api-key "$(uuidgen)" --port 8080
+# load several models at once with --model (repeatable):
+# basert serve --model models/a.base --model models/b.base
 ```
 
 ```sh
@@ -93,7 +95,7 @@ commands are forwarded to the matching `basert-<cmd>` engine binary:
 | `basert list` | List installed models (`--remote` to include the catalog) |
 | `basert convert <src>` | Convert a local GGUF / HF / MLX checkpoint to `.base` |
 | `basert chat <model>` | Interactive chat |
-| `basert serve --model <m>` | OpenAI-compatible HTTP server |
+| `basert serve <model>` | OpenAI-compatible HTTP server (`--model` repeats for multi-model) |
 | `basert complete <model>` | One-shot completion (text / image / audio) |
 | `basert bench <model>` | Throughput benchmark |
 | `basert inspect <model>` | Dump a `.base` header + tensor inventory |
