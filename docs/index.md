@@ -8,8 +8,8 @@ CLI, `basert`.
 
 ## Why BaseRT
 
-- **Single-binary engine.** `libbaseRT.dylib` carries the compiled Metal
-  kernels. Drop it next to the `basert-*` tools and run.
+- **Self-contained engine.** No GPU drivers, Python runtime, or extra
+  components to install — drop in the binaries and run.
 - **One CLI for everything.** `basert pull`, `basert chat`, `basert serve`,
   `basert convert` — model management and runtime in one front-end.
 - **OpenAI-compatible server.** Chat, completions, embeddings, transcription,
