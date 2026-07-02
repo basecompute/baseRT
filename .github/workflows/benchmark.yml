@@ -25,8 +25,8 @@ jobs:
         run: |
           mkdir -p build
           gh release download --repo ${{ github.repository }} \
-            --pattern 'baseRT-engine-macos-arm64*.tar.gz' -D build
-          tar -xzf build/baseRT-engine-macos-arm64*.tar.gz -C build
+            --pattern 'basert-engine-macos-arm64*.tar.gz' -D build
+          tar -xzf build/basert-engine-macos-arm64*.tar.gz -C build
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Fetch model
