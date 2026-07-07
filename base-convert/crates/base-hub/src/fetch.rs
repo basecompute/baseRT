@@ -8,6 +8,22 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
+/// Download retries hf-hub performs on transient failures (peer disconnects,
+/// truncated chunks — routine on multi-GB model pulls). hf-hub's own default is
+/// `0`, which turns the very first network hiccup into a hard failure; its retry
+/// loop resumes mid-file via Range headers, so opting in makes large pulls
+/// resilient. Override with `$BASERT_HF_MAX_RETRIES` (`0` disables retries).
+const DEFAULT_HF_MAX_RETRIES: usize = 5;
+
+/// Resolve the retry count from `$BASERT_HF_MAX_RETRIES`, falling back to
+/// [`DEFAULT_HF_MAX_RETRIES`] when the var is unset or unparseable.
+fn resolve_max_retries() -> usize {
+    std::env::var("BASERT_HF_MAX_RETRIES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_HF_MAX_RETRIES)
+}
+
 /// Fetches model files from a remote (or, for tests, a fixture) source.
 pub trait Fetcher {
     /// Download `filename` from `repo` at `revision`; returns the local path.
@@ -26,7 +42,9 @@ pub struct HfFetcher {
 
 impl HfFetcher {
     pub fn new() -> Result<Self> {
-        let mut builder = hf_hub::api::sync::ApiBuilder::new().with_progress(true);
+        let mut builder = hf_hub::api::sync::ApiBuilder::new()
+            .with_progress(true)
+            .with_retries(resolve_max_retries());
         if let Some(tok) = std::env::var("HF_TOKEN")
             .ok()
             .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
@@ -108,5 +126,45 @@ impl Fetcher for MockFetcher {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // All assertions live in one test: they mutate the shared process env, so
+    // splitting them into separate `#[test]` fns would race under Rust's
+    // parallel test runner. Sequential mutation within a single fn is safe.
+    #[test]
+    fn resolve_max_retries_reads_env_with_default_fallback() {
+        let prev = std::env::var("BASERT_HF_MAX_RETRIES").ok();
+
+        // Unset -> the opted-in default (must be > 0, else the retry loop that
+        // makes multi-GB pulls resilient stays disabled — the bug this fixes).
+        std::env::remove_var("BASERT_HF_MAX_RETRIES");
+        assert!(DEFAULT_HF_MAX_RETRIES > 0, "retries must be opted in by default");
+        assert_eq!(resolve_max_retries(), DEFAULT_HF_MAX_RETRIES);
+
+        // A valid override is honored.
+        std::env::set_var("BASERT_HF_MAX_RETRIES", "9");
+        assert_eq!(resolve_max_retries(), 9);
+
+        // "0" is a deliberate opt-out (fail fast), not a fallback.
+        std::env::set_var("BASERT_HF_MAX_RETRIES", "0");
+        assert_eq!(resolve_max_retries(), 0);
+
+        // Surrounding whitespace is tolerated.
+        std::env::set_var("BASERT_HF_MAX_RETRIES", "  3 ");
+        assert_eq!(resolve_max_retries(), 3);
+
+        // Garbage falls back to the default rather than panicking.
+        std::env::set_var("BASERT_HF_MAX_RETRIES", "not-a-number");
+        assert_eq!(resolve_max_retries(), DEFAULT_HF_MAX_RETRIES);
+
+        match prev {
+            Some(v) => std::env::set_var("BASERT_HF_MAX_RETRIES", v),
+            None => std::env::remove_var("BASERT_HF_MAX_RETRIES"),
+        }
     }
 }
