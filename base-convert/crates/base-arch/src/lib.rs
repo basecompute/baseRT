@@ -61,9 +61,30 @@ pub trait HfMapper: Sync {
 
 pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMapper> {
     match model_type {
-        "llama" => Some(&llama::LlamaHfMapper),
+        // Mistral is Llama-shaped (RMSNorm, RoPE, SwiGLU, GQA), its HF tensor
+        // names are already canonical Llama names, and it reuses the Llama mapper
+        // (canonical_arch="llama" → llama model class). Validated end-to-end on
+        // Mistral-7B-Instruct-v0.3 and Ministral-8B-Instruct-2410.
+        //
+        // Phi-3 is NOT enabled. The converter side is ready (SplittingProvider
+        // splits its fused qkv_proj/gate_up_proj; weights convert; HD=96
+        // attention is fine — regression-tested) and the generation_config eos
+        // merge below makes it stop cleanly. BUT Phi-3 chat output degenerates
+        // (raw completions are coherent; chat floods/repeats and is incoherent at
+        // both Q4 and Q8, temp 0 and 0.7) — a chat-path issue (same class as
+        // SmolLM2) that's not yet root-caused. Re-enable "phi3" once that's
+        // fixed. (Phi-3.5 additionally needs LongRoPE — engine is linear-only.)
+        "llama" | "mistral" => Some(&llama::LlamaHfMapper),
         "qwen2" | "qwen3" => Some(&qwen::QwenHfMapper),
         "qwen2_moe" | "qwen3_moe" => Some(&qwen::QwenMoeHfMapper),
+        // Qwen3.5 / 3.6: hybrid Gated-DeltaNet + full-attention decoder
+        // (reuses the Qwen3-Next design). The top-level HF model_type is
+        // `qwen3_5` (multimodal wrapper `Qwen3_5ForConditionalGeneration`)
+        // with the text tower under `text_config.model_type = qwen3_5_text`.
+        // Both resolve here so a text-only checkpoint (top-level
+        // `qwen3_5_text`) and the multimodal wrapper convert identically.
+        "qwen3_5" | "qwen3_5_text" | "qwen35" => Some(&qwen::Qwen35HfMapper),
+        "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen35_moe" => Some(&qwen::Qwen35MoeHfMapper),
         "nomic_bert" | "nomic-bert" => Some(&bert::NomicBertHfMapper),
         "gemma" | "gemma2" | "gemma3" | "gemma3_text" => Some(&gemma::Gemma3HfMapper),
         // gemma3n is a distinct arch (AltUp/Laurel/per-layer-FFN); the
@@ -81,10 +102,17 @@ pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMappe
 /// message) has a single source of truth for what convert-on-pull supports.
 pub const SUPPORTED_HF_MODEL_TYPES: &[&str] = &[
     "llama",
+    "mistral",
     "qwen2",
     "qwen3",
     "qwen2_moe",
     "qwen3_moe",
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen35",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+    "qwen35_moe",
     "nomic_bert",
     "gemma",
     "gemma2",
@@ -145,6 +173,10 @@ pub struct ArchConfig {
     /// MoE: 1 if router top-k weights are renormalized to sum to 1
     /// (Qwen), 0 if left as-is (Gemma).
     pub norm_topk_prob: bool,
+    /// MoE: number of always-on shared experts running in parallel to the
+    /// routed ones (Qwen3.5/3.6-MoE: 1, width `intermediate_size`, plus a
+    /// per-token scalar sigmoid gate). 0 = no shared expert.
+    pub num_shared_experts: u32,
     /// Maximum positional embedding length.  Pulled from
     /// `max_position_embeddings` (HF) or `context_length` (GGUF).
     pub max_position_embeddings: u32,
@@ -193,6 +225,44 @@ pub struct ArchConfig {
     /// `rope_freqs.weight` divisor mask; HF stores it as
     /// `rope_parameters.full_attention.partial_rotary_factor`.
     pub global_rope_partial_factor: f32,
+
+    // ── Qwen3.5 / 3.6 hybrid-linear-attention fields ─────────────────
+    // (all zero/empty for non-hybrid archs). Qwen3.5 interleaves
+    // Gated-DeltaNet linear-attention layers with periodic full
+    // (softmax) attention layers, reusing the Qwen3-Next decoder.
+    /// Per-layer attention kind, one entry per layer:
+    /// "linear_attention" (Gated DeltaNet) | "full_attention".
+    /// Empty = not a hybrid model. Length = num_hidden_layers.
+    pub layer_types: Vec<String>,
+    /// Every Nth layer is full attention (the rest are linear). Mirror
+    /// of `full_attention_interval` in the HF config; 0 = not hybrid.
+    /// Redundant with `layer_types` but kept for a cheap runtime check.
+    pub full_attention_interval: u32,
+    /// Gated-DeltaNet: number of key ("k") heads. 0 = not hybrid.
+    pub linear_num_key_heads: u32,
+    /// Gated-DeltaNet: number of value ("v") heads.
+    pub linear_num_value_heads: u32,
+    /// Gated-DeltaNet: per-head key/query dimension.
+    pub linear_key_head_dim: u32,
+    /// Gated-DeltaNet: per-head value dimension.
+    pub linear_value_head_dim: u32,
+    /// Gated-DeltaNet: causal depthwise short-conv kernel width (e.g. 4).
+    pub linear_conv_kernel_dim: u32,
+    /// Full-attention layers apply an output (sigmoid) gate to the
+    /// attention output before o_proj (`attn_output_gate`). Qwen3.5=true.
+    pub attn_output_gate: bool,
+    /// Partial rotary factor for the full-attention layers: only the
+    /// first `factor * head_dim` dims are rotated. Qwen3.5 = 0.25.
+    /// 0 or 1 = full rotation.
+    pub partial_rotary_factor: f32,
+    /// Multimodal-RoPE section split (Qwen3.5: [11, 11, 10] over
+    /// temporal/height/width). Empty = plain 1-D RoPE. For text-only
+    /// inference all positions collapse so the runtime may treat this
+    /// as ordinary 1-D RoPE.
+    pub mrope_section: Vec<u32>,
+    /// mRoPE interleaves the section frequencies rather than
+    /// concatenating them (Qwen3.5 = true).
+    pub mrope_interleaved: bool,
 }
 
 impl ArchConfig {
@@ -235,6 +305,12 @@ impl ArchConfig {
             m.insert("num_experts_per_tok".into(), json!(self.num_experts_per_tok));
             m.insert("moe_intermediate_size".into(), json!(self.moe_intermediate_size));
             m.insert("norm_topk_prob".into(), json!(self.norm_topk_prob));
+            if self.num_shared_experts > 0 {
+                m.insert(
+                    "num_shared_experts".into(),
+                    json!(self.num_shared_experts),
+                );
+            }
         }
         if self.max_position_embeddings > 0 {
             m.insert(
@@ -294,6 +370,49 @@ impl ArchConfig {
         }
         if self.rope_local_theta > 0.0 {
             m.insert("rope_local_theta".into(), json!(self.rope_local_theta));
+        }
+        // Qwen3.5 / 3.6 hybrid-linear-attention fields — only emit when
+        // set so non-hybrid archs' headers stay tidy.
+        if !self.layer_types.is_empty() {
+            m.insert("layer_types".into(), json!(self.layer_types));
+        }
+        if self.full_attention_interval > 0 {
+            m.insert(
+                "full_attention_interval".into(),
+                json!(self.full_attention_interval),
+            );
+        }
+        if self.linear_num_key_heads > 0 {
+            m.insert(
+                "linear_num_key_heads".into(),
+                json!(self.linear_num_key_heads),
+            );
+            m.insert(
+                "linear_num_value_heads".into(),
+                json!(self.linear_num_value_heads),
+            );
+            m.insert("linear_key_head_dim".into(), json!(self.linear_key_head_dim));
+            m.insert(
+                "linear_value_head_dim".into(),
+                json!(self.linear_value_head_dim),
+            );
+            m.insert(
+                "linear_conv_kernel_dim".into(),
+                json!(self.linear_conv_kernel_dim),
+            );
+        }
+        if self.attn_output_gate {
+            m.insert("attn_output_gate".into(), json!(self.attn_output_gate));
+        }
+        if self.partial_rotary_factor > 0.0 {
+            m.insert(
+                "partial_rotary_factor".into(),
+                json!(self.partial_rotary_factor),
+            );
+        }
+        if !self.mrope_section.is_empty() {
+            m.insert("mrope_section".into(), json!(self.mrope_section));
+            m.insert("mrope_interleaved".into(), json!(self.mrope_interleaved));
         }
         m
     }

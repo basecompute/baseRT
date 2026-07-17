@@ -127,6 +127,17 @@ class BaseRTModelConfig(ctypes.Structure):
         ("swa_layers", ctypes.c_uint8 * 64),
         ("ffn_dims", ctypes.c_uint32 * 128),
         ("n_kv_heads_per_layer", ctypes.c_uint32 * 128),
+        # Qwen3.5 / 3.6 hybrid linear-attention (Gated DeltaNet)
+        ("attn_output_gate", ctypes.c_uint8),
+        ("_qwen35_pad", ctypes.c_uint8 * 3),
+        ("partial_rotary_factor", ctypes.c_float),
+        ("full_attention_interval", ctypes.c_uint32),
+        ("linear_attn_layers", ctypes.c_uint8 * 64),
+        ("gdn_num_k_heads", ctypes.c_uint32),
+        ("gdn_num_v_heads", ctypes.c_uint32),
+        ("gdn_key_head_dim", ctypes.c_uint32),
+        ("gdn_value_head_dim", ctypes.c_uint32),
+        ("gdn_conv_kernel", ctypes.c_uint32),
         # Mixture-of-Experts (0 = dense)
         ("n_experts", ctypes.c_uint32),
         ("n_experts_used", ctypes.c_uint32),
@@ -151,6 +162,11 @@ class BaseRTModelConfig(ctypes.Structure):
         ("image_token_id", ctypes.c_uint32),
         ("boi_token_id", ctypes.c_uint32),
         ("eoi_token_id", ctypes.c_uint32),
+        # Vision-tower family selector + Qwen3-VL-style extras
+        ("vision_arch", ctypes.c_uint32),
+        ("vision_spatial_merge", ctypes.c_uint32),
+        ("vision_temporal_patch", ctypes.c_uint32),
+        ("vision_out_dim", ctypes.c_uint32),
         # Audio tower
         ("audio_n_layers", ctypes.c_uint32),
         ("audio_dim", ctypes.c_uint32),
@@ -171,6 +187,9 @@ class BaseRTModelConfig(ctypes.Structure):
         ("audio_token_id", ctypes.c_uint32),
         ("boa_token_id", ctypes.c_uint32),
         ("eoa_token_id", ctypes.c_uint32),
+        ("mrope_section", ctypes.c_uint32 * 3),
+        ("mrope_interleaved", ctypes.c_uint8),
+        ("_mrope_pad", ctypes.c_uint8 * 3),
     ]
 
 
@@ -364,6 +383,22 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     # Model info
     lib.baseRT_get_config.argtypes = [ctypes.c_void_p]
     lib.baseRT_get_config.restype = BaseRTModelConfig
+
+    # BaseRTModelConfig is mirrored by hand above; a size mismatch means the
+    # mirror drifted from include/baseRT/types.h and every field after the
+    # divergence point decodes as garbage. Fail at import, not at use.
+    # (Older libraries predate the symbol; skip the check there.)
+    if hasattr(lib, "baseRT_model_config_sizeof"):
+        lib.baseRT_model_config_sizeof.argtypes = []
+        lib.baseRT_model_config_sizeof.restype = ctypes.c_size_t
+        c_size = lib.baseRT_model_config_sizeof()
+        py_size = ctypes.sizeof(BaseRTModelConfig)
+        if c_size != py_size:
+            raise RuntimeError(
+                f"BaseRTModelConfig layout drift: library says {c_size} bytes, "
+                f"Python mirror is {py_size} bytes. Update the _fields_ list in "
+                "bindings/python/baseRT/__init__.py to match include/baseRT/types.h."
+            )
 
     lib.baseRT_model_memory.argtypes = [ctypes.c_void_p]
     lib.baseRT_model_memory.restype = ctypes.c_size_t

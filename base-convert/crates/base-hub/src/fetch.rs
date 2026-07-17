@@ -143,7 +143,7 @@ mod tests {
         // Unset -> the opted-in default (must be > 0, else the retry loop that
         // makes multi-GB pulls resilient stays disabled — the bug this fixes).
         std::env::remove_var("BASERT_HF_MAX_RETRIES");
-        assert!(DEFAULT_HF_MAX_RETRIES > 0, "retries must be opted in by default");
+        const { assert!(DEFAULT_HF_MAX_RETRIES > 0, "retries must be opted in by default") };
         assert_eq!(resolve_max_retries(), DEFAULT_HF_MAX_RETRIES);
 
         // A valid override is honored.

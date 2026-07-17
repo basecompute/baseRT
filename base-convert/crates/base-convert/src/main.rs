@@ -15,7 +15,12 @@ Runtime tools (forwarded to the matching `basert-<cmd>` binary):
   profile     Profile prefill/decode timing
   transcribe  Audio transcription
 
-Run `basert <tool> --help` for a tool's own options.";
+Run `basert <tool> --help` for a tool's own options.
+
+Model variant (serve/chat/complete/bench/profile) — pick which quant build to run:
+  <id>:<variant>   e.g. basert serve basecompute/Gemma-4-E2B-it:default-q8
+  --variant <v>    same, as a flag (applies to ids without an inline ':variant')
+Run `basert list` to see installed variants (default-q4, default-q8, …).";
 
 /// The `basert` CLI: the model hub (pull/list from HuggingFace), the offline
 /// GGUF / MLX-safetensors / HF-safetensors → `.base` converter, and a
@@ -206,7 +211,60 @@ struct ListArgs {
     json: bool,
 }
 
+/// BaseRT wordmark banner (mirrors the C++ CLIs — tools/basert_banner.h).
+/// White→lime vertical gradient anchored on brand Lime #E8FFBD (the brand
+/// tone alone is too close to white to read as terminal text). Printed only
+/// on an interactive terminal; NO_COLOR drops the colors.
+fn print_banner() {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let color = std::env::var_os("NO_COLOR").is_none();
+    const ART: [&str; 8] = [
+        " ███████████                             ███████████   ███████████",
+        "░░███░░░░░███                           ░░███░░░░░███ ░█░░░███░░░█",
+        " ░███    ░███  ██████    █████   ██████  ░███    ░███ ░   ░███  ░",
+        " ░██████████  ░░░░░███  ███░░   ███░░███ ░██████████      ░███",
+        " ░███░░░░░███  ███████ ░░█████ ░███████  ░███░░░░░███     ░███",
+        " ░███    ░███ ███░░███  ░░░░███░███░░░   ░███    ░███     ░███",
+        " ███████████ ░░████████ ██████ ░░██████  █████   █████    █████",
+        "░░░░░░░░░░░   ░░░░░░░░ ░░░░░░   ░░░░░░  ░░░░░   ░░░░░    ░░░░░",
+    ];
+    const GRAD: [&str; 8] = [
+        "\x1b[38;2;255;255;255m",
+        "\x1b[38;2;248;255;232m",
+        "\x1b[38;2;240;255;208m",
+        "\x1b[38;2;232;255;189m",
+        "\x1b[38;2;223;255;161m",
+        "\x1b[38;2;213;255;133m",
+        "\x1b[38;2;204;255;105m",
+        "\x1b[38;2;195;255;77m",
+    ];
+    println!();
+    for i in 0..8 {
+        if color {
+            println!("  \x1b[1m{}{}\x1b[0m", GRAD[i], ART[i]);
+        } else {
+            println!("  {}", ART[i]);
+        }
+    }
+    let (dim, lime, rst) = if color {
+        ("\x1b[2m", "\x1b[38;2;195;255;77m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    println!("\n  {dim}{lime}https://basecompute.co{rst} {dim}·{rst} {dim}{lime}https://discord.gg/tB9YFTKZUV{rst}\n");
+}
+
 fn main() -> Result<()> {
+    // Banner on the launcher's own help / no-args surface only — hub
+    // subcommands (convert/pull/list/...) stay quiet, and the runtime tools
+    // print their own banner (tools/basert_banner.h).
+    let raw_arg1 = std::env::args().nth(1);
+    if raw_arg1.is_none() || matches!(raw_arg1.as_deref(), Some("-h") | Some("--help") | Some("help")) {
+        print_banner();
+    }
     let args = Args::parse();
     match args.cmd {
         Cmd::Convert(a) => cmd_convert(a),
@@ -706,6 +764,58 @@ fn convert_hf(
         config.intermediate_size,
         config.vocab_size
     );
+    // Merge the generation stop set from generation_config.json. HF declares
+    // the authoritative end-of-generation ids there; config.json often carries
+    // only a single scalar eos. Phi-3 is the canonical case: config.json has
+    // eos_token_id=32000 (<|endoftext|>) but generation_config.json has
+    // [32000, 32001, 32007] where <|end|>(32007) ends every chat turn. Without
+    // the full set the runtime never stops on <|end|>, so the model floods /
+    // repeats past its turn (finish_reason=length forever). Keep config.json's
+    // primary eos first; append any extra ids from generation_config.json.
+    let mut config = config;
+    let gc_path = input.join("generation_config.json");
+    if let Ok(text) = std::fs::read_to_string(&gc_path) {
+        if let Ok(gc) = serde_json::from_str::<serde_json::Value>(&text) {
+            let mut gen_ids: Vec<u32> = Vec::new();
+            match &gc["eos_token_id"] {
+                serde_json::Value::Number(n) => {
+                    if let Some(u) = n.as_u64() {
+                        gen_ids.push(u as u32);
+                    }
+                }
+                serde_json::Value::Array(a) => {
+                    for x in a {
+                        if let Some(u) = x.as_u64() {
+                            gen_ids.push(u as u32);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if !gen_ids.is_empty() {
+                let mut ids: Vec<u32> = Vec::new();
+                if config.eos_token_id != 0 {
+                    ids.push(config.eos_token_id);
+                }
+                for &e in &config.eos_token_ids {
+                    if !ids.contains(&e) {
+                        ids.push(e);
+                    }
+                }
+                for &g in &gen_ids {
+                    if g != 0 && !ids.contains(&g) {
+                        ids.push(g);
+                    }
+                }
+                if ids.len() > config.eos_token_ids.len() + 1 {
+                    eprintln!("  eos:     stop ids {:?} (merged generation_config.json)", ids);
+                }
+                config.eos_token_id = ids[0];
+                config.eos_token_ids = ids[1..].to_vec();
+            }
+        }
+    }
+
     let provider = HfTensorProvider { hf: &hf };
     let mmproj_cfg = mmproj_config_from_hf(&hf);
     convert_generic(
@@ -920,6 +1030,216 @@ impl<'a> TensorProvider for MlxTensorProvider<'a> {
     }
 }
 
+/// Wraps a provider to stack HF-mainline MoE *per-expert* tensors into the
+/// fused 3D form the runtime requires. HF Qwen3-MoE (and Mixtral-style) ships
+/// experts as `…layers.N.mlp.experts.{e}.{gate,up,down}_proj.weight` — one
+/// matrix per expert. The runtime wants a single `layers.N.ffn_{…}_exps.weight`
+/// of shape `[n_experts, out, in]`. We expose a *virtual* name with the expert
+/// index dropped (`…layers.N.mlp.experts.{gate,up,down}_proj.weight`), which the
+/// existing canonicalizer already remaps to `ffn_*_exps`; `to_f32` concatenates
+/// the per-expert f32 in expert order so the unchanged 3D-expert quant path
+/// handles it exactly like Gemma 4's already-fused experts. Pure pass-through
+/// when no per-expert tensors are present (MLX / Gemma-4 sources).
+struct StackingProvider<'a> {
+    inner: &'a dyn TensorProvider,
+    stacks: std::collections::BTreeMap<String, Vec<String>>, // virtual name -> per-expert names (expert order)
+    rewritten: Vec<String>,
+}
+impl<'a> StackingProvider<'a> {
+    fn build(inner: &'a dyn TensorProvider, source_names: &[String]) -> Self {
+        use std::collections::{BTreeMap, HashSet};
+        const MARK: &str = ".mlp.experts.";
+        let mut groups: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+        let mut consumed: HashSet<String> = HashSet::new();
+        for n in source_names {
+            let Some(idx) = n.find(MARK) else { continue };
+            let before = &n[..idx];
+            let rest = &n[idx + MARK.len()..];
+            let Some(dot) = rest.find('.') else { continue };
+            let (e_str, tail) = rest.split_at(dot);
+            if e_str.is_empty() || !e_str.bytes().all(|b| b.is_ascii_digit()) {
+                continue; // already-fused (`experts.gate_proj.weight`) — leave to canon
+            }
+            if !matches!(tail, ".gate_proj.weight" | ".up_proj.weight" | ".down_proj.weight") {
+                continue;
+            }
+            let e: usize = e_str.parse().unwrap_or(usize::MAX);
+            let vname = format!("{before}{MARK}{tail_no_dot}", tail_no_dot = &tail[1..]);
+            groups.entry(vname).or_default().push((e, n.clone()));
+            consumed.insert(n.clone());
+        }
+        let mut stacks: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (v, mut es) in groups {
+            es.sort_by_key(|(e, _)| *e);
+            stacks.insert(v, es.into_iter().map(|(_, n)| n).collect());
+        }
+        let mut rewritten: Vec<String> =
+            source_names.iter().filter(|n| !consumed.contains(*n)).cloned().collect();
+        rewritten.extend(stacks.keys().cloned());
+        StackingProvider { inner, stacks, rewritten }
+    }
+    fn rewritten_names(&self) -> Vec<String> {
+        self.rewritten.clone()
+    }
+}
+impl TensorProvider for StackingProvider<'_> {
+    fn source_shape(&self, name: &str) -> Result<Vec<u64>> {
+        match self.stacks.get(name) {
+            Some(parts) => {
+                let per = self.inner.source_shape(&parts[0])?; // [out, in]
+                let mut s = Vec::with_capacity(per.len() + 1);
+                s.push(parts.len() as u64);
+                s.extend_from_slice(&per);
+                Ok(s)
+            }
+            None => self.inner.source_shape(name),
+        }
+    }
+    fn to_f32(&self, name: &str) -> Result<Vec<f32>> {
+        match self.stacks.get(name) {
+            Some(parts) => {
+                let mut out: Vec<f32> = Vec::new();
+                for p in parts {
+                    out.extend(self.inner.to_f32(p)?);
+                }
+                Ok(out)
+            }
+            None => self.inner.to_f32(name),
+        }
+    }
+}
+
+/// Inverse of [`StackingProvider`]: some HF checkpoints ship *fused* attention
+/// and MLP projections that the canonical llama path expects to be separate.
+/// Phi-3 stores `…self_attn.qkv_proj.weight` (output rows laid out as
+/// `[q: n_heads·head_dim | k: n_kv·head_dim | v: n_kv·head_dim]`) and
+/// `…mlp.gate_up_proj.weight` (`[gate: ffn | up: ffn]`, gate first). We expose
+/// *virtual* separate names (`q_proj`/`k_proj`/`v_proj`, `gate_proj`/`up_proj`)
+/// — which the canonicalizer already maps — and slice the fused matrix by
+/// output rows in `to_f32`. Pure pass-through for sources that already ship
+/// these separate (Llama, Qwen, Gemma, Mistral): no fused names → no splits.
+#[derive(Clone)]
+struct SplitSpec {
+    src: String,
+    row_off: u64,
+    row_cnt: u64,
+}
+struct SplittingProvider<'a> {
+    inner: &'a dyn TensorProvider,
+    splits: std::collections::BTreeMap<String, SplitSpec>, // virtual name -> slice of fused src
+    rewritten: Vec<String>,
+}
+impl<'a> SplittingProvider<'a> {
+    fn build(
+        inner: &'a dyn TensorProvider,
+        source_names: &[String],
+        config: &base_arch::ArchConfig,
+    ) -> Result<Self> {
+        use std::collections::{BTreeMap, HashSet};
+        let mut splits: BTreeMap<String, SplitSpec> = BTreeMap::new();
+        let mut consumed: HashSet<String> = HashSet::new();
+
+        let hd = config.head_dim as u64;
+        let nq = config.num_attention_heads as u64;
+        let nkv = config.num_kv_heads as u64;
+        let ffn = config.intermediate_size as u64;
+
+        for n in source_names {
+            if let Some(before) = n.strip_suffix(".self_attn.qkv_proj.weight") {
+                if hd == 0 || nq == 0 || nkv == 0 {
+                    bail!(
+                        "fused {n}: head_dim/num_attention_heads/num_kv_heads must be set in \
+                         config to split qkv_proj (got hd={hd}, nq={nq}, nkv={nkv})"
+                    );
+                }
+                let (q, k, v) = (nq * hd, nkv * hd, nkv * hd);
+                let shape = inner.source_shape(n)?; // [out, in]
+                let rows = shape.first().copied().unwrap_or(0);
+                if rows != q + k + v {
+                    bail!(
+                        "fused qkv_proj {n} has {rows} output rows but config implies \
+                         n_heads·hd + 2·n_kv·hd = {} (nq={nq}, nkv={nkv}, hd={hd})",
+                        q + k + v
+                    );
+                }
+                splits.insert(
+                    format!("{before}.self_attn.q_proj.weight"),
+                    SplitSpec { src: n.clone(), row_off: 0, row_cnt: q },
+                );
+                splits.insert(
+                    format!("{before}.self_attn.k_proj.weight"),
+                    SplitSpec { src: n.clone(), row_off: q, row_cnt: k },
+                );
+                splits.insert(
+                    format!("{before}.self_attn.v_proj.weight"),
+                    SplitSpec { src: n.clone(), row_off: q + k, row_cnt: v },
+                );
+                consumed.insert(n.clone());
+            } else if let Some(before) = n.strip_suffix(".mlp.gate_up_proj.weight") {
+                if ffn == 0 {
+                    bail!("fused {n}: intermediate_size must be set in config to split gate_up_proj");
+                }
+                let shape = inner.source_shape(n)?;
+                let rows = shape.first().copied().unwrap_or(0);
+                if rows != 2 * ffn {
+                    bail!(
+                        "fused gate_up_proj {n} has {rows} output rows but config implies \
+                         2·intermediate_size = {}",
+                        2 * ffn
+                    );
+                }
+                splits.insert(
+                    format!("{before}.mlp.gate_proj.weight"),
+                    SplitSpec { src: n.clone(), row_off: 0, row_cnt: ffn },
+                );
+                splits.insert(
+                    format!("{before}.mlp.up_proj.weight"),
+                    SplitSpec { src: n.clone(), row_off: ffn, row_cnt: ffn },
+                );
+                consumed.insert(n.clone());
+            }
+        }
+
+        let mut rewritten: Vec<String> =
+            source_names.iter().filter(|n| !consumed.contains(*n)).cloned().collect();
+        rewritten.extend(splits.keys().cloned());
+        Ok(SplittingProvider { inner, splits, rewritten })
+    }
+    fn rewritten_names(&self) -> Vec<String> {
+        self.rewritten.clone()
+    }
+}
+impl TensorProvider for SplittingProvider<'_> {
+    fn source_shape(&self, name: &str) -> Result<Vec<u64>> {
+        match self.splits.get(name) {
+            Some(spec) => {
+                let full = self.inner.source_shape(&spec.src)?; // [out, in]
+                if full.len() != 2 {
+                    bail!("fused tensor {} is not 2-D (shape {:?})", spec.src, full);
+                }
+                Ok(vec![spec.row_cnt, full[1]])
+            }
+            None => self.inner.source_shape(name),
+        }
+    }
+    fn to_f32(&self, name: &str) -> Result<Vec<f32>> {
+        match self.splits.get(name) {
+            Some(spec) => {
+                let full = self.inner.source_shape(&spec.src)?;
+                if full.len() != 2 {
+                    bail!("fused tensor {} is not 2-D (shape {:?})", spec.src, full);
+                }
+                let in_dim = full[1] as usize;
+                let data = self.inner.to_f32(&spec.src)?;
+                let start = spec.row_off as usize * in_dim;
+                let end = (spec.row_off + spec.row_cnt) as usize * in_dim;
+                Ok(data[start..end].to_vec())
+            }
+            None => self.inner.to_f32(name),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn convert_generic(
     input: &std::path::Path,
@@ -951,6 +1271,34 @@ fn convert_generic(
         TargetScheme::Mxfp4 => QuantScheme::Mxfp4,
         TargetScheme::Nvfp4 => QuantScheme::Nvfp4,
     };
+
+    // Stack HF-mainline per-expert MoE tensors into fused 3D experts before
+    // mapping/quantizing (no-op for MLX / Gemma-4 sources that are already
+    // fused). Shadows `provider` + `source_names` for the rest of the function.
+    let stacking = StackingProvider::build(provider, &source_names);
+    if !stacking.stacks.is_empty() {
+        eprintln!(
+            "  moe:     stacked per-expert tensors into {} fused ffn_*_exps",
+            stacking.stacks.len()
+        );
+    }
+    let source_names = stacking.rewritten_names();
+    let provider: &dyn TensorProvider = &stacking;
+
+    // Split HF fused attention/MLP projections (Phi-3: `qkv_proj`,
+    // `gate_up_proj`) into the separate q/k/v + gate/up tensors the llama path
+    // expects, slicing by output rows per the config dims. No-op for sources
+    // that already ship them separate (Llama, Qwen, Gemma, Mistral). Shadows
+    // `provider` + `source_names` again for the rest of the function.
+    let splitting = SplittingProvider::build(provider, &source_names, &config)?;
+    if !splitting.splits.is_empty() {
+        eprintln!(
+            "  fused:   split {} fused qkv_proj/gate_up_proj into q/k/v + gate/up",
+            splitting.splits.len()
+        );
+    }
+    let source_names = splitting.rewritten_names();
+    let provider: &dyn TensorProvider = &splitting;
 
     // Map source names → canonical. Use the same llama-style map that
     // GGUF uses for blk.N.* tensors, plus a HF-style pass-through for
@@ -1118,12 +1466,15 @@ fn convert_generic(
 
         let is_ssm_a = canonical == "ssm.a_log"
             || canonical.ends_with(".ssm.a_log")
-            || src_name.ends_with(".ssm_a");
+            || src_name.ends_with(".ssm_a")
+            || is_gdn_a_log(canonical);
         let is_ssm_sensitive = is_ssm_a
             || canonical.ends_with(".ssm.dt_bias")
-            || canonical.ends_with(".ssm.d");
-        // See GGUF path above for rationale on the f16/GPU route.
-        let is_norm_like = shape.len() == 1;
+            || canonical.ends_with(".ssm.d")
+            || is_gdn_f32(canonical);
+        // See GGUF path above for rationale on the f16/GPU route. Qwen3.5 GDN
+        // conv1d + per-head gate projections also route here (f16 on GPU).
+        let is_norm_like = shape.len() == 1 || is_gdn_f16(canonical);
         let is_embedding =
             canonical == "embed_tokens.weight" || canonical == "lm_head.weight";
 
@@ -1562,11 +1913,49 @@ fn nomic_bert_hf_rename(name: &str) -> Option<String> {
     Some(format!("layers.{layer}.{canonical}"))
 }
 
+// ── Qwen3.5 / 3.6 Gated-DeltaNet tensor precision ────────────────────────
+// The GDN linear-attention block has params that the default profile's
+// catch-all `**.weight` Q4 rule would wreck. These predicates (matched on
+// canonical name) pin the precision-critical ones, mirroring how the GGUF
+// SSM path protects Mamba's `ssm.*` scalars.
+
+/// GDN log-space state-decay `A_log` (A = -exp(A_log)). Same
+/// NaN-after-~100-recurrent-steps sensitivity as the Mamba A-matrix, so it
+/// must stay f32 in the CPU region (and carries the SSM_A_MATRIX flag).
+fn is_gdn_a_log(canonical: &str) -> bool {
+    canonical.ends_with(".linear_attn.A_log")
+}
+
+/// GDN recurrence scalars that must stay f32: `A_log` + the `dt` bias that
+/// feeds the exp-gating.
+fn is_gdn_f32(canonical: &str) -> bool {
+    is_gdn_a_log(canonical) || canonical.ends_with(".linear_attn.dt_bias")
+}
+
+/// GDN short causal conv (`conv1d.weight`, [3*dim, 1, K]) and the tiny
+/// per-head gate projections (`in_proj_a` = decay, `in_proj_b` = beta, each
+/// [n_heads, dim]). Precision-critical but not recurrence-accumulated, so
+/// f16-on-GPU is enough — the point is only to escape Q4 (the conv's 4-wide
+/// last dim can't even form a sane quant group).
+fn is_gdn_f16(canonical: &str) -> bool {
+    canonical.ends_with(".linear_attn.conv1d.weight")
+        || canonical.ends_with(".linear_attn.in_proj_a.weight")
+        || canonical.ends_with(".linear_attn.in_proj_b.weight")
+}
+
 /// Map an HF-style or MLX-style tensor name to canonical `.base` name.
 /// HF already uses the canonical `model.layers.N.*` convention, so we
 /// mostly strip the `model.` prefix. For anything not in HF convention,
 /// fall back to the llama-style GGUF mapper.
 fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
+    // Qwen3.5/3.6 checkpoints ship a Multi-Token-Prediction head (`mtp.*` —
+    // one extra decoder layer + fc/norms, its own experts on the MoE
+    // variants). It's a speculative-decoding auxiliary the runtime doesn't
+    // execute; keeping it would bloat the .base (256 extra expert stacks on
+    // 35B-A3B) and land unknown-named tensors in the main bundle. Drop it.
+    if arch.starts_with("qwen35") && (name == "mtp" || name.starts_with("mtp.")) {
+        return None;
+    }
     // Multimodal wrappers (Gemma-4) put the LLM under `language_model.model.*`
     // and the audio/vision towers under siblings. The towers ship in
     // the same .base bundle but live under `header.mmproj.tensors` so
@@ -1585,6 +1974,13 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
     let mm_name = name.strip_prefix("model.").unwrap_or(name);
     if mm_name.starts_with("audio_tower.")
         || mm_name.starts_with("vision_tower.")
+        // Qwen3.5 / 3.6 wrap the vision tower under `model.visual.*`
+        // (Qwen-VL naming) rather than Gemma-4's `vision_tower.*`. Route
+        // it to the mmproj sub-bundle so a text-only runtime skips it and
+        // a future multimodal path can materialize it — the weights stay
+        // out of the main LM tensor set instead of being written as
+        // unknown pass-through tensors.
+        || mm_name.starts_with("visual.")
         || mm_name.starts_with("embed_audio")
         || mm_name.starts_with("embed_vision")
         || mm_name.starts_with("multi_modal_projector")
@@ -1614,6 +2010,14 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
         .or_else(|| name.strip_prefix("language_model."))
         .or_else(|| name.strip_prefix("model."))
         .unwrap_or(name);
+
+    // MTP can also arrive wrapped (`model.mtp.*`, or `model.language_model.
+    // mtp.*` on VL-style checkpoints); the bare-prefix drop at the top of
+    // this function runs before wrapper stripping and misses those, which
+    // would canonicalize the dead MTP decoder/expert stacks into the bundle.
+    if arch.starts_with("qwen35") && (stripped == "mtp" || stripped.starts_with("mtp.")) {
+        return None;
+    }
 
     // HF native names → canonical.
     if stripped != name {
@@ -1690,6 +2094,15 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
             .replace(".experts.down_proj.weight", ".ffn_down_exps.weight")
             .replace(".experts.gate_proj.weight", ".ffn_gate_exps.weight")
             .replace(".experts.up_proj.weight", ".ffn_up_exps.weight")
+            // Bare (no `.weight`) forms with a `.mlp.` parent — Qwen3.5/3.6
+            // MoE ships `layers.N.mlp.experts.gate_up_proj` (pre-stacked 3D).
+            // The `.mlp.` must be dropped here too, else the canonical comes
+            // out `layers.N.mlp.ffn_gate_up_exps.weight` and the runtime's
+            // alias table misses it (FATAL missing-tensor at load).
+            .replace(".mlp.experts.gate_up_proj", ".ffn_gate_up_exps.weight")
+            .replace(".mlp.experts.down_proj", ".ffn_down_exps.weight")
+            .replace(".mlp.experts.gate_proj", ".ffn_gate_exps.weight")
+            .replace(".mlp.experts.up_proj", ".ffn_up_exps.weight")
             .replace(".experts.gate_up_proj", ".ffn_gate_up_exps.weight")
             .replace(".experts.down_proj", ".ffn_down_exps.weight")
             .replace(".experts.gate_proj", ".ffn_gate_exps.weight")
@@ -2585,6 +2998,138 @@ mod canonical_name_tests {
         }
     }
 
+    fn mmproj_canon(name: &str, arch: &str) -> Option<String> {
+        match to_canonical_name(name, arch)? {
+            Canonical::Mmproj(s) => Some(s),
+            Canonical::Main(_) => None,
+        }
+    }
+
+    // Qwen3.5 / 3.6 (`Qwen3_5ForConditionalGeneration`) wraps the LM under
+    // `model.language_model.*`. The Gated-DeltaNet ("linear_attn") tensors
+    // have no GGUF analogue, so they must pass through to_canonical_name
+    // verbatim (after prefix strip + the standard norm renames) — the
+    // runtime reads them under `layers.N.linear_attn.*`. The vision tower
+    // (`model.visual.*`, Qwen-VL naming) must route to the mmproj sub-bundle
+    // so a text-only bundle keeps it out of the main LM tensor set.
+    #[test]
+    fn qwen35_hybrid_tensor_canonicalization() {
+        // Gated-DeltaNet linear-attention block — verbatim passthrough.
+        for (src, want) in [
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                "layers.0.linear_attn.in_proj_qkv.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+                "layers.0.linear_attn.in_proj_z.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+                "layers.0.linear_attn.in_proj_a.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+                "layers.0.linear_attn.in_proj_b.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.conv1d.weight",
+                "layers.0.linear_attn.conv1d.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.norm.weight",
+                "layers.0.linear_attn.norm.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.out_proj.weight",
+                "layers.0.linear_attn.out_proj.weight",
+            ),
+            // 1-D params without a `.weight` suffix must survive too.
+            (
+                "model.language_model.layers.0.linear_attn.A_log",
+                "layers.0.linear_attn.A_log",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.dt_bias",
+                "layers.0.linear_attn.dt_bias",
+            ),
+        ] {
+            assert_eq!(main_canon(src, "qwen35"), Some(want.to_string()), "src={src}");
+        }
+
+        // Full-attention block: standard Qwen QK-norm + gate passthrough,
+        // and the two per-layer norms get the usual HF→canonical renames.
+        assert_eq!(
+            main_canon(
+                "model.language_model.layers.3.self_attn.q_norm.weight",
+                "qwen35",
+            ),
+            Some("layers.3.self_attn.q_norm.weight".to_string()),
+        );
+        assert_eq!(
+            main_canon(
+                "model.language_model.layers.3.input_layernorm.weight",
+                "qwen35",
+            ),
+            Some("layers.3.input_norm.weight".to_string()),
+        );
+        assert_eq!(
+            main_canon(
+                "model.language_model.layers.3.post_attention_layernorm.weight",
+                "qwen35",
+            ),
+            Some("layers.3.post_attn_norm.weight".to_string()),
+        );
+
+        // Top-level final norm + embedding.
+        assert_eq!(
+            main_canon("model.language_model.norm.weight", "qwen35"),
+            Some("final_norm.weight".to_string()),
+        );
+        assert_eq!(
+            main_canon("model.language_model.embed_tokens.weight", "qwen35"),
+            Some("embed_tokens.weight".to_string()),
+        );
+
+        // Vision tower routes to mmproj (kept out of the main LM tensors).
+        assert_eq!(
+            mmproj_canon("model.visual.patch_embed.proj.weight", "qwen35"),
+            Some("visual.patch_embed.proj.weight".to_string()),
+        );
+        assert!(main_canon("model.visual.patch_embed.proj.weight", "qwen35").is_none());
+    }
+
+    // Qwen3.5 GDN precision policy: the delta-rule recurrence scalars stay
+    // f32; the short conv + per-head gate projections escape Q4 to f16; the
+    // big projections (in_proj_qkv/z, out_proj) and MLP quantize normally.
+    // Verified end-to-end against a real Qwen3.5-2B conversion — under the
+    // default profile these three would otherwise be Q4-quantized, which
+    // corrupts the linear-attention recurrence.
+    #[test]
+    fn qwen35_gdn_tensor_precision() {
+        use super::{is_gdn_a_log, is_gdn_f16, is_gdn_f32};
+        // f32 recurrence scalars.
+        assert!(is_gdn_a_log("layers.0.linear_attn.A_log"));
+        assert!(is_gdn_f32("layers.0.linear_attn.A_log"));
+        assert!(is_gdn_f32("layers.7.linear_attn.dt_bias"));
+        assert!(!is_gdn_a_log("layers.0.linear_attn.dt_bias"));
+        // f16 conv + gate projections.
+        assert!(is_gdn_f16("layers.0.linear_attn.conv1d.weight"));
+        assert!(is_gdn_f16("layers.0.linear_attn.in_proj_a.weight"));
+        assert!(is_gdn_f16("layers.0.linear_attn.in_proj_b.weight"));
+        // Big projections + everything else quantize normally (no override).
+        for n in [
+            "layers.0.linear_attn.in_proj_qkv.weight",
+            "layers.0.linear_attn.in_proj_z.weight",
+            "layers.0.linear_attn.out_proj.weight",
+            "layers.0.linear_attn.norm.weight",
+            "layers.0.mlp.gate_proj.weight",
+            "layers.3.self_attn.q_proj.weight",
+        ] {
+            assert!(!is_gdn_f32(n) && !is_gdn_f16(n), "unexpected override for {n}");
+        }
+    }
+
     // MLX Qwen3-MoE: `model.layers.N.mlp.switch_mlp.X_proj.weight`
     // (per-expert stack) must canonicalize to `layers.N.ffn_X_exps.weight`
     // without doubling the `.weight` suffix.
@@ -2643,7 +3188,67 @@ mod canonical_name_tests {
         );
     }
 
+    // Qwen3.5/3.6-MoE ships the pre-stacked expert tensors bare under a
+    // `.mlp.` parent: `model.language_model.layers.N.mlp.experts.gate_up_proj`.
+    // The `.mlp.` prefix must be dropped along with the rename — pre-fix the
+    // canonical came out `layers.N.mlp.ffn_gate_up_exps.weight` and the
+    // runtime FATALed with missing-tensor at load.
+    #[test]
+    fn qwen35_moe_fused_bare_mlp_parent() {
+        assert_eq!(
+            main_canon(
+                "model.language_model.layers.7.mlp.experts.gate_up_proj",
+                "qwen35moe",
+            ),
+            Some("layers.7.ffn_gate_up_exps.weight".to_string()),
+        );
+        assert_eq!(
+            main_canon(
+                "model.language_model.layers.7.mlp.experts.down_proj",
+                "qwen35moe",
+            ),
+            Some("layers.7.ffn_down_exps.weight".to_string()),
+        );
+    }
+
     // The shared-expert path (Qwen2-MoE / some Qwen3 variants) uses
+    // Qwen3.5/3.6 MTP (multi-token-prediction) head tensors must be DROPPED
+    // (`mtp.*` — an auxiliary decoder layer the runtime never executes; on
+    // 35B-A3B it carries 256 extra expert stacks that would bloat the .base).
+    #[test]
+    fn qwen35_mtp_tensors_dropped() {
+        for n in [
+            "mtp.fc.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            "mtp.layers.0.self_attn.q_proj.weight",
+        ] {
+            assert!(
+                to_canonical_name(n, "qwen35moe").is_none(),
+                "should drop: {n}"
+            );
+            assert!(to_canonical_name(n, "qwen35").is_none(), "should drop: {n}");
+        }
+        // Wrapped variants (`model.mtp.*`, VL-style `model.language_model.
+        // mtp.*`) must be dropped too — the drop re-applies after wrapper
+        // prefix stripping.
+        for n in [
+            "model.mtp.fc.weight",
+            "model.mtp.layers.0.mlp.experts.gate_up_proj",
+            "model.language_model.mtp.fc.weight",
+            "language_model.mtp.norm.weight",
+        ] {
+            assert!(
+                to_canonical_name(n, "qwen35moe").is_none(),
+                "should drop wrapped: {n}"
+            );
+        }
+        // Non-qwen35 arches keep their behavior for names that merely start
+        // with "mtp" — the drop is arch-gated.
+        assert!(to_canonical_name("model.layers.0.mlp.gate_proj.weight", "qwen35moe").is_some());
+    }
+
     // `mlp.shared_expert.X_proj.weight`. The experts-rename rules must NOT
     // touch it — shared-expert tensors map through `mlp.shared_expert.*`
     // aliases on the runtime side.
@@ -2750,5 +3355,193 @@ mod canonical_name_tests {
             None,
         );
         assert_eq!(main_canon("0.auto_model.pooler.dense.weight", "nomic-bert"), None);
+    }
+}
+
+#[cfg(test)]
+mod stacking_tests {
+    use super::{StackingProvider, TensorProvider};
+    use anyhow::Result;
+
+    // Mock provider: each per-expert matrix is [out=4, in=2] = 8 elems, all
+    // equal to the expert index, so stacking order is checkable.
+    struct Mock;
+    impl TensorProvider for Mock {
+        fn source_shape(&self, _name: &str) -> Result<Vec<u64>> {
+            Ok(vec![4, 2])
+        }
+        fn to_f32(&self, name: &str) -> Result<Vec<f32>> {
+            let e: f32 = name
+                .split(".mlp.experts.")
+                .nth(1)
+                .and_then(|s| s.split('.').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1.0);
+            Ok(vec![e; 8])
+        }
+    }
+
+    fn names() -> Vec<String> {
+        // experts out of order incl. two-digit index to exercise numeric sort
+        let mut v = vec!["model.layers.0.self_attn.q_proj.weight".to_string()];
+        for e in [0u32, 1, 10, 2] {
+            for p in ["gate", "up", "down"] {
+                v.push(format!("model.layers.0.mlp.experts.{e}.{p}_proj.weight"));
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn hf_per_expert_moe_stacks_into_fused_3d() {
+        let mock = Mock;
+        let sp = StackingProvider::build(&mock, &names());
+
+        // three fused virtual tensors (gate/up/down), per-expert names consumed
+        assert_eq!(sp.stacks.len(), 3);
+        let gate = "model.layers.0.mlp.experts.gate_proj.weight";
+        assert!(sp.stacks.contains_key(gate));
+
+        // shape becomes [n_experts=4, out=4, in=2]
+        assert_eq!(sp.source_shape(gate).unwrap(), vec![4, 4, 2]);
+
+        // stacked in NUMERIC expert order 0,1,2,10 (not lexical 0,1,10,2)
+        let d = sp.to_f32(gate).unwrap();
+        assert_eq!(d.len(), 32);
+        assert_eq!(d[0], 0.0); // expert 0
+        assert_eq!(d[8], 1.0); // expert 1
+        assert_eq!(d[16], 2.0); // expert 2
+        assert_eq!(d[24], 10.0); // expert 10
+
+        // rewritten names: per-expert dropped, attn kept, virtuals added
+        let rw = sp.rewritten_names();
+        assert!(rw.iter().any(|n| n == "model.layers.0.self_attn.q_proj.weight"));
+        assert!(rw.iter().any(|n| n == gate));
+        assert!(!rw.iter().any(|n| n.contains(".mlp.experts.0.")));
+    }
+
+    #[test]
+    fn no_experts_is_passthrough() {
+        let mock = Mock;
+        let plain = vec![
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            "model.embed_tokens.weight".to_string(),
+        ];
+        let sp = StackingProvider::build(&mock, &plain);
+        assert!(sp.stacks.is_empty());
+        assert_eq!(sp.rewritten_names(), plain);
+    }
+}
+
+#[cfg(test)]
+mod splitting_tests {
+    use super::{SplittingProvider, TensorProvider};
+    use anyhow::Result;
+    use base_arch::ArchConfig;
+
+    // Mock: qkv_proj is [8, 2], gate_up_proj is [6, 2], anything else [4, 2].
+    // Each element encodes its (row, col) as row*10 + col so slices are
+    // checkable by output row.
+    struct SplitMock;
+    impl TensorProvider for SplitMock {
+        fn source_shape(&self, name: &str) -> Result<Vec<u64>> {
+            if name.ends_with(".self_attn.qkv_proj.weight") {
+                Ok(vec![8, 2])
+            } else if name.ends_with(".mlp.gate_up_proj.weight") {
+                Ok(vec![6, 2])
+            } else {
+                Ok(vec![4, 2])
+            }
+        }
+        fn to_f32(&self, name: &str) -> Result<Vec<f32>> {
+            let s = self.source_shape(name)?;
+            let (rows, cols) = (s[0] as usize, s[1] as usize);
+            let mut v = Vec::with_capacity(rows * cols);
+            for r in 0..rows {
+                for c in 0..cols {
+                    v.push((r * 10 + c) as f32);
+                }
+            }
+            Ok(v)
+        }
+    }
+
+    fn phi_config() -> ArchConfig {
+        // qkv rows = nq*hd + 2*nkv*hd = 2*2 + 2*(1*2) = 8; gate_up rows = 2*ffn = 6
+        ArchConfig {
+            head_dim: 2,
+            num_attention_heads: 2,
+            num_kv_heads: 1,
+            intermediate_size: 3,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn phi_fused_qkv_and_gate_up_split_by_row() {
+        let mock = SplitMock;
+        let names = vec![
+            "model.layers.0.self_attn.qkv_proj.weight".to_string(),
+            "model.layers.0.mlp.gate_up_proj.weight".to_string(),
+            "model.layers.0.self_attn.o_proj.weight".to_string(),
+        ];
+        let sp = SplittingProvider::build(&mock, &names, &phi_config()).unwrap();
+
+        // 5 virtual splits (q/k/v + gate/up); the two fused tensors consumed.
+        assert_eq!(sp.splits.len(), 5);
+        let q = "model.layers.0.self_attn.q_proj.weight";
+        let k = "model.layers.0.self_attn.k_proj.weight";
+        let v = "model.layers.0.self_attn.v_proj.weight";
+        let g = "model.layers.0.mlp.gate_proj.weight";
+        let u = "model.layers.0.mlp.up_proj.weight";
+
+        // sliced shapes: q=[nq*hd,in], k/v=[nkv*hd,in], gate/up=[ffn,in]
+        assert_eq!(sp.source_shape(q).unwrap(), vec![4, 2]);
+        assert_eq!(sp.source_shape(k).unwrap(), vec![2, 2]);
+        assert_eq!(sp.source_shape(v).unwrap(), vec![2, 2]);
+        assert_eq!(sp.source_shape(g).unwrap(), vec![3, 2]);
+        assert_eq!(sp.source_shape(u).unwrap(), vec![3, 2]);
+
+        // qkv layout = [q rows 0..4 | k rows 4..6 | v rows 6..8]
+        assert_eq!(sp.to_f32(q).unwrap(), vec![0., 1., 10., 11., 20., 21., 30., 31.]);
+        assert_eq!(sp.to_f32(k).unwrap(), vec![40., 41., 50., 51.]);
+        assert_eq!(sp.to_f32(v).unwrap(), vec![60., 61., 70., 71.]);
+        // gate_up layout = [gate rows 0..3 | up rows 3..6], gate first
+        assert_eq!(sp.to_f32(g).unwrap(), vec![0., 1., 10., 11., 20., 21.]);
+        assert_eq!(sp.to_f32(u).unwrap(), vec![30., 31., 40., 41., 50., 51.]);
+
+        // rewritten: fused dropped, o_proj passed through, virtuals present
+        let rw = sp.rewritten_names();
+        assert!(rw.iter().any(|n| n == "model.layers.0.self_attn.o_proj.weight"));
+        assert!(rw.iter().any(|n| n == q));
+        assert!(!rw.iter().any(|n| n.ends_with("qkv_proj.weight")));
+        assert!(!rw.iter().any(|n| n.ends_with("gate_up_proj.weight")));
+    }
+
+    #[test]
+    fn no_fused_is_passthrough() {
+        let mock = SplitMock;
+        let plain = vec![
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            "model.embed_tokens.weight".to_string(),
+        ];
+        let sp = SplittingProvider::build(&mock, &plain, &phi_config()).unwrap();
+        assert!(sp.splits.is_empty());
+        assert_eq!(sp.rewritten_names(), plain);
+    }
+
+    #[test]
+    fn mismatched_config_is_rejected() {
+        let mock = SplitMock; // qkv_proj is [8, 2]
+        // nq=3 implies q+k+v = 3*2 + 2*(1*2) = 10 ≠ 8 rows → loud error, no garbage.
+        let bad = ArchConfig {
+            head_dim: 2,
+            num_attention_heads: 3,
+            num_kv_heads: 1,
+            intermediate_size: 3,
+            ..Default::default()
+        };
+        let names = vec!["model.layers.0.self_attn.qkv_proj.weight".to_string()];
+        assert!(SplittingProvider::build(&mock, &names, &bad).is_err());
     }
 }

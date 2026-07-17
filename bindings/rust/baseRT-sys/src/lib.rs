@@ -58,6 +58,18 @@ pub struct BaseRTModelConfig {
     pub ffn_dims: [u32; 128],
     pub n_kv_heads_per_layer: [u32; 128],
 
+    // Qwen3.5 / 3.6 hybrid linear-attention (Gated DeltaNet)
+    pub attn_output_gate: u8,
+    pub _qwen35_pad: [u8; 3],
+    pub partial_rotary_factor: c_float,
+    pub full_attention_interval: u32,
+    pub linear_attn_layers: [u8; 64],
+    pub gdn_num_k_heads: u32,
+    pub gdn_num_v_heads: u32,
+    pub gdn_key_head_dim: u32,
+    pub gdn_value_head_dim: u32,
+    pub gdn_conv_kernel: u32,
+
     // Mixture-of-Experts (0 = dense)
     pub n_experts: u32,
     pub n_experts_used: u32,
@@ -84,6 +96,12 @@ pub struct BaseRTModelConfig {
     pub boi_token_id: u32,
     pub eoi_token_id: u32,
 
+    // Vision-tower family selector + Qwen3-VL-style extras
+    pub vision_arch: u32,
+    pub vision_spatial_merge: u32,
+    pub vision_temporal_patch: u32,
+    pub vision_out_dim: u32,
+
     // Audio tower (all zero = none)
     pub audio_n_layers: u32,
     pub audio_dim: u32,
@@ -104,6 +122,9 @@ pub struct BaseRTModelConfig {
     pub audio_token_id: u32,
     pub boa_token_id: u32,
     pub eoa_token_id: u32,
+    pub mrope_section: [u32; 3],
+    pub mrope_interleaved: u8,
+    pub _mrope_pad: [u8; 3],
 }
 
 /// Transcription result statistics.
@@ -197,6 +218,7 @@ extern "C" {
     // === Model info ===
 
     pub fn baseRT_get_config(model: baseRT_model_t) -> BaseRTModelConfig;
+    pub fn baseRT_model_config_sizeof() -> usize;
     pub fn baseRT_model_memory(model: baseRT_model_t) -> usize;
     pub fn baseRT_get_error() -> *const c_char;
 
@@ -370,7 +392,8 @@ mod tests {
 
     #[test]
     fn model_config_size() {
-        // Full struct: decoder + encoder + Gemma4 + MoE + vision + audio.
+        // Full struct: decoder + encoder + Gemma4 + Qwen3.5-GDN + MoE +
+        // vision + audio.
         // Must be far larger than the old 112-byte truncation; returning a
         // 112-byte struct by value from baseRT_get_config corrupted memory.
         assert!(
@@ -378,7 +401,20 @@ mod tests {
             "config struct unexpectedly small ({})",
             mem::size_of::<BaseRTModelConfig>()
         );
-        assert_eq!(mem::size_of::<BaseRTModelConfig>(), 1392);
+        assert_eq!(mem::size_of::<BaseRTModelConfig>(), 1520);
+    }
+
+    #[test]
+    fn model_config_size_matches_library() {
+        // The authoritative drift check: compare this hand-written mirror
+        // against sizeof(BaseRTModelConfig) as compiled into libbaseRT. A
+        // mismatch means every field after the divergence point decodes as
+        // garbage through baseRT_get_config.
+        assert_eq!(
+            unsafe { baseRT_model_config_sizeof() },
+            mem::size_of::<BaseRTModelConfig>(),
+            "BaseRTModelConfig mirror drifted from include/baseRT/types.h"
+        );
     }
 
     #[test]
@@ -446,10 +482,16 @@ mod tests {
         // Spot-check the tail blocks to confirm the full layout.
         assert_eq!(&base.swa_layers as *const _ as usize - base_ptr, 144);
         assert_eq!(&base.ffn_dims as *const _ as usize - base_ptr, 208);
-        assert_eq!(&base.n_experts as *const _ as usize - base_ptr, 1232);
-        assert_eq!(&base.vision_n_layers as *const _ as usize - base_ptr, 1252);
-        assert_eq!(&base.audio_n_layers as *const _ as usize - base_ptr, 1312);
-        assert_eq!(&base.eoa_token_id as *const _ as usize - base_ptr, 1388);
+        assert_eq!(&base.attn_output_gate as *const _ as usize - base_ptr, 1232);
+        assert_eq!(&base.linear_attn_layers as *const _ as usize - base_ptr, 1244);
+        assert_eq!(&base.gdn_num_k_heads as *const _ as usize - base_ptr, 1308);
+        assert_eq!(&base.n_experts as *const _ as usize - base_ptr, 1328);
+        assert_eq!(&base.vision_n_layers as *const _ as usize - base_ptr, 1348);
+        assert_eq!(&base.vision_arch as *const _ as usize - base_ptr, 1408);
+        assert_eq!(&base.audio_n_layers as *const _ as usize - base_ptr, 1424);
+        assert_eq!(&base.eoa_token_id as *const _ as usize - base_ptr, 1500);
+        assert_eq!(&base.mrope_section as *const _ as usize - base_ptr, 1504);
+        assert_eq!(&base.mrope_interleaved as *const _ as usize - base_ptr, 1516);
     }
 
     #[test]

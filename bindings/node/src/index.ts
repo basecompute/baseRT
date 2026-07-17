@@ -106,6 +106,17 @@ const ModelConfigC = koffi.struct("BaseRTModelConfig", {
   swa_layers: koffi.array("uint8", 64),
   ffn_dims: koffi.array("uint32", 128),
   n_kv_heads_per_layer: koffi.array("uint32", 128),
+  // Qwen3.5 / 3.6 hybrid linear-attention (Gated DeltaNet)
+  attn_output_gate: "uint8",
+  _qwen35_pad: koffi.array("uint8", 3),
+  partial_rotary_factor: "float",
+  full_attention_interval: "uint32",
+  linear_attn_layers: koffi.array("uint8", 64),
+  gdn_num_k_heads: "uint32",
+  gdn_num_v_heads: "uint32",
+  gdn_key_head_dim: "uint32",
+  gdn_value_head_dim: "uint32",
+  gdn_conv_kernel: "uint32",
   // MoE
   n_experts: "uint32",
   n_experts_used: "uint32",
@@ -130,6 +141,11 @@ const ModelConfigC = koffi.struct("BaseRTModelConfig", {
   image_token_id: "uint32",
   boi_token_id: "uint32",
   eoi_token_id: "uint32",
+  // Vision-tower family selector + Qwen3-VL-style extras
+  vision_arch: "uint32",
+  vision_spatial_merge: "uint32",
+  vision_temporal_patch: "uint32",
+  vision_out_dim: "uint32",
   // Audio tower
   audio_n_layers: "uint32",
   audio_dim: "uint32",
@@ -150,6 +166,9 @@ const ModelConfigC = koffi.struct("BaseRTModelConfig", {
   audio_token_id: "uint32",
   boa_token_id: "uint32",
   eoa_token_id: "uint32",
+  mrope_section: koffi.array("uint32", 3),
+  mrope_interleaved: "uint8",
+  _mrope_pad: koffi.array("uint8", 3),
 });
 
 const SamplingConfigC = koffi.struct("BaseRTSamplingConfig", {
@@ -486,6 +505,26 @@ function lib(): BaseRTLib {
       "const char *baseRT_transcribe_pcm_stream(void *, float *, int, const char *, _Out_ BaseRTTranscribeStats *, SegmentCallback *, void *)"
     ),
   } as BaseRTLib;
+
+  // ModelConfigC is mirrored by hand above; a size mismatch means the mirror
+  // drifted from include/baseRT/types.h and every field after the divergence
+  // point decodes as garbage. Fail at load, not at use. (Older libraries
+  // predate the symbol; skip the check there.)
+  try {
+    const configSizeof = k.func("size_t baseRT_model_config_sizeof()");
+    const cSize = Number(configSizeof());
+    const jsSize = koffi.sizeof(ModelConfigC);
+    if (cSize !== jsSize) {
+      throw new Error(
+        `BaseRTModelConfig layout drift: library says ${cSize} bytes, ` +
+          `Node mirror is ${jsSize} bytes. Update ModelConfigC in ` +
+          `bindings/node/src/index.ts to match include/baseRT/types.h.`
+      );
+    }
+  } catch (e) {
+    if (e instanceof Error && e.message.includes("layout drift")) throw e;
+    // Symbol missing in an older library — no check possible.
+  }
   return _lib;
 }
 
