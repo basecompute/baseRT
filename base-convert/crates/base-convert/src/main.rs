@@ -818,6 +818,7 @@ fn convert_hf(
 
     let provider = HfTensorProvider { hf: &hf };
     let mmproj_cfg = mmproj_config_from_hf(&hf);
+    let config_for_permute = config.clone();
     convert_generic(
         input,
         output,
@@ -830,6 +831,7 @@ fn convert_hf(
         &tokenizer_from_hf(&hf),
         mmproj_cfg,
         &|n| mapper.norm_shift(n),
+        &|n| mapper.rope_permute_heads(n, &config_for_permute),
     )
 }
 
@@ -885,6 +887,7 @@ fn convert_mlx(
         .collect();
     let provider = MlxTensorProvider { mlx: &mlx };
     let mmproj_cfg = mmproj_config_from_hf(&mlx.hf);
+    let config_for_permute = config.clone();
     convert_generic(
         input,
         output,
@@ -897,6 +900,7 @@ fn convert_mlx(
         &tokenizer_from_hf(&mlx.hf),
         mmproj_cfg,
         &|n| mapper.norm_shift(n),
+        &|n| mapper.rope_permute_heads(n, &config_for_permute),
     )
 }
 
@@ -1253,6 +1257,7 @@ fn convert_generic(
     tokenizer_fields: &std::collections::BTreeMap<String, serde_json::Value>,
     mmproj_config: std::collections::BTreeMap<String, serde_json::Value>,
     norm_shift: &dyn Fn(&str) -> f32,
+    rope_permute: &dyn Fn(&str) -> Option<u32>,
 ) -> Result<()> {
     use base_format::{
         AlignmentConfig, BaseReader, BaseWriter, ComputeRegion, Header, HeaderFlags, LayerKind,
@@ -1459,6 +1464,17 @@ fn convert_generic(
                 for v in f32s.iter_mut() {
                     *v += s;
                 }
+            }
+        }
+
+        // Per-arch hook: normalize HF "split-half" rotary q/k row layout to
+        // the interleaved layout the runtime rope kernels (and GGUF sources)
+        // use. Mirrors `convert_hf_to_gguf.py::LlamaModel.permute`.
+        if shape.len() >= 2 {
+            if let Some(n_heads) = rope_permute(canonical) {
+                let rows = shape[0] as usize;
+                let cols = f32s.len() / rows;
+                f32s = rope_permute_rows(&f32s, rows, cols, n_heads);
             }
         }
 
@@ -3543,5 +3559,73 @@ mod splitting_tests {
         };
         let names = vec!["model.layers.0.self_attn.qkv_proj.weight".to_string()];
         assert!(SplittingProvider::build(&mock, &names, &bad).is_err());
+    }
+}
+
+/// HF "split-half" rotary q/k row layout -> Meta/GGUF interleaved layout.
+/// Per head of HD rows: out[h*HD + 2j + k] = in[h*HD + k*HD/2 + j].
+/// Mirrors `convert_hf_to_gguf.py::LlamaModel.permute`. Skipping this for
+/// llama-family HF sources keeps attention internally consistent but assigns
+/// every rotary dim-pair the wrong trained frequency — long-context
+/// retrieval collapses while short prompts still look plausible.
+fn rope_permute_rows(f32s: &[f32], rows: usize, cols: usize, n_heads: u32) -> Vec<f32> {
+    let hd = rows / n_heads as usize;
+    let half = hd / 2;
+    let mut out = vec![0f32; f32s.len()];
+    for h in 0..n_heads as usize {
+        for j in 0..half {
+            for k in 0..2usize {
+                let dst = h * hd + 2 * j + k;
+                let src = h * hd + k * half + j;
+                out[dst * cols..(dst + 1) * cols].copy_from_slice(&f32s[src * cols..(src + 1) * cols]);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod rope_permute_tests {
+    use super::rope_permute_rows;
+
+    /// 2 heads x HD=4, cols=1: rows tagged h.r — split-half [h0r0,h0r1,h0r2,h0r3]
+    /// where (r0,r1) are first-half dims and (r2,r3) second-half. Interleaved
+    /// output must pair them as [r0,r2,r1,r3] per head.
+    #[test]
+    fn split_half_to_interleaved() {
+        let input: Vec<f32> = vec![
+            0.0, 1.0, 2.0, 3.0, // head 0
+            10.0, 11.0, 12.0, 13.0, // head 1
+        ];
+        let out = rope_permute_rows(&input, 8, 1, 2);
+        assert_eq!(out, vec![0.0, 2.0, 1.0, 3.0, 10.0, 12.0, 11.0, 13.0]);
+    }
+
+    /// Multi-column rows move as whole rows.
+    #[test]
+    fn rows_move_whole() {
+        let input: Vec<f32> = vec![
+            0.0, 0.5, // r0
+            1.0, 1.5, // r1
+            2.0, 2.5, // r2
+            3.0, 3.5, // r3
+        ];
+        let out = rope_permute_rows(&input, 4, 2, 1);
+        assert_eq!(out, vec![0.0, 0.5, 2.0, 2.5, 1.0, 1.5, 3.0, 3.5]);
+    }
+
+    /// The permutation is an involution-inverse pair with the GGUF->HF
+    /// direction: applying it twice must NOT be identity (it is a genuine
+    /// reordering), but it must be a bijection — every input row appears
+    /// exactly once.
+    #[test]
+    fn is_bijection() {
+        let rows = 64usize; // one llama-3.2 head
+        let input: Vec<f32> = (0..rows).map(|i| i as f32).collect();
+        let out = rope_permute_rows(&input, rows, 1, 1);
+        let mut seen = out.clone();
+        seen.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(seen, input);
+        assert_ne!(out, input);
     }
 }

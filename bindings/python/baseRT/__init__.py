@@ -190,6 +190,11 @@ class BaseRTModelConfig(ctypes.Structure):
         ("mrope_section", ctypes.c_uint32 * 3),
         ("mrope_interleaved", ctypes.c_uint8),
         ("_mrope_pad", ctypes.c_uint8 * 3),
+        ("rope_scaling_factor", ctypes.c_float),
+        ("rope_low_freq_factor", ctypes.c_float),
+        ("rope_high_freq_factor", ctypes.c_float),
+        ("rope_orig_max_pos", ctypes.c_uint32),
+        ("rope_scaling_type", ctypes.c_uint32),
     ]
 
 

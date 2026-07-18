@@ -169,6 +169,11 @@ const ModelConfigC = koffi.struct("BaseRTModelConfig", {
   mrope_section: koffi.array("uint32", 3),
   mrope_interleaved: "uint8",
   _mrope_pad: koffi.array("uint8", 3),
+  rope_scaling_factor: "float",
+  rope_low_freq_factor: "float",
+  rope_high_freq_factor: "float",
+  rope_orig_max_pos: "uint32",
+  rope_scaling_type: "uint32",
 });
 
 const SamplingConfigC = koffi.struct("BaseRTSamplingConfig", {

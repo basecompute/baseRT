@@ -32,6 +32,16 @@ impl crate::HfMapper for LlamaHfMapper {
     fn config_from_hf(&self, c: &serde_json::Value) -> Result<crate::ArchConfig> {
         hf_generic_config(c)
     }
+    fn rope_permute_heads(&self, canonical: &str, cfg: &crate::ArchConfig) -> Option<u32> {
+        // Weights only: llama/mistral attention carries no q/k bias.
+        if canonical.ends_with("self_attn.q_proj.weight") {
+            Some(cfg.num_attention_heads)
+        } else if canonical.ends_with("self_attn.k_proj.weight") {
+            Some(cfg.num_kv_heads)
+        } else {
+            None
+        }
+    }
 }
 
 pub(crate) fn hf_generic_config(c: &serde_json::Value) -> Result<crate::ArchConfig> {
@@ -70,12 +80,32 @@ pub(crate) fn hf_generic_config(c: &serde_json::Value) -> Result<crate::ArchConf
     let vocab_size = u32_key("vocab_size")?;
     let head_dim = u32_key("head_dim").unwrap_or(hidden_size / num_attention_heads);
     let rope_theta = f32_key("rope_theta").unwrap_or(10_000.0);
-    let rope_scale = c
-        .get("rope_scaling")
+    let rope_scaling = c.get("rope_scaling");
+    let rope_scale = rope_scaling
         .and_then(|v| v.get("factor"))
         .and_then(|v| v.as_f64())
         .map(|f| f as f32)
         .unwrap_or(1.0);
+    // `rope_type` (current HF) with `type` (older configs) as fallback.
+    let rope_scaling_type = rope_scaling
+        .and_then(|v| v.get("rope_type").or_else(|| v.get("type")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let rs_f32 = |k: &str| {
+        rope_scaling
+            .and_then(|v| v.get(k))
+            .and_then(|v| v.as_f64())
+            .map(|f| f as f32)
+            .unwrap_or(0.0)
+    };
+    let rope_low_freq_factor = rs_f32("low_freq_factor");
+    let rope_high_freq_factor = rs_f32("high_freq_factor");
+    let rope_original_max_pos = rope_scaling
+        .and_then(|v| v.get("original_max_position_embeddings"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(0);
     let rms_norm_eps = f32_key("rms_norm_eps").unwrap_or(1e-6);
     let tie_word_embeddings = bool_key("tie_word_embeddings").unwrap_or(false);
 
@@ -112,6 +142,10 @@ pub(crate) fn hf_generic_config(c: &serde_json::Value) -> Result<crate::ArchConf
         vocab_size,
         rope_theta,
         rope_scale,
+        rope_scaling_type,
+        rope_low_freq_factor,
+        rope_high_freq_factor,
+        rope_original_max_pos,
         rms_norm_eps,
         tie_word_embeddings,
         max_position_embeddings,

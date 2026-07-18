@@ -175,6 +175,20 @@ typedef struct {
     uint32_t mrope_section[3];
     uint8_t mrope_interleaved;  // 1 = interleaved axis map THWTHW…TT (Qwen3.5), 0 = sectioned/absent
     uint8_t _mrope_pad[3];      // align to 4 bytes
+    // RoPE frequency scaling (HF `rope_scaling`, "llama3" type). factor <= 1
+    // means none. The low/high freq factors and original max position
+    // parameterize the piecewise per-frequency rescale; when factor > 1 and
+    // the detail fields are 0 the runtime falls back to the Llama-3-family
+    // defaults (low 1.0, high 4.0, original 8192).
+    float rope_scaling_factor;    // e.g. 32 on Llama-3.2 (1 or 0 = unscaled)
+    float rope_low_freq_factor;   // wavelengths above orig_max/low rescale by 1/factor
+    float rope_high_freq_factor;  // wavelengths below orig_max/high stay unscaled
+    uint32_t rope_orig_max_pos;   // original_max_position_embeddings (e.g. 8192)
+    // rope_scaling type: 0 = none/legacy header (llama arch + factor > 1
+    // defaults to llama3 — correct for every published llama-family .base),
+    // 1 = llama3 (piecewise), 2 = linear (uniform divisor), 3 = other /
+    // unsupported (skipped with a warning rather than mis-applied).
+    uint32_t rope_scaling_type;
 } BaseRTModelConfig;
 
 /// Transcription result statistics.

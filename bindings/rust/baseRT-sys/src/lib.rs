@@ -125,6 +125,11 @@ pub struct BaseRTModelConfig {
     pub mrope_section: [u32; 3],
     pub mrope_interleaved: u8,
     pub _mrope_pad: [u8; 3],
+    pub rope_scaling_factor: c_float,
+    pub rope_low_freq_factor: c_float,
+    pub rope_high_freq_factor: c_float,
+    pub rope_orig_max_pos: u32,
+    pub rope_scaling_type: u32,
 }
 
 /// Transcription result statistics.
@@ -401,7 +406,7 @@ mod tests {
             "config struct unexpectedly small ({})",
             mem::size_of::<BaseRTModelConfig>()
         );
-        assert_eq!(mem::size_of::<BaseRTModelConfig>(), 1520);
+        assert_eq!(mem::size_of::<BaseRTModelConfig>(), 1540);
     }
 
     #[test]
@@ -492,6 +497,9 @@ mod tests {
         assert_eq!(&base.eoa_token_id as *const _ as usize - base_ptr, 1500);
         assert_eq!(&base.mrope_section as *const _ as usize - base_ptr, 1504);
         assert_eq!(&base.mrope_interleaved as *const _ as usize - base_ptr, 1516);
+        assert_eq!(&base.rope_scaling_factor as *const _ as usize - base_ptr, 1520);
+        assert_eq!(&base.rope_orig_max_pos as *const _ as usize - base_ptr, 1532);
+        assert_eq!(&base.rope_scaling_type as *const _ as usize - base_ptr, 1536);
     }
 
     #[test]

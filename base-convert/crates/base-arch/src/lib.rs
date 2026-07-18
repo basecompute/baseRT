@@ -57,6 +57,21 @@ pub trait HfMapper: Sync {
     fn norm_shift(&self, _canonical: &str) -> f32 {
         0.0
     }
+
+    /// RoPE row-permutation head count for a canonical tensor at HF→.base
+    /// conversion time, or None when the tensor needs no permutation.
+    ///
+    /// HF llama-family checkpoints store `q_proj` / `k_proj` in the
+    /// transformers "split-half" rotary layout (rotate_half); the runtime
+    /// rope kernels — and GGUF sources — use Meta's original interleaved
+    /// pair layout. Mirrors `convert_hf_to_gguf.py::LlamaModel.permute`:
+    /// out_row[h*HD + 2j + k] = in_row[h*HD + k*HD/2 + j]. Skipping this
+    /// keeps attention internally consistent (Q and K scramble identically,
+    /// so relative-position structure survives) but assigns every dim-pair
+    /// the wrong trained frequency — retrieval collapses as context grows.
+    fn rope_permute_heads(&self, _canonical: &str, _cfg: &ArchConfig) -> Option<u32> {
+        None
+    }
 }
 
 pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMapper> {
@@ -150,6 +165,14 @@ pub struct ArchConfig {
     pub vocab_size: u32,
     pub rope_theta: f32,
     pub rope_scale: f32,
+    /// HF `rope_scaling.rope_type` (empty = none). The runtime applies the
+    /// llama3 piecewise divisor formula only for "llama3" (or, for legacy
+    /// headers with no type, llama-arch + factor > 1); "linear" gets the
+    /// uniform divisor; anything else is skipped with a warning.
+    pub rope_scaling_type: String,
+    pub rope_low_freq_factor: f32,
+    pub rope_high_freq_factor: f32,
+    pub rope_original_max_pos: u32,
     pub rms_norm_eps: f32,
     pub tie_word_embeddings: bool,
     /// Per-layer FFN widths when the model declares heterogeneous FFN
@@ -283,6 +306,27 @@ impl ArchConfig {
         m.insert("vocab_size".into(), json!(self.vocab_size));
         m.insert("rope_theta".into(), json!(self.rope_theta));
         m.insert("rope_scaling_factor".into(), json!(self.rope_scale));
+        if !self.rope_scaling_type.is_empty() {
+            m.insert("rope_scaling_type".into(), json!(self.rope_scaling_type));
+        }
+        if self.rope_low_freq_factor > 0.0 {
+            m.insert(
+                "rope_scaling_low_freq_factor".into(),
+                json!(self.rope_low_freq_factor),
+            );
+        }
+        if self.rope_high_freq_factor > 0.0 {
+            m.insert(
+                "rope_scaling_high_freq_factor".into(),
+                json!(self.rope_high_freq_factor),
+            );
+        }
+        if self.rope_original_max_pos > 0 {
+            m.insert(
+                "rope_scaling_original_max_position_embeddings".into(),
+                json!(self.rope_original_max_pos),
+            );
+        }
         m.insert("rms_norm_eps".into(), json!(self.rms_norm_eps));
         m.insert(
             "tie_word_embeddings".into(),
