@@ -315,6 +315,16 @@
       "quant": "default-q8",
       "size": 4155544576,
       "sha256": "930d78ec853410b68a433bfb8f608fe389566936899bf0a9dbc867618d80bce4"
+    },
+    {
+      "id": "basecompute/Qwen3-30B-A3B-Instruct-2507",
+      "hf_repo": "basecompute/Qwen3-30B-A3B-Instruct-2507",
+      "file": "Qwen3-30B-A3B-Instruct-2507-Q4.base",
+      "source_repo": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+      "arch": "qwen3_moe",
+      "quant": "default-q4",
+      "size": 17182920704,
+      "sha256": "7b294daeff8ba6e097f6cebe9f56c7b71f32476765a3f614eb256ef9d8c6ffce"
     }
   ]
 }

@@ -57,8 +57,8 @@ through pre-converted catalog artifacts.
 `basert <cmd>` forwards to the matching runtime binary (`basert-<cmd>`):
 
 ```
-basert serve    --model <path> [--model <path2> …]   # OpenAI-compatible server
-basert chat     --model <path>                       # interactive chat
+basert serve    <model> [--model <model2> …]         # OpenAI-compatible server (--model repeats for multi-model)
+basert chat     <model>                              # interactive chat
 basert complete <model> --prompt <text>              # one-shot completion
 basert bench    <model>                              # throughput benchmark
 ```

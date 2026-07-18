@@ -33,9 +33,13 @@ from baseRT import (
     TranscribeStats,
     TensorInfo,
     BaseRTError,
-    _LIB_NAME,
     _find_library,
+    _lib_names,
 )
+
+# macOS shared-library name (the only shipping backend); tests below
+# simulate the project layout with this filename.
+_LIB_NAME = "libbaseRT.dylib"
 
 
 # -------------------------------------------------------------------------
@@ -48,18 +52,30 @@ class TestBaseRTModelConfig:
 
     def test_field_names(self):
         names = [f[0] for f in BaseRTModelConfig._fields_]
-        expected = [
+        # Head of the struct — exact order matters for every field after it.
+        expected_head = [
             "dim", "n_layers", "n_heads", "n_kv_heads", "head_dim",
             "q_dim", "kv_dim", "ffn_dim", "vocab_size", "max_seq_len",
-            "norm_eps", "rope_theta", "sliding_window_pattern", "rope_local_theta",
-            "architecture",
+            "norm_eps", "rope_theta", "sliding_window_pattern", "sliding_window",
+            "rope_local_theta", "architecture",
             "enc_n_layers", "enc_n_heads", "enc_dim", "enc_ffn_dim",
             "n_mels", "enc_max_seq_len",
         ]
-        assert names == expected
+        assert names[: len(expected_head)] == expected_head
+        # Block ordering — one sentinel per block, in types.h order.
+        block_order = [
+            "n_embd_per_layer",     # Gemma 4
+            "attn_output_gate",     # Qwen3.5 GDN
+            "n_experts",            # MoE
+            "vision_n_layers",      # vision tower
+            "vision_arch",          # vision family selector
+            "audio_n_layers",       # audio tower
+        ]
+        indices = [names.index(f) for f in block_order]
+        assert indices == sorted(indices)
 
     def test_field_count(self):
-        assert len(BaseRTModelConfig._fields_) == 21
+        assert len(BaseRTModelConfig._fields_) == 87
 
     def test_architecture_field_is_char_array(self):
         # architecture should be a fixed 32-byte char array
@@ -459,7 +475,7 @@ class TestFindLibrary:
                 assert result == str(fake_lib.resolve())
 
     def test_lib_name_constant(self):
-        assert _LIB_NAME == "libbaseRT.dylib"
+        assert _lib_names()[0] == _LIB_NAME
 
 
 # -------------------------------------------------------------------------
@@ -540,11 +556,10 @@ class TestStructSizes:
     """
 
     def test_model_config_size(self):
-        size = ctypes.sizeof(BaseRTModelConfig)
-        # 14 uint32 + 2 float + 32 char + 6 uint32 = 20*4 + 2*4 + 32 = 120 min
-        assert size >= 112
-        # Should not be absurdly large
-        assert size <= 256
+        # Exact sizeof(BaseRTModelConfig) from include/baseRT/types.h; the
+        # library cross-check happens at import via baseRT_model_config_sizeof.
+        # Must match the Rust mirror test (bindings/rust/baseRT-sys).
+        assert ctypes.sizeof(BaseRTModelConfig) == 1540
 
     def test_sampling_config_size(self):
         size = ctypes.sizeof(BaseRTSamplingConfig)

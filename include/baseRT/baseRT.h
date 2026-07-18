@@ -63,8 +63,8 @@ extern "C" {
 // === Versioning ===
 
 #define BASERT_VERSION_MAJOR 0
-#define BASERT_VERSION_MINOR 4
-#define BASERT_VERSION_PATCH 1
+#define BASERT_VERSION_MINOR 1
+#define BASERT_VERSION_PATCH 6
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
@@ -101,6 +101,11 @@ baseRT_model_t baseRT_load_model(const char *model_path, const char *kernel_libr
 /// baseRT_load_model. Other values are ignored.
 void baseRT_set_kv_bits(int bits);
 
+/// Enable engine diagnostics (RoPE/tokenizer/GPU/architecture dumps, the
+/// per-token dispatch-command count, "Warming up"). Off by default so end
+/// users see only model output. Also honored via the BASERT_VERBOSE env var.
+void baseRT_set_verbose(int on);
+
 /// Toggle paged-KV mode for the next baseRT_load_model call.
 ///   enable = 0 → contiguous KV cache (default; existing layout)
 ///   enable = 1 → paged KV cache + block-table dispatch
@@ -133,6 +138,12 @@ void baseRT_free_model(baseRT_model_t model);
 
 /// Get model configuration.
 BaseRTModelConfig baseRT_get_config(baseRT_model_t model);
+
+/// sizeof(BaseRTModelConfig) as compiled into the library. Language
+/// bindings that mirror the struct by hand (Python/Rust/Node) compare
+/// this against their mirror's size at load time so layout drift fails
+/// loudly instead of decoding garbage fields.
+size_t baseRT_model_config_sizeof(void);
 
 /// Get total GPU memory used by model (bytes).
 size_t baseRT_model_memory(baseRT_model_t model);

@@ -58,8 +58,8 @@ jobs:
         run: |
           mkdir -p build
           if gh release download --repo ${{ github.repository }} \
-               --pattern 'baseRT-engine-macos-arm64*.tar.gz' -D build 2>/dev/null; then
-            tar -xzf build/baseRT-engine-macos-arm64*.tar.gz -C build
+               --pattern 'basert-engine-macos-arm64*.tar.gz' -D build 2>/dev/null; then
+            tar -xzf build/basert-engine-macos-arm64*.tar.gz -C build
             echo "have=1" >> "$GITHUB_OUTPUT"
           else
             echo "no engine release yet — skipping engine-linked tests"

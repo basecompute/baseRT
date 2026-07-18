@@ -216,12 +216,30 @@ fn auto_pull_and_resolve(reg: &MergedRegistry, id: &str, want_variant: Option<&s
         .with_context(|| format!("fetched {pull_id} but could not locate the installed artifact"))
 }
 
-/// Resolve a hub model reference (`org/model` or `org/model:variant`) to the
-/// installed `.base` artifact path. When the model isn't installed yet it is
-/// fetched on demand — preferring the pre-converted basecompute mirror, else
-/// converting the source repo — so `basert chat`/`serve <id>` Just Works.
-fn resolve_hub_model(token: &str) -> Result<PathBuf> {
-    let (id, variant) = token.split_once(':').map_or((token, None), |(i, v)| (i, Some(v)));
+/// Resolve a hub model reference to the installed `.base` artifact path.
+///
+/// The variant (quant build) is chosen by an inline `org/model:default-q8` on
+/// the token, or by the `--variant` launcher flag (`default_variant`) for
+/// tokens without an inline `:variant` — the inline form wins. With neither,
+/// the sole installed variant is used (and it's an error to resolve a model
+/// with several installed without naming one). An uninstalled model is fetched
+/// on demand — preferring the pre-converted basecompute mirror, else converting
+/// the source repo — so `basert chat`/`serve <id>` Just Works.
+fn resolve_hub_model(token: &str, default_variant: Option<&str>) -> Result<PathBuf> {
+    let (id, inline) = token.split_once(':').map_or((token, None), |(i, v)| (i, Some(v)));
+
+    // A trailing/empty `:` is a typo, not "default variant" — fail loudly so it
+    // doesn't silently resolve to q4.
+    if inline == Some("") {
+        bail!(
+            "empty variant after ':' in `{token}` — name a variant \
+             (e.g. `{id}:default-q8`) or drop the colon. Run `basert list` to \
+             see installed variants."
+        );
+    }
+
+    // Inline `:variant` wins over the `--variant` flag.
+    let variant = inline.or(default_variant);
     let reg = MergedRegistry::load()?;
 
     if let Some(v) = variant {
@@ -239,17 +257,54 @@ fn resolve_hub_model(token: &str) -> Result<PathBuf> {
 
 /// Rewrite every hub-id-shaped argument to the installed `.base` path so that
 /// `basert chat org/model` (positional) and `basert serve --model org/model`
-/// (repeatable flag) both Just Work after `basert pull`.
-fn resolve_model_args(rest: &[String]) -> Result<Vec<String>> {
+/// (repeatable flag) both Just Work after `basert pull`. `default_variant`
+/// comes from the `--variant` launcher flag and applies to ids without an
+/// inline `:variant`.
+fn resolve_model_args(rest: &[String], default_variant: Option<&str>) -> Result<Vec<String>> {
     rest.iter()
         .map(|arg| {
             if looks_like_hub_id(arg) {
-                Ok(resolve_hub_model(arg)?.to_string_lossy().into_owned())
+                Ok(resolve_hub_model(arg, default_variant)?.to_string_lossy().into_owned())
             } else {
                 Ok(arg.clone())
             }
         })
         .collect()
+}
+
+/// Pull a `--variant <v>` / `--variant=<v>` selector out of the forwarded args,
+/// returning the variant (if any) and the args with it removed — the runtime
+/// binary never sees a flag it doesn't understand. The selector applies to
+/// hub-id model args that don't already carry an inline `:variant`.
+fn extract_variant_flag(rest: &[String]) -> Result<(Option<String>, Vec<String>)> {
+    let mut variant: Option<String> = None;
+    let mut out: Vec<String> = Vec::with_capacity(rest.len());
+    let mut i = 0;
+    while i < rest.len() {
+        let a = &rest[i];
+        if a == "--variant" {
+            let v = rest
+                .get(i + 1)
+                .context("`--variant` needs a value, e.g. `--variant default-q8`")?;
+            if v.is_empty() {
+                bail!("`--variant` value is empty");
+            }
+            variant = Some(v.clone());
+            i += 2;
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--variant=") {
+            if v.is_empty() {
+                bail!("`--variant=` value is empty");
+            }
+            variant = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    Ok((variant, out))
 }
 
 /// Forward `basert <cmd> [args…]` to the matching runtime binary. Searches for
@@ -262,7 +317,11 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
     let (cmd, rest) = argv
         .split_first()
         .context("no subcommand given to launcher")?;
-    let rest = resolve_model_args(rest)?;
+    // `--variant <v>` is a launcher-level model selector; strip it before
+    // forwarding (the runtime binary doesn't know it) and apply it during
+    // hub-id resolution.
+    let (variant_flag, rest) = extract_variant_flag(rest)?;
+    let rest = resolve_model_args(&rest, variant_flag.as_deref())?;
     let candidates = [format!("basert-{cmd}"), format!("baseRT_{cmd}")];
 
     // Prefer a binary sitting next to `basert` (how the release ships); fall
@@ -910,8 +969,48 @@ mod tests {
             "--max-tokens".to_string(),
             "32".to_string(),
         ];
-        let out = resolve_model_args(&args).unwrap();
+        let out = resolve_model_args(&args, None).unwrap();
         assert_eq!(out, args);
+    }
+
+    #[test]
+    fn resolve_hub_model_rejects_empty_variant() {
+        // A trailing `:` (empty variant) is a typo — error before any pull,
+        // rather than silently resolving to the q4 default.
+        let err = resolve_hub_model("basecompute/Gemma-4-E2B-it:", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty variant"), "{err}");
+    }
+
+    #[test]
+    fn extract_variant_flag_parses_all_forms() {
+        // `--variant <v>`
+        let (v, rest) = extract_variant_flag(&[
+            "--model".into(),
+            "org/m".into(),
+            "--variant".into(),
+            "default-q8".into(),
+            "--port".into(),
+            "8080".into(),
+        ])
+        .unwrap();
+        assert_eq!(v.as_deref(), Some("default-q8"));
+        assert_eq!(rest, vec!["--model", "org/m", "--port", "8080"]);
+
+        // `--variant=<v>`
+        let (v, rest) = extract_variant_flag(&["--variant=q8".into(), "org/m".into()]).unwrap();
+        assert_eq!(v.as_deref(), Some("q8"));
+        assert_eq!(rest, vec!["org/m"]);
+
+        // Absent → None, args untouched.
+        let (v, rest) = extract_variant_flag(&["org/m".into()]).unwrap();
+        assert!(v.is_none());
+        assert_eq!(rest, vec!["org/m"]);
+
+        // Missing / empty value → error.
+        assert!(extract_variant_flag(&["--variant".into()]).is_err());
+        assert!(extract_variant_flag(&["--variant=".into()]).is_err());
     }
 
     #[test]

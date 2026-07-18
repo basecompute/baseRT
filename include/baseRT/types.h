@@ -84,6 +84,27 @@ typedef struct {
     // E4B / E2B: all zeros (uniform cfg.n_kv_heads applies).
     uint32_t n_kv_heads_per_layer[128];
 
+    // ── Qwen3.5 / 3.6 hybrid linear-attention (Gated DeltaNet) ───────
+    // 0 / empty = not a hybrid model. Qwen3.5 interleaves Gated-DeltaNet
+    // linear-attention layers with periodic full (softmax) attention
+    // (reuses the Qwen3-Next decoder). full_attention_interval / the
+    // linear_attn_layers bitfield select which layers are which.
+    // Full-attention layers additionally use an output gate + partial RoPE.
+    uint8_t attn_output_gate;          // 1 = full-attn q_proj is doubled [q|gate]; attn *= sigmoid(gate) pre-o_proj
+    uint8_t _qwen35_pad[3];            // align to 4 bytes
+    float partial_rotary_factor;       // full-attn: only first factor*head_dim dims rotate (Qwen3.5 = 0.25). 0/1 = full
+    uint32_t full_attention_interval;  // every Nth layer is full attention (rest are GDN). 0 = not hybrid
+    // Per-layer GDN mask: bit i = 1 means layer i is a Gated-DeltaNet
+    // linear-attention layer; bit 0 = full (softmax) attention. Authoritative
+    // copy of the config `layer_types` schedule. Up to 512 layers (64 bytes).
+    uint8_t linear_attn_layers[64];
+    // Gated-DeltaNet shapes (0 = not hybrid). Consumed by the GDN kernel.
+    uint32_t gdn_num_k_heads;     // linear_num_key_heads
+    uint32_t gdn_num_v_heads;     // linear_num_value_heads
+    uint32_t gdn_key_head_dim;    // linear_key_head_dim
+    uint32_t gdn_value_head_dim;  // linear_value_head_dim
+    uint32_t gdn_conv_kernel;     // linear_conv_kernel_dim (short causal conv width)
+
     // Mixture-of-Experts (0 = dense model).
     // Gemma 4 26B-A4B: n_experts=128, n_experts_used=8, n_experts_shared=1 (via dense ffn.*), expert_gating=0
     // (softmax), norm_topk_prob=0 Qwen3.6-35B-A3B (qwen35moe): n_experts=128, n_experts_used=8, n_experts_shared=0,
@@ -114,6 +135,16 @@ typedef struct {
     uint32_t boi_token_id;           // begin-of-image token (0 = none)
     uint32_t eoi_token_id;           // end-of-image token (0 = none)
 
+    // ── Vision-tower family selector + Qwen3-VL-style extras ─────────
+    // vision_arch: 0 = SigLIP/Gemma-4 (pooled ViT + factorized pos-embed);
+    //              1 = Qwen3.5 / Qwen3-VL ViT (LayerNorm blocks, fused QKV,
+    //                  learned pos-embed bilinear interp, 2D M-RoPE, spatial
+    //                  merger instead of avg-pool). Populated from mmproj.arch.
+    uint32_t vision_arch;            // 0 = siglip/gemma4, 1 = qwen3_5 / qwen3_vl
+    uint32_t vision_spatial_merge;   // Qwen: spatial_merge_size (2 → 2x2 patch merge). 0 = n/a
+    uint32_t vision_temporal_patch;  // Qwen: temporal_patch_size (frame is tiled this many times)
+    uint32_t vision_out_dim;         // Qwen: merger out_hidden_size (== text dim). 0 = use cfg.dim
+
     // Audio tower (Gemma 4 Conformer encoder). All zero = no audio tower.
     uint32_t audio_n_layers;          // Conformer blocks (e.g. 12)
     uint32_t audio_dim;               // hidden size (e.g. 1024)
@@ -134,6 +165,30 @@ typedef struct {
     uint32_t audio_token_id;          // placeholder token for audio features
     uint32_t boa_token_id;            // begin-of-audio token (0 = none)
     uint32_t eoa_token_id;            // end-of-audio token (0 = none)
+
+    // ── Multimodal RoPE (Qwen3.5-VL interleaved M-RoPE) ──────────────
+    // Rotary-pair split over the [temporal, height, width] axes for the
+    // full-attention layers of VL models (Qwen3.5/3.6-VL: [11, 11, 10],
+    // summing to n_rot/2). All-zero = plain 1-D RoPE (text-only model or a
+    // .base converted before the converter recorded the key — the runtime
+    // falls back to [11, 11, 10] on the image path then).
+    uint32_t mrope_section[3];
+    uint8_t mrope_interleaved;  // 1 = interleaved axis map THWTHW…TT (Qwen3.5), 0 = sectioned/absent
+    uint8_t _mrope_pad[3];      // align to 4 bytes
+    // RoPE frequency scaling (HF `rope_scaling`, "llama3" type). factor <= 1
+    // means none. The low/high freq factors and original max position
+    // parameterize the piecewise per-frequency rescale; when factor > 1 and
+    // the detail fields are 0 the runtime falls back to the Llama-3-family
+    // defaults (low 1.0, high 4.0, original 8192).
+    float rope_scaling_factor;    // e.g. 32 on Llama-3.2 (1 or 0 = unscaled)
+    float rope_low_freq_factor;   // wavelengths above orig_max/low rescale by 1/factor
+    float rope_high_freq_factor;  // wavelengths below orig_max/high stay unscaled
+    uint32_t rope_orig_max_pos;   // original_max_position_embeddings (e.g. 8192)
+    // rope_scaling type: 0 = none/legacy header (llama arch + factor > 1
+    // defaults to llama3 — correct for every published llama-family .base),
+    // 1 = llama3 (piecewise), 2 = linear (uniform divisor), 3 = other /
+    // unsupported (skipped with a warning rather than mis-applied).
+    uint32_t rope_scaling_type;
 } BaseRTModelConfig;
 
 /// Transcription result statistics.
