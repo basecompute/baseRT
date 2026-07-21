@@ -423,7 +423,7 @@ mod tests {
         std::fs::create_dir_all(&vdir).unwrap();
         std::fs::write(cache::base_artifact_path(&vdir), b"junk-not-a-header").unwrap();
         // A staging artifact under .src must be ignored.
-        let sdir = cache::src_staging_dir(root, "meta/Foo", "main").unwrap();
+        let sdir = cache::hf_staging_dir(root).join("models--meta--Foo/snapshots/main");
         std::fs::create_dir_all(&sdir).unwrap();
         std::fs::write(cache::base_artifact_path(&sdir), b"junk").unwrap();
 

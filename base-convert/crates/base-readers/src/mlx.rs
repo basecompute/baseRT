@@ -6,14 +6,18 @@
 //! - `config.json` has a `"quantization": {"bits": 4, "group_size": 64}`
 //!   key declaring the scheme.
 //! - A quantized weight `foo.weight` is stored as a `U32` tensor with
-//!   shape `[out_features, in_features / (32 / bits)]` — packed nibbles
-//!   (or bytes for 8-bit).
+//!   shape `[out_features, in_features * bits / 32]`: each row is a
+//!   contiguous little-endian bitstream of `bits`-wide codes. For bits
+//!   that divide 32 (2/4/8) every code sits at a fixed slot inside one
+//!   u32; for 3/5/6-bit codes cross byte and word boundaries, so the
+//!   stream must be decoded at bit granularity (MLX supports
+//!   bits ∈ {2, 3, 4, 5, 6, 8} for affine quant).
 //! - Two additional tensors accompany it: `foo.scales` and `foo.biases`,
 //!   both `F16`, shape `[out_features, in_features / group_size]`.
 //! - Dequant: `x[i, j] = q[i, j] * scale[i, j / group_size]
 //!                       + bias[i, j / group_size]`
-//!   where `q[i, j]` is extracted from `packed[i, j / (32/bits)]` at
-//!   nibble position `j % (32/bits)` (low-nibble first).
+//!   where `q[i, j]` is the `bits`-wide field at bit offset `j * bits`
+//!   of row `i`'s bitstream.
 //!
 //! Some MLX models carry per-tensor AWQ overrides in
 //! `config.quantization_config.{tensor_name}`; those are read verbatim
@@ -135,7 +139,13 @@ impl MlxDir {
         let q = self.quant_for_tensor(name);
         let bits = q.bits as usize;
         let group_size = q.group_size as usize;
-        let vals_per_u32 = 32 / bits;
+        if !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8) {
+            bail!(
+                "MLX packed tensor {:?}: unsupported bits={} (MLX affine quant packs 2/3/4/5/6/8)",
+                name,
+                bits
+            );
+        }
 
         // Batch dims are everything except the last; last-2 dims are
         // [out_features, packed_in]. For 2-D tensors batch is empty.
@@ -143,7 +153,15 @@ impl MlxDir {
         let packed_in = packed_in[0] as usize;
         let (batch_dims_split, out_dim_slice) = batch_dims.split_at(batch_dims.len() - 1);
         let out_features = out_dim_slice[0] as usize;
-        let in_features = packed_in * vals_per_u32;
+        if packed_in * 32 % bits != 0 {
+            bail!(
+                "MLX packed tensor {:?}: packed width {} u32 does not hold a whole number of {}-bit codes",
+                name,
+                packed_in,
+                bits
+            );
+        }
+        let in_features = packed_in * 32 / bits;
         let batch: usize = batch_dims_split.iter().product::<u64>() as usize;
         let batch = batch.max(1);
 
@@ -185,7 +203,7 @@ impl MlxDir {
             let s_base = b * slice_scales_len;
             let o_base = b * slice_out_len;
             for i in 0..out_features {
-                let row_p = p_base + i * packed_in;
+                let row_bytes = (p_base + i * packed_in) * 4;
                 let row_s = s_base + i * groups_per_row;
                 for gj in 0..groups_per_row {
                     let scale = read_half(scales_bytes, row_s + gj, scales_dtype);
@@ -197,14 +215,19 @@ impl MlxDir {
                     };
                     for lj in 0..group_size {
                         let j = gj * group_size + lj;
-                        let u32_idx = row_p + j / vals_per_u32;
-                        let u = u32::from_le_bytes(
-                            packed_bytes[u32_idx * 4..u32_idx * 4 + 4]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let slot = j % vals_per_u32;
-                        let q = (u >> (bits * slot)) & mask;
+                        // Code j occupies bits [j*bits, (j+1)*bits) of the
+                        // row's little-endian bitstream. With bits ≤ 8 a
+                        // code spans at most two bytes, and the second
+                        // byte is only touched when the code actually
+                        // crosses into it — never past the row's end.
+                        let bit = j * bits;
+                        let byte0 = row_bytes + bit / 8;
+                        let sh = bit % 8;
+                        let mut word = packed_bytes[byte0] as u32;
+                        if sh + bits > 8 {
+                            word |= (packed_bytes[byte0 + 1] as u32) << 8;
+                        }
+                        let q = (word >> sh) & mask;
                         out[o_base + i * in_features + j] =
                             (q as f32) * scale + bias;
                     }
@@ -219,8 +242,8 @@ impl MlxDir {
     /// Resolves bits per-tensor — Gemma 4 26B-A4B 4-bit checkpoints
     /// override `mlp.{gate,up,down}_proj` and `router.proj` to 8-bit, so
     /// using the global bits here unpacks 8-bit data as 4-bit and the
-    /// resulting `last_dim *= 8` (instead of *= 4) doubles the logical
-    /// in_features the runtime expects.
+    /// resulting `last_dim * 32 / 4` (instead of `* 32 / 8`) doubles the
+    /// logical in_features the runtime expects.
     pub fn unpacked_shape(&self, name: &str) -> Option<Vec<u64>> {
         let info = self.hf.tensor_info(name)?;
         quant_sibling(name, "scales")
@@ -229,10 +252,15 @@ impl MlxDir {
             return None;
         }
         let q = self.quant_for_tensor(name);
-        let vals_per_u32 = 32 / q.bits as u64;
+        let bits = q.bits as u64;
         let mut shape = info.shape.clone();
         let last = shape.len() - 1;
-        shape[last] *= vals_per_u32;
+        // packed_in = in_features * bits / 32, exactly — a non-exact
+        // inverse means the tensor isn't MLX-packed with these settings.
+        if bits == 0 || (shape[last] * 32) % bits != 0 {
+            return None;
+        }
+        shape[last] = shape[last] * 32 / bits;
         Some(shape)
     }
 

@@ -180,6 +180,17 @@ const char *baseRT_decode_token(baseRT_model_t model, uint32_t token_id);
 /// string lives in a thread-local buffer that is overwritten on each call.
 const char *baseRT_decode_token_static(baseRT_model_t model, uint32_t token_id);
 
+/// Length-preserving variant of `baseRT_decode_token_static` for callers
+/// that need the token's EXACT raw bytes. Byte-level BPE / byte-fallback
+/// tokens can decode to bytes containing 0x00, which the C-string variants
+/// above silently truncate at. Writes up to `max_bytes` into `out` (no NUL
+/// terminator appended) and returns the token's FULL byte length — if the
+/// return value exceeds `max_bytes`, call again with a larger buffer.
+/// Stateless; does not touch the incremental-decode state. Returns 0 for
+/// tokens that decode to nothing (e.g. filtered special tokens), <0 on
+/// invalid arguments.
+int baseRT_decode_token_raw(baseRT_model_t model, uint32_t token_id, char *out, int max_bytes);
+
 // === Generation ===
 
 /// Callback for streaming token output.

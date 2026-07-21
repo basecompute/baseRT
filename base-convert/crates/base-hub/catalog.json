@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-07-01",
+  "updated": "2026-07-20",
   "models": [
     {
       "id": "basecompute/Qwen3-0.6B",
@@ -325,6 +325,106 @@
       "quant": "default-q4",
       "size": 17182920704,
       "sha256": "7b294daeff8ba6e097f6cebe9f56c7b71f32476765a3f614eb256ef9d8c6ffce"
+    },
+    {
+      "id": "basecompute/Qwen3.5-2B",
+      "hf_repo": "basecompute/Qwen3.5-2B",
+      "source_repo": "Qwen/Qwen3.5-2B",
+      "arch": "qwen35",
+      "file": "Qwen3.5-2B-Q4.base",
+      "quant": "default-q4",
+      "size": 1266810880,
+      "sha256": "1c95f41730d5713fcb886a71d2481a29ff1a6e2fc9cea8a4d9ddbe29082fa262"
+    },
+    {
+      "id": "basecompute/Qwen3.5-2B",
+      "hf_repo": "basecompute/Qwen3.5-2B",
+      "source_repo": "Qwen/Qwen3.5-2B",
+      "arch": "qwen35",
+      "file": "Qwen3.5-2B-Q8.base",
+      "quant": "default-q8",
+      "size": 2301460480,
+      "sha256": "d4cf325278e873b3e0aefc18c5eff0a863f12fee5a82f0ac2f2e5ebce4067f3c"
+    },
+    {
+      "id": "basecompute/Qwen3.5-2B-Base",
+      "hf_repo": "basecompute/Qwen3.5-2B-Base",
+      "source_repo": "Qwen/Qwen3.5-2B-Base",
+      "arch": "qwen35",
+      "file": "Qwen3.5-2B-Base-Q4.base",
+      "quant": "default-q4",
+      "size": 1266810880,
+      "sha256": "ef10005ccd4c6bd3e2d9fbcac31b7f4491eff2639584bdc8006e67226f63d986"
+    },
+    {
+      "id": "basecompute/Qwen3.5-2B-Base",
+      "hf_repo": "basecompute/Qwen3.5-2B-Base",
+      "source_repo": "Qwen/Qwen3.5-2B-Base",
+      "arch": "qwen35",
+      "file": "Qwen3.5-2B-Base-Q8.base",
+      "quant": "default-q8",
+      "size": 2301460480,
+      "sha256": "f546b5074d92f104453a782a44143f3a44ed538569befdc7e2ff22675c719a30"
+    },
+    {
+      "id": "basecompute/Qwen3.5-35B-A3B",
+      "hf_repo": "basecompute/Qwen3.5-35B-A3B",
+      "source_repo": "Qwen/Qwen3.5-35B-A3B",
+      "arch": "qwen35moe",
+      "file": "Qwen3.5-35B-A3B-Q4.base",
+      "quant": "default-q4",
+      "size": 19776225280,
+      "sha256": "e62635e523e26c7a31df2d0d26cec485630b3b2172a9fd710b06e90c45174ff5"
+    },
+    {
+      "id": "basecompute/Qwen3.5-35B-A3B",
+      "hf_repo": "basecompute/Qwen3.5-35B-A3B",
+      "source_repo": "Qwen/Qwen3.5-35B-A3B",
+      "arch": "qwen35moe",
+      "file": "Qwen3.5-35B-A3B-Q8.base",
+      "quant": "default-q8",
+      "size": 36228218880,
+      "sha256": "6f8878ff2332451efbf2258887bad0535a97aeb657cf0b7ce8492219881184ff"
+    },
+    {
+      "id": "basecompute/Qwen3.6-27B",
+      "hf_repo": "basecompute/Qwen3.6-27B",
+      "source_repo": "Qwen/Qwen3.6-27B",
+      "arch": "qwen35",
+      "file": "Qwen3.6-27B-Q4.base",
+      "quant": "default-q4",
+      "size": 15447605248,
+      "sha256": "f24b31c552994f82e18f2a3b7a7352ff0c41cf070351e941816365bd02bca79c"
+    },
+    {
+      "id": "basecompute/Qwen3.6-27B",
+      "hf_repo": "basecompute/Qwen3.6-27B",
+      "source_repo": "Qwen/Qwen3.6-27B",
+      "arch": "qwen35",
+      "file": "Qwen3.6-27B-Q8.base",
+      "quant": "default-q8",
+      "size": 28256698368,
+      "sha256": "f65023ea2a5e1cc2a6091cc926a4156935e4ada58133d4bc84bc6d759f738039"
+    },
+    {
+      "id": "basecompute/Qwen3.6-35B-A3B",
+      "hf_repo": "basecompute/Qwen3.6-35B-A3B",
+      "source_repo": "Qwen/Qwen3.6-35B-A3B",
+      "arch": "qwen35moe",
+      "file": "Qwen3.6-35B-A3B-Q4.base",
+      "quant": "default-q4",
+      "size": 19776225280,
+      "sha256": "6819d2152fe025af5b1eb12d02e862c5277258a016e6b901c6c91791ba24c48b"
+    },
+    {
+      "id": "basecompute/Qwen3.6-35B-A3B",
+      "hf_repo": "basecompute/Qwen3.6-35B-A3B",
+      "source_repo": "Qwen/Qwen3.6-35B-A3B",
+      "arch": "qwen35moe",
+      "file": "Qwen3.6-35B-A3B-Q8.base",
+      "quant": "default-q8",
+      "size": 36228218880,
+      "sha256": "11d093a918e2a0b917430547dafcdcab2fe1c2d689ec86b5343382f72d2b2c3b"
     }
   ]
 }
