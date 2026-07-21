@@ -1,0 +1,13 @@
+model,size_mb,engine,test,tok_per_sec,stddev
+Qwen/Qwen3.6-35B-A3B · default-q4,20889,basert,pp128,552.07,1.29
+Qwen/Qwen3.6-35B-A3B · default-q4,20889,basert,tg128,96.77,0.72
+Qwen/Qwen3.6-35B-A3B · default-q4,20889,basert,pp256,692.73,1.88
+Qwen/Qwen3.6-35B-A3B · default-q4,20889,basert,tg128,96.37,0.66
+Qwen/Qwen3.6-35B-A3B · default-q4,20889,basert,pp512,851.39,0.41
+Qwen/Qwen3.6-35B-A3B · default-q4,20889,basert,tg128,97.15,0.77
+Qwen/Qwen3.6-35B-A3B · default-q4,20889,basert,pp2048,1025.34,10.61
+Qwen/Qwen3.6-35B-A3B · default-q4,20889,basert,tg128,96.48,0.62
+Qwen/Qwen3.6-35B-A3B · default-q4,20928,basert,pp6000,878.60,3.18
+Qwen/Qwen3.6-35B-A3B · default-q4,20928,basert,tg128,95.99,0.86
+Qwen/Qwen3.6-35B-A3B · default-q4,21651,basert,pp43000,574.93,1.00
+Qwen/Qwen3.6-35B-A3B · default-q4,21651,basert,tg128,96.53,0.52

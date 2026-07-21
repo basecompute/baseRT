@@ -35,7 +35,9 @@ engine bundle unpacked into `build/` (so `build/basert-bench` exists) — see
 - Use controlled token counts (`-p`/`-n`) and several repetitions (`-r`) with a
   warm-up (`-w`) so the first-call allocation cost doesn't skew results.
 - Prefill and decode are reported separately; they stress different parts of the
-  engine (compute-bound matmuls vs. memory-bound single-token steps).
-- For server-style throughput, benchmark under `basert serve
-  --continuous-batching` with concurrent clients rather than the single-stream
-  `bench` tool.
+  engine (compute-bound matmuls vs. memory-bound single-token steps). The decode
+  row is an independent microbenchmark, not generation after the prompt length
+  in the prefill row printed beside it.
+- `basert bench` is a single-stream engine microbenchmark. For production
+  server-style throughput, benchmark under `basert serve --continuous-batching`
+  with concurrent clients so request scheduling and batching are included.
