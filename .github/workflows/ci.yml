@@ -15,6 +15,14 @@ on:
 # Also turn on "Require approval for all outside collaborators" in repo Actions
 # settings before making this repo public.
 jobs:
+  benchmark-tools:
+    name: benchmark tooling (unit tests)
+    if: github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && (github.base_ref == 'main' || github.base_ref == 'dev'))
+    runs-on: [self-hosted, macOS, ARM64, m4pro]
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s benchmarks/tests -v
+
   base-convert:
     name: base-convert (build + test)
     if: github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && (github.base_ref == 'main' || github.base_ref == 'dev'))

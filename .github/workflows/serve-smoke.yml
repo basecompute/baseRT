@@ -1,6 +1,6 @@
 name: Server smoke
 
-# Manually-triggered: start baseRT_serve from an engine release and assert it
+# Manually-triggered: start basert-serve from an engine release and assert it
 # answers an OpenAI /v1/chat/completions request. Needs an engine release and a
 # .base model URL.
 
@@ -10,6 +10,11 @@ on:
       model_url:
         description: "URL to a .base model"
         required: true
+      run_tool_state_smoke:
+        description: "Run sequential/concurrent tool-state regression checks"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   serve:
@@ -20,18 +25,20 @@ jobs:
         run: |
           mkdir -p build
           gh release download --repo ${{ github.repository }} \
-            --pattern 'baseRT-engine-macos-arm64*.tar.gz' -D build
-          tar -xzf build/baseRT-engine-macos-arm64*.tar.gz -C build
+            --pattern 'basert-engine-macos-arm64*.tar.gz' -D build
+          tar -xzf build/basert-engine-macos-arm64*.tar.gz -C build
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Fetch model
         run: |
           mkdir -p models
-          curl -fsSL "${{ inputs.model_url }}" -o models/model.base
-      - name: Start server + assert a completion
+          curl -fsSL "$MODEL_URL" -o models/model.base
+        env:
+          MODEL_URL: ${{ inputs.model_url }}
+      - name: Start server + run smoke checks
         run: |
           KEY="ci-$RANDOM"
-          ./build/baseRT_serve --model models/model.base --api-key "$KEY" --port 8080 \
+          ./build/basert-serve models/model.base --api-key "$KEY" --port 8080 \
             > serve.log 2>&1 &
           SV=$!
           trap 'kill $SV 2>/dev/null || true' EXIT
@@ -44,3 +51,11 @@ jobs:
             http://127.0.0.1:8080/v1/chat/completions)
           echo "$RESP"
           echo "$RESP" | python3 -c "import sys,json; c=json.load(sys.stdin)['choices'][0]['message']['content']; assert c, 'empty completion'; print('OK:', repr(c[:60]))"
+          if [[ "$RUN_TOOL_STATE_SMOKE" == "true" ]]; then
+            python3 benchmarks/scripts/tool_state_smoke.py \
+              --base-url http://127.0.0.1:8080/v1 \
+              --model model.base \
+              --api-key "$KEY"
+          fi
+        env:
+          RUN_TOOL_STATE_SMOKE: ${{ inputs.run_tool_state_smoke }}
