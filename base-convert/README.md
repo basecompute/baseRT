@@ -47,14 +47,22 @@ basert list                    # installed models (table; --json for JSON)
 basert list --remote           # also show catalog models not yet installed
 ```
 
+Downloads stage under `<models dir>/.src/hf` — not the global HuggingFace
+cache — and are moved into place on success, so a pulled model exists
+exactly once on disk. Interrupted pulls leave their partial download in
+staging and resume on retry. Convert-on-pull deletes the downloaded
+safetensors sources after a successful conversion; set
+`BASERT_KEEP_HF_SOURCES=1` to keep them (faster re-pulls of another quant
+of the same repo, at the cost of a second multi-GB copy).
+
 Gated/private repos use the standard HuggingFace token chain
 (`$HF_TOKEN` / `~/.cache/huggingface/token`). Convert-on-pull in the
 public build uses only generic profiles; tuned quantization is delivered
 through pre-converted catalog artifacts.
 
-## Runtime tools
+## Runtime commands
 
-`basert <cmd>` forwards to the matching runtime binary (`basert-<cmd>`):
+Run a model with the BaseRT runtime:
 
 ```
 basert serve    <model> [--model <model2> …]         # OpenAI-compatible server (--model repeats for multi-model)

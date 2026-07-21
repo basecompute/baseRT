@@ -4,29 +4,45 @@ use std::path::PathBuf;
 
 mod hub;
 
-/// Listed in `basert --help` so the dispatched runtime tools are discoverable
-/// (clap's external-subcommand catch-all is otherwise invisible in help).
-const RUNTIME_TOOLS_HELP: &str = "\
-Runtime tools (forwarded to the matching `basert-<cmd>` binary):
-  serve       Start the OpenAI-compatible HTTP server
-  chat        Interactive chat
-  complete    One-shot text completion
-  bench       Throughput benchmark
-  profile     Profile prefill/decode timing
-  transcribe  Audio transcription
+/// Hand-written top-level help: the runtime commands are dispatched via
+/// clap's external-subcommand catch-all (invisible to clap's auto listing),
+/// so the whole command list is laid out here — runtime commands first,
+/// grouped, with the built-in subcommands folded in.
+const HELP_TEMPLATE: &str = "\
+{about-with-newline}
+{usage-heading} {usage}
 
-Run `basert <tool> --help` for a tool's own options.
+Run models:
+  serve       Start an OpenAI-compatible HTTP server
+  chat        Chat with a model interactively
+  complete    Generate a one-shot completion
+  bench       Measure throughput
 
-Model variant (serve/chat/complete/bench/profile) — pick which quant build to run:
+Manage models:
+  pull        Download a model from the BaseRT catalog or Hugging Face
+  list        List installed models (`--remote` adds the catalog)
+
+Convert & author:
+  convert     Convert a GGUF / safetensors model to `.base`
+  inspect     Summarize a `.base` file (header, tensors, metadata)
+  sign        Sign a `.base` file
+  verify      Verify a signed `.base` file
+  keygen      Generate a signing keypair
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+Model variants — pick which quant build to run:
   <id>:<variant>   e.g. basert serve basecompute/Gemma-4-E2B-it:default-q8
   --variant <v>    same, as a flag (applies to ids without an inline ':variant')
-Run `basert list` to see installed variants (default-q4, default-q8, …).";
+Run `basert list` to see installed variants (default-q4, default-q8, …).
 
-/// The `basert` CLI: the model hub (pull/list from HuggingFace), the offline
-/// GGUF / MLX-safetensors / HF-safetensors → `.base` converter, and a
-/// launcher for the runtime tools (`basert serve`, `basert chat`, …).
+Run `basert <command> --help` for a command's options.";
+
+/// The BaseRT CLI: run, download, and convert models.
 #[derive(Parser, Debug)]
-#[command(name = "basert", version, about, after_help = RUNTIME_TOOLS_HELP)]
+#[command(name = "basert", version, about, help_template = HELP_TEMPLATE)]
 struct Args {
     #[command(subcommand)]
     cmd: Cmd,
@@ -49,8 +65,8 @@ enum Cmd {
     Pull(PullArgs),
     /// List models in the local hub cache (and, with `--remote`, the catalog).
     List(ListArgs),
-    /// Runtime tools — `serve`, `chat`, `complete`, `bench`, … — forwarded to
-    /// the matching engine binary (`basert-<cmd>`).
+    /// Runtime commands — `serve`, `chat`, `complete`, `bench`, … — handled
+    /// by the BaseRT runtime (dispatched in `hub::dispatch_external`).
     #[command(external_subcommand)]
     External(Vec<String>),
 }

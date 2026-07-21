@@ -9,7 +9,7 @@
 use crate::{AwqMode, ConvertArgs, ListArgs, PullArgs, TargetScheme};
 use anyhow::{bail, Context, Result};
 use base_hub::cache::{self, HubSidecar};
-use base_hub::fetch::{Fetcher, HfFetcher};
+use base_hub::fetch::{self, Fetcher, HfFetcher};
 use base_hub::registry::{MergedRegistry, ModelEntry, ModelRef, Registry, SourceKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,11 +18,13 @@ use std::process::Command;
 // per-arch profiles are intentionally NOT bundled — tuned quality reaches
 // users through pre-converted catalog artifacts, not by exposing the recipe.
 const PROFILE_Q4: &str = include_str!("../../../profiles/default-q4.json");
+const PROFILE_Q6: &str = include_str!("../../../profiles/default-q6.json");
 const PROFILE_Q8: &str = include_str!("../../../profiles/default-q8.json");
 
 fn bundled_profile_for_target(target: TargetScheme) -> Option<(&'static str, &'static str)> {
     match target {
         TargetScheme::BaseQ4 => Some(("default-q4", PROFILE_Q4)),
+        TargetScheme::BaseQ6 => Some(("default-q6", PROFILE_Q6)),
         TargetScheme::BaseQ8 => Some(("default-q8", PROFILE_Q8)),
         _ => None,
     }
@@ -314,9 +316,7 @@ fn extract_variant_flag(rest: &[String]) -> Result<(Option<String>, Vec<String>)
 pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
-    let (cmd, rest) = argv
-        .split_first()
-        .context("no subcommand given to launcher")?;
+    let (cmd, rest) = argv.split_first().context("no command given")?;
     // `--variant <v>` is a launcher-level model selector; strip it before
     // forwarding (the runtime binary doesn't know it) and apply it during
     // hub-id resolution.
@@ -347,12 +347,21 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
             return Err(err).with_context(|| format!("launching {}", target.display()));
         }
     }
-    bail!(
-        "unknown command `basert {cmd}` — no `basert-{cmd}` runtime tool found \
-         next to this binary or on PATH.\n\
-         Install the BaseRT runtime alongside the CLI, or run `basert --help`."
-    )
+    if RUNTIME_COMMANDS.contains(&cmd.as_str()) {
+        bail!(
+            "`basert {cmd}` needs the BaseRT runtime, which wasn't found in this \
+             installation.\n\
+             Reinstall the full BaseRT package, or run `basert --help`."
+        )
+    }
+    bail!("unknown command `basert {cmd}`.\nRun `basert --help` to see available commands.")
 }
+
+/// Commands served by the BaseRT runtime rather than this binary. Used only
+/// to shape the not-found error above; dispatch itself is name-driven, so
+/// commands absent from this list (or from `basert --help`) still dispatch.
+const RUNTIME_COMMANDS: [&str; 6] =
+    ["serve", "chat", "complete", "bench", "transcribe", "profile"];
 
 pub fn cmd_pull(args: PullArgs) -> Result<()> {
     let reg = MergedRegistry::load()?;
@@ -381,7 +390,7 @@ pub fn cmd_pull(args: PullArgs) -> Result<()> {
             if quant_tag(variant) == want {
                 pull_catalog(&root, &r)
             } else {
-                let fetcher = HfFetcher::new()?;
+                let fetcher = HfFetcher::new(cache::hf_staging_dir(&root))?;
                 let base_files = list_base_files(&fetcher, hf_repo, revision)?;
                 pull_base_direct(&root, &args, id, hf_repo, revision, &fetcher, &base_files)
             }
@@ -390,7 +399,7 @@ pub fn cmd_pull(args: PullArgs) -> Result<()> {
         // (e.g. the basecompute org), download the matching one directly — no
         // local conversion. Otherwise treat it as source safetensors.
         ModelRef::HuggingFace { id, repo, revision } => {
-            let fetcher = HfFetcher::new()?;
+            let fetcher = HfFetcher::new(cache::hf_staging_dir(&root))?;
             let base_files = list_base_files(&fetcher, repo, revision)?;
             if base_files.is_empty() {
                 pull_and_convert(&root, &args, id, repo, revision)
@@ -442,18 +451,23 @@ fn pull_catalog(root: &Path, r: &ModelRef) -> Result<()> {
     eprintln!("basert pull v{}", env!("CARGO_PKG_VERSION"));
     eprintln!("  catalog: {hf_repo}/{file}@{revision} (pre-converted)");
 
-    let fetcher = HfFetcher::new()?;
+    let fetcher = HfFetcher::new(cache::hf_staging_dir(root))?;
     let src = fetcher.get_file(hf_repo, revision, file)?;
 
     let vdir = cache::variant_dir(root, id, variant)?;
     std::fs::create_dir_all(&vdir)?;
     let out = cache::base_artifact_path(&vdir);
-    std::fs::copy(&src, &out).with_context(|| format!("installing into {}", out.display()))?;
+    // Moves the staged download into place (same filesystem), so the pulled
+    // artifact exists exactly once on disk.
+    fetch::install_file(&fetcher, hf_repo, &src, &out)?;
 
     let got_sha = crate::compute_sha256_streaming(&out)?;
     if let Some(expected) = sha256 {
         if !got_sha.eq_ignore_ascii_case(expected) {
             std::fs::remove_file(&out).ok();
+            // The staged bytes are equally bad — no resume value in them, so
+            // clear them and let a retry start from scratch.
+            fetch::cleanup_staging(&fetcher, hf_repo);
             bail!("sha256 mismatch for {id}: expected {expected}, got {got_sha}");
         }
         eprintln!("  sha256:  verified");
@@ -470,6 +484,7 @@ fn pull_catalog(root: &Path, r: &ModelRef) -> Result<()> {
         None,
         Some(got_sha),
     )?;
+    fetch::cleanup_staging(&fetcher, hf_repo);
     eprintln!("installed {id} [{variant}] → {}", out.display());
     Ok(())
 }
@@ -508,10 +523,13 @@ fn pull_base_direct(
     let out = cache::base_artifact_path(&vdir);
 
     let src = fetcher.get_file(repo, revision, file)?;
-    std::fs::copy(&src, &out).with_context(|| format!("installing into {}", out.display()))?;
+    // Moves the staged download into place (same filesystem), so the pulled
+    // artifact exists exactly once on disk.
+    fetch::install_file(fetcher, repo, &src, &out)?;
 
     let sha = crate::compute_sha256_streaming(&out).ok();
     write_sidecar_for(&vdir, id, "huggingface", repo, None, revision, &variant, None, sha)?;
+    fetch::cleanup_staging(fetcher, repo);
     eprintln!("installed {id} [{variant}] → {}", out.display());
     Ok(())
 }
@@ -536,7 +554,7 @@ fn pull_and_convert(
     let out = cache::base_artifact_path(&vdir);
     std::fs::create_dir_all(&vdir)?;
 
-    let fetcher = HfFetcher::new()?;
+    let fetcher = HfFetcher::new(cache::hf_staging_dir(root))?;
     let snapshot = download_source(repo, revision, &fetcher)?;
 
     let conv = ConvertArgs {
@@ -565,8 +583,35 @@ fn pull_and_convert(
         Some(&variant),
         sha,
     )?;
+    // The staged source snapshot is now a redundant multi-GB copy of a model
+    // we keep in converted form (provenance lives in hub.json; a re-convert
+    // can re-fetch). Drop it unless the user opted to keep sources — keeping
+    // them makes a later pull of another quant of the same repo skip the
+    // re-download.
+    if keep_hf_sources() {
+        eprintln!(
+            "  keeping HF source snapshot under {} (BASERT_KEEP_HF_SOURCES)",
+            cache::hf_staging_dir(root).display()
+        );
+    } else {
+        fetch::cleanup_staging(&fetcher, repo);
+    }
     eprintln!("installed {id} [{variant}] → {}", out.display());
     Ok(())
+}
+
+/// Whether convert-on-pull should keep the downloaded HF source snapshot
+/// after a successful conversion. Off by default: the converted `.base` is
+/// the artifact users asked for, and the safetensors sources would otherwise
+/// linger as a second multi-GB copy. `BASERT_KEEP_HF_SOURCES=1` (anything but
+/// `0`/`false`/empty) trades that disk for faster re-pulls of other quants.
+fn keep_hf_sources() -> bool {
+    std::env::var("BASERT_KEEP_HF_SOURCES")
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
 }
 
 /// Returns `(variant, profile_path, tempfile_guard)`. The guard keeps a
@@ -835,6 +880,105 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), b"q8-bytes");
         // A provenance sidecar was written.
         assert!(root.join("basecompute/m/default-q8/hub.json").exists());
+        // MockFetcher owns no staging: its fixtures are copied, never moved.
+        assert!(repo_dir.join("m-Q8.base").exists(), "fixture must survive");
+    }
+
+    /// Fetcher owning an hf-hub-style staging tree (blob + snapshot symlink),
+    /// mirroring what `HfFetcher` leaves on disk mid-pull.
+    struct StagedFetcher {
+        staging: PathBuf,
+    }
+
+    impl StagedFetcher {
+        fn repo_dir(&self, repo: &str) -> PathBuf {
+            self.staging.join(format!("models--{}", repo.replace('/', "--")))
+        }
+
+        fn stage(&self, repo: &str, revision: &str, filename: &str, bytes: &[u8]) {
+            let rdir = self.repo_dir(repo);
+            let blobs = rdir.join("blobs");
+            let snap = rdir.join("snapshots").join(revision);
+            std::fs::create_dir_all(&blobs).unwrap();
+            std::fs::create_dir_all(&snap).unwrap();
+            let blob = blobs.join(format!("etag-{filename}"));
+            std::fs::write(&blob, bytes).unwrap();
+            std::os::unix::fs::symlink(&blob, snap.join(filename)).unwrap();
+        }
+    }
+
+    impl Fetcher for StagedFetcher {
+        fn get_file(&self, repo: &str, revision: &str, filename: &str) -> anyhow::Result<PathBuf> {
+            let p = self.repo_dir(repo).join("snapshots").join(revision).join(filename);
+            anyhow::ensure!(p.exists(), "not staged: {}", p.display());
+            Ok(p)
+        }
+
+        fn list_files(&self, repo: &str, revision: &str) -> anyhow::Result<Vec<String>> {
+            let dir = self.repo_dir(repo).join("snapshots").join(revision);
+            let mut out = Vec::new();
+            for e in std::fs::read_dir(dir)? {
+                out.push(e?.file_name().to_string_lossy().into_owned());
+            }
+            Ok(out)
+        }
+
+        fn staging_dir(&self, repo: &str) -> Option<PathBuf> {
+            Some(self.repo_dir(repo))
+        }
+    }
+
+    #[test]
+    fn pull_base_direct_from_staging_leaves_exactly_one_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let fetcher = StagedFetcher {
+            staging: root.join(".src").join("hf"),
+        };
+        fetcher.stage("basecompute/m", "main", "m-Q4.base", b"q4-bytes");
+        let base_files = list_base_files(&fetcher, "basecompute/m", "main").unwrap();
+
+        let args = PullArgs {
+            id: "basecompute/m".into(),
+            profile: None,
+            target: TargetScheme::BaseQ4,
+            revision: "main".into(),
+            force: false,
+            dry_run: false,
+        };
+        pull_base_direct(&root, &args, "basecompute/m", "basecompute/m", "main", &fetcher, &base_files)
+            .unwrap();
+
+        let out = root.join("basecompute/m/default-q4/model.base");
+        assert_eq!(std::fs::read(&out).unwrap(), b"q4-bytes");
+        // The staged download was consumed: no second copy anywhere.
+        assert!(
+            !fetcher.repo_dir("basecompute/m").exists(),
+            "staging tree must be cleaned after a successful install"
+        );
+    }
+
+    #[test]
+    fn keep_hf_sources_reads_env() {
+        // Single test for all cases: mutates shared process env (see the
+        // matching pattern in base-hub's fetch.rs tests).
+        let prev = std::env::var("BASERT_KEEP_HF_SOURCES").ok();
+
+        std::env::remove_var("BASERT_KEEP_HF_SOURCES");
+        assert!(!keep_hf_sources(), "default must be: clean up sources");
+        for off in ["", "0", "false", "FALSE", " 0 "] {
+            std::env::set_var("BASERT_KEEP_HF_SOURCES", off);
+            assert!(!keep_hf_sources(), "{off:?} should not keep sources");
+        }
+        for on in ["1", "true", "yes"] {
+            std::env::set_var("BASERT_KEEP_HF_SOURCES", on);
+            assert!(keep_hf_sources(), "{on:?} should keep sources");
+        }
+
+        match prev {
+            Some(v) => std::env::set_var("BASERT_KEEP_HF_SOURCES", v),
+            None => std::env::remove_var("BASERT_KEEP_HF_SOURCES"),
+        }
     }
 
     #[test]
@@ -1014,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn choose_profile_uses_bundled_for_q4_and_q8() {
+    fn choose_profile_uses_bundled_for_q4_q6_and_q8() {
         let mk = |t| PullArgs {
             id: "x/y".into(),
             profile: None,
@@ -1025,6 +1169,10 @@ mod tests {
         };
         let (variant, path, guard) = choose_profile(&mk(TargetScheme::BaseQ4)).unwrap();
         assert_eq!(variant, "default-q4");
+        assert!(path.is_some() && guard.is_some());
+
+        let (variant, path, guard) = choose_profile(&mk(TargetScheme::BaseQ6)).unwrap();
+        assert_eq!(variant, "default-q6");
         assert!(path.is_some() && guard.is_some());
 
         let (variant, _, _) = choose_profile(&mk(TargetScheme::BaseQ8)).unwrap();

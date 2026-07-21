@@ -4,7 +4,7 @@
 //! $BASERT_MODELS_DIR/  (default ~/.cache/baseRT/models)
 //!   <namespace>/<repo>/<variant>/model.base   ← artifact the runtime loads
 //!   <namespace>/<repo>/<variant>/hub.json      ← provenance sidecar
-//!   .src/<namespace>/<repo>/<revision>/        ← raw HF snapshot staging
+//!   .src/hf/models--<org>--<repo>/             ← hf-hub download staging
 //! ```
 //!
 //! The fixed `model.base` filename makes server discovery a trivial
@@ -19,7 +19,7 @@ use std::path::{Component, Path, PathBuf};
 pub const ARTIFACT_NAME: &str = "model.base";
 /// Provenance sidecar filename inside every variant directory.
 pub const SIDECAR_NAME: &str = "hub.json";
-/// Sub-tree holding raw HF source snapshots prior to conversion.
+/// Sub-tree holding in-flight HF downloads prior to installation.
 pub const SRC_STAGING: &str = ".src";
 
 /// Resolve the models root: `$BASERT_MODELS_DIR` or `~/.cache/baseRT/models`.
@@ -82,14 +82,15 @@ pub fn base_artifact_path(variant_dir: &Path) -> PathBuf {
     variant_dir.join(ARTIFACT_NAME)
 }
 
-/// Staging dir for a raw HF source snapshot:
-/// `<root>/.src/<id-relpath>/<revision>/`. Kept apart from the canonical tree
-/// so an interrupted download never pollutes it and `list` never trips over
-/// loose safetensors.
-pub fn src_staging_dir(root: &Path, repo: &str, revision: &str) -> Result<PathBuf> {
-    let rel = id_to_relpath(repo)?;
-    let rev = sanitize_variant(revision)?;
-    Ok(root.join(SRC_STAGING).join(rel).join(rev))
+/// Root for hf-hub downloads: `<root>/.src/hf`. Downloads land here (in
+/// hf-hub's own `models--<org>--<repo>/{blobs,snapshots,refs}` layout) instead
+/// of the user's global HuggingFace cache, so a pulled artifact is never
+/// duplicated across two caches and a finished install is a same-filesystem
+/// rename, not a copy. Kept apart from the canonical tree so an interrupted
+/// download never pollutes it and `list` never trips over loose safetensors;
+/// partial downloads left behind by a failed pull are resumed on retry.
+pub fn hf_staging_dir(root: &Path) -> PathBuf {
+    root.join(SRC_STAGING).join("hf")
 }
 
 /// A single path component derived from free-form text (variant / revision).
@@ -221,10 +222,12 @@ mod tests {
     }
 
     #[test]
-    fn src_staging_is_namespaced() {
+    fn hf_staging_is_under_dot_src() {
         let root = Path::new("/models");
-        let d = src_staging_dir(root, "meta-llama/Llama-3.2-1B", "main").unwrap();
-        assert_eq!(d, Path::new("/models/.src/meta-llama/Llama-3.2-1B/main"));
+        let d = hf_staging_dir(root);
+        assert_eq!(d, Path::new("/models/.src/hf"));
+        // Must stay inside the `.src` sub-tree that `list` skips.
+        assert!(d.starts_with(root.join(SRC_STAGING)));
     }
 
     #[test]
