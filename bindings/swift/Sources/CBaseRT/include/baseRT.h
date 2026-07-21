@@ -64,7 +64,7 @@ extern "C" {
 
 #define BASERT_VERSION_MAJOR 0
 #define BASERT_VERSION_MINOR 1
-#define BASERT_VERSION_PATCH 6
+#define BASERT_VERSION_PATCH 7
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
