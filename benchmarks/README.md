@@ -23,6 +23,36 @@ Results are written to `benchmarks/results/<arch>_baseRT.csv` with columns
 throughput at prompt length N; `tgN` rows are decode (token-generation)
 throughput.
 
+## Tool-state regression smoke
+
+`tool_state_smoke.py` checks whether repeated tool schemas preserve isolated
+arguments between requests. It sends distinct `lookup_key` sentinels in 10
+sequential requests, then concurrent batches of 2 and 4 by default. Failures are
+consistent with cross-request state leakage, but this diagnostic does not prove
+an engine root cause by itself. It is opt-in for tool-capable models; plain chat
+models are expected to fail it:
+
+```sh
+python3 benchmarks/scripts/tool_state_smoke.py \
+  --base-url http://127.0.0.1:8080/v1 \
+  --model model.base \
+  --sequential 10 --concurrency 2 4 \
+  --timeout 300 --max-tokens 2048
+```
+
+Set `BASERT_API_KEY` in the environment when the server requires a bearer
+token. The harness uses only the Python standard library. Each mismatch is
+printed as a `FAIL` JSON record, followed by a `SUMMARY` JSON record, and any
+mismatch makes the process exit nonzero.
+
+The manual **Server smoke** workflow can run this check after its basic chat
+completion by enabling `run_tool_state_smoke`. Pure unit tests use a local fake
+HTTP server and do not require an engine or model:
+
+```sh
+python3 -m unittest benchmarks.tests.test_tool_state_smoke -v
+```
+
 ## Example results
 
 `results/m4-pro_baseRT.csv` and `results/m3-base_baseRT.csv` hold reference
