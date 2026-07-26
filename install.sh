@@ -3,10 +3,11 @@
 #
 #   curl -LsSf https://basecompute.co/install.sh | sh
 #
-# Downloads the latest prebuilt engine bundle (libbaseRT.dylib + the basert CLI
-# and runtime tools) and installs it to ~/.basert, then adds it to your PATH.
-# Re-running upgrades in place; it skips the download when you're already on the
-# target release.
+# Downloads the latest prebuilt engine bundle for this platform — macOS/arm64
+# (Metal) or Linux/arm64 (CUDA) — the engine library + the basert CLI and
+# runtime tools, installs it to ~/.basert, then adds it to your PATH. Re-running
+# upgrades in place; it skips the download when you're already on the target
+# release.
 #
 # Environment overrides:
 #   BASERT_INSTALL_DIR   install location           (default: $HOME/.basert)
@@ -16,7 +17,6 @@
 set -eu
 
 REPO="basecompute/baseRT"
-ASSET_PREFIX="basert-engine-macos-arm64"
 INSTALL_DIR="${BASERT_INSTALL_DIR:-$HOME/.basert}"
 STAMP="$INSTALL_DIR/.release"
 
@@ -29,11 +29,26 @@ need curl
 need tar
 need uname
 
-# --- platform check (BaseRT is Apple Silicon / Metal only) -------------------
+# --- platform detection + asset selection ------------------------------------
+# BaseRT ships two prebuilt engine bundles: macOS/arm64 (Metal) and Linux/arm64
+# (CUDA). Pick the one matching this host; the installed CLI is built for that
+# backend and `basert pull` resolves the matching catalog variant.
 os="$(uname -s)"
 arch="$(uname -m)"
-[ "$os" = "Darwin" ] || err "BaseRT requires macOS (Apple Silicon). Detected: $os"
-[ "$arch" = "arm64" ] || err "BaseRT requires Apple Silicon (arm64). Detected: $arch"
+case "$os $arch" in
+  "Darwin arm64")
+    ASSET_PREFIX="basert-engine-macos-arm64" ;;
+  "Linux aarch64" | "Linux arm64")
+    # The Linux bundle is CUDA-only — require an NVIDIA GPU / driver.
+    if command -v nvidia-smi >/dev/null 2>&1 || [ -e /dev/nvidia0 ] || [ -d /proc/driver/nvidia ]; then
+      ASSET_PREFIX="basert-engine-linux-arm64-cuda"
+    else
+      err "BaseRT on Linux/arm64 needs an NVIDIA CUDA GPU (none detected)."
+    fi ;;
+  *)
+    err "unsupported platform: $os/$arch. BaseRT ships macOS/arm64 (Metal) and Linux/arm64 (CUDA)." ;;
+esac
+say "platform $os/$arch → $ASSET_PREFIX"
 
 # --- resolve the release (one API call) --------------------------------------
 if [ -n "${BASERT_VERSION:-}" ]; then
@@ -73,11 +88,11 @@ curl -fSL --progress-bar "$url" -o "$tmp/bundle.tar.gz"
 # --- clean install -----------------------------------------------------------
 # Remove the previous bundle's artifacts first so a file dropped in a newer
 # release can't linger as an orphan. Only the known bundle contents are touched
-# (the bundle is flat: libbaseRT.dylib, baseRT.metallib, basert, basert-*,
-# include/), so an unrelated file in a custom INSTALL_DIR is left alone.
+# (the bundle is flat: libbaseRT.{dylib,so}, baseRT.metallib on macOS, basert,
+# basert-*, include/), so an unrelated file in a custom INSTALL_DIR is left alone.
 mkdir -p "$INSTALL_DIR"
 rm -f  "$INSTALL_DIR"/basert "$INSTALL_DIR"/basert-* "$INSTALL_DIR"/baseRT_* \
-       "$INSTALL_DIR"/libbaseRT.dylib "$INSTALL_DIR"/baseRT.metallib
+       "$INSTALL_DIR"/libbaseRT.dylib "$INSTALL_DIR"/libbaseRT.so* "$INSTALL_DIR"/baseRT.metallib
 rm -rf "$INSTALL_DIR"/include
 
 tar -xzf "$tmp/bundle.tar.gz" -C "$INSTALL_DIR"
@@ -114,7 +129,7 @@ if [ "$already_on_path" -eq 0 ]; then
 fi
 echo
 echo "  Try it:"
-echo "    basert pull Qwen/Qwen3-0.6B"
-echo "    basert chat Qwen/Qwen3-0.6B"
+echo "    basert pull basecompute/Qwen3-0.6B"
+echo "    basert chat basecompute/Qwen3-0.6B"
 echo
 echo "  Docs: https://github.com/$REPO"
