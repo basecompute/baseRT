@@ -458,7 +458,15 @@ pub fn cmd_pull(args: PullArgs) -> Result<()> {
         // requested quant straight from the same repo rather than silently
         // handing back the cataloged one.
         ModelRef::Catalog { id, hf_repo, revision, variant, .. } => {
-            if quant_tag(variant) == want {
+            // Match on the QUANT BITS, not the raw variant string: the resolver
+            // may hand back a backend-native variant (e.g. `cuda-q4mix`) that
+            // satisfies a `q4` request but whose `quant_tag` ("q4mix") isn't the
+            // literal `want` ("q4"). A raw `quant_tag(variant) == want` there
+            // wrongly fell through to pull_base_direct and grabbed the universal
+            // f16-scale `default-q4` — which a CUDA client can't load. Mirror
+            // installed_best_variant / the catalog resolver's bit-aware match.
+            let want_bits = base_hub::registry::quant_bits(&want).unwrap_or(&want);
+            if base_hub::registry::quant_bits(variant).unwrap_or(variant) == want_bits {
                 pull_catalog(&root, &r)
             } else {
                 let fetcher = HfFetcher::new(cache::hf_staging_dir(&root))?;
@@ -487,7 +495,8 @@ fn print_plan(r: &ModelRef, want: &str) {
             println!("plan: {id} [{variant}] already installed at {}", path.display())
         }
         ModelRef::Catalog { id, hf_repo, file, revision, variant, .. } => {
-            if quant_tag(variant) == want {
+            let want_bits = base_hub::registry::quant_bits(want).unwrap_or(want);
+            if base_hub::registry::quant_bits(variant).unwrap_or(variant) == want_bits {
                 println!(
                     "plan: pull pre-converted {id} [{variant}] from {hf_repo}/{file}@{revision} (no conversion)"
                 )
