@@ -37,6 +37,10 @@ overhaul of `basert serve`.
 
 ### Fixed
 
+- **CUDA model resolution.** `basert pull`/`chat <id>` on NVIDIA GB10 now fetches
+  the CUDA-native bundle instead of the universal one it couldn't load
+  (`no function named 'gemv_q4'`). The 0.2.0 Linux/arm64 CUDA download was updated
+  in place with this fix.
 - **Chunked-decode correctness on CUDA.** Free generation past the decode chunk size
   no longer repeats an earlier block (an eager-dispatch write-after-read hazard);
   prefill and teacher-forced decode were always correct.
