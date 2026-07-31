@@ -1,4 +1,4 @@
-use crate::header::{Header, MmprojBundle, TensorEntry};
+use crate::header::{Header, MmprojBundle, TensorDtype, TensorEntry};
 use crate::slots::{write_slots, Slot};
 use crate::{Error, Result, BLOB_ALIGNMENT, FORMAT_VERSION, MAGIC, PREFIX_LEN};
 use std::fs::File;
@@ -126,6 +126,23 @@ impl<W: Write + Seek> BaseWriter<W> {
             blob_cursor = aligned + p.data.len() as u64;
         }
         self.header.tensors = entries;
+
+        // Stamp `target_backend` from CONTENT instead of trusting the
+        // caller's default (every construction site used to hardcode
+        // Metal, so CUDA-only bundles carried a `metal` tag and failed a
+        // kernel lookup only after a full download + load). The one
+        // CUDA-only content class today: base_q6 MoE expert slabs
+        // (`*_exps.*` tensors) — Metal ships no q6 MoE kernels. bf16-scale
+        // q8/q4 bundles stay `metal` (universal): both backends carry the
+        // `_sbf16` kernel families.
+        if self
+            .header
+            .tensors
+            .iter()
+            .any(|t| t.name.contains("_exps.") && t.dtype == TensorDtype::BaseQ6)
+        {
+            self.header.target_backend = crate::header::TargetBackend::CudaSm121;
+        }
 
         // Multimodal sub-bundle entries land in the same weights blob,
         // continuing past the LM tensors. Their entries go into

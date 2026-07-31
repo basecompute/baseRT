@@ -68,6 +68,14 @@ pub struct CatalogEntry {
     /// Optional integrity check for the downloaded `.base`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// Backend requirement. `None` = universal (runs on every backend —
+    /// f16/bf16 weights and bf16-scale q4/q8 bundles). `Some("cuda")` /
+    /// `Some("metal")` restricts resolution to clients of that backend
+    /// (e.g. base_q6-expert MoE bundles are CUDA-only). Checked at
+    /// resolve time so an incompatible pull refuses BEFORE the download,
+    /// not at load after 30 GB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 fn default_file() -> String {
@@ -179,6 +187,15 @@ impl Catalog {
             .or_else(|| self.models.iter().find(|e| e.id.eq_ignore_ascii_case(id)))
     }
 
+    /// True if ANY row (any quant/backend) carries this id. Lets the resolver
+    /// tell "this is a catalog model we can't run on this backend" (refuse
+    /// pre-download) apart from "unknown id" (fall through to a raw HF repo).
+    pub fn has_id(&self, id: &str) -> bool {
+        self.models
+            .iter()
+            .any(|e| e.id == id || e.id.eq_ignore_ascii_case(id))
+    }
+
     /// Check the catalog is internally consistent: every entry well-formed, and
     /// no duplicate `(id, quant)` pair (which would shadow in `find`/listing).
     /// Run by tests/CI to catch a malformed catalog edit before it ships and
@@ -198,8 +215,17 @@ impl Catalog {
             if e.quant.is_empty() {
                 anyhow::bail!("{}: empty quant", e.id);
             }
-            if !seen.insert((e.id.as_str(), e.quant.as_str())) {
-                anyhow::bail!("duplicate catalog entry: {} [{}]", e.id, e.quant);
+            // A model may carry a universal row AND a per-backend variant of the
+            // same quant (the resolver prefers the backend-native one); those are
+            // distinguished by `backend`, so the uniqueness key includes it. Two
+            // rows identical in (id, quant, backend) are still a real duplicate.
+            if !seen.insert((e.id.as_str(), e.quant.as_str(), e.backend.as_deref())) {
+                anyhow::bail!(
+                    "duplicate catalog entry: {} [{}] backend={:?}",
+                    e.id,
+                    e.quant,
+                    e.backend
+                );
             }
         }
         Ok(())

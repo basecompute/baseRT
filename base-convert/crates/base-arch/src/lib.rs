@@ -81,15 +81,20 @@ pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMappe
         // (canonical_arch="llama" → llama model class). Validated end-to-end on
         // Mistral-7B-Instruct-v0.3 and Ministral-8B-Instruct-2410.
         //
-        // Phi-3 is NOT enabled. The converter side is ready (SplittingProvider
-        // splits its fused qkv_proj/gate_up_proj; weights convert; HD=96
-        // attention is fine — regression-tested) and the generation_config eos
-        // merge below makes it stop cleanly. BUT Phi-3 chat output degenerates
-        // (raw completions are coherent; chat floods/repeats and is incoherent at
-        // both Q4 and Q8, temp 0 and 0.7) — a chat-path issue (same class as
-        // SmolLM2) that's not yet root-caused. Re-enable "phi3" once that's
-        // fixed. (Phi-3.5 additionally needs LongRoPE — engine is linear-only.)
-        "llama" | "mistral" => Some(&llama::LlamaHfMapper),
+        // Phi-3-mini (4k, standard RoPE) is Llama-shaped and reuses the Llama
+        // mapper: the SplittingProvider (base-convert) slices its fused
+        // self_attn.qkv_proj / mlp.gate_up_proj into the canonical split names
+        // the mapper consumes, HD=96 is fine (regression-tested), and the
+        // generation_config eos merge makes it stop cleanly on <|end|> (32007).
+        // The chat-path flood that used to gate it (same class as SmolLM2) is
+        // resolved by two landed tokenizer fixes — the added-token lstrip/rstrip
+        // handling in split_special_tokens (Phi-3's `<|end|>` rstrip absorbs the
+        // trailing newline; tokenizer.cpp) and the GPT2* add_bos default
+        // (tokenizer_defaults.h). REVALIDATED on microsoft/Phi-3-mini-4k-instruct
+        // (converted Q8): chat output is coherent across probes, no flood.
+        // Phi-3.5 stays OUT — it needs LongRoPE, which the engine (linear scaling
+        // only) does not implement.
+        "llama" | "mistral" | "phi3" => Some(&llama::LlamaHfMapper),
         "qwen2" | "qwen3" => Some(&qwen::QwenHfMapper),
         "qwen2_moe" | "qwen3_moe" => Some(&qwen::QwenMoeHfMapper),
         // Qwen3.5 / 3.6: hybrid Gated-DeltaNet + full-attention decoder
@@ -107,7 +112,13 @@ pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMappe
         // actually google/gemma-3n-E2B-it. The canonical Gemma 4 lives
         // under google/gemma-4-{E2B,E4B}-it and uses model_type=gemma4
         // with text_config.model_type=gemma4_text.
-        "gemma4" | "gemma4_text" => Some(&gemma::Gemma4HfMapper),
+        // gemma4_unified (gemma-4-12B-it): the encoder-free multimodal
+        // variant — a standard gemma4 text stack under
+        // `model.language_model.*` plus ~10 small modality-projection
+        // tensors (embed_vision/embed_audio/vision_embedder) that the
+        // text conversion skips like any other non-text tower. Config is
+        // gemma4-shaped (uniform head_dim, rope_parameters, layer_types).
+        "gemma4" | "gemma4_text" | "gemma4_unified" => Some(&gemma::Gemma4HfMapper),
         _ => None,
     }
 }
@@ -118,6 +129,7 @@ pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMappe
 pub const SUPPORTED_HF_MODEL_TYPES: &[&str] = &[
     "llama",
     "mistral",
+    "phi3",
     "qwen2",
     "qwen3",
     "qwen2_moe",
@@ -135,6 +147,7 @@ pub const SUPPORTED_HF_MODEL_TYPES: &[&str] = &[
     "gemma3_text",
     "gemma4",
     "gemma4_text",
+    "gemma4_unified",
 ];
 
 pub trait GgufMapper: Sync {

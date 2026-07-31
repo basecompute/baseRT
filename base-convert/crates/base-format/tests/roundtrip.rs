@@ -456,3 +456,36 @@ fn rejects_unknown_version() {
     let err = expect_err(BaseReader::open(tmp.path()));
     assert!(matches!(err, base_format::Error::UnsupportedVersion(999, _)));
 }
+
+#[test]
+fn target_backend_stamped_from_content() {
+    // q6 MoE expert slabs are CUDA-only (no Metal q6 MoE kernels): the
+    // writer must override the caller's Metal default so Metal builds
+    // reject the bundle at open, not at kernel lookup.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let header = make_header();
+    let mut writer = BaseWriter::create(tmp.path(), header).unwrap();
+    let mut e = entry("layers.0.ffn_gate_exps.weight", vec![4, 8]);
+    e.dtype = TensorDtype::BaseQ6;
+    writer.add_tensor(TensorPayload {
+        entry: e,
+        data: vec![0u8; 24],
+    });
+    writer.finish().unwrap();
+    let reader = BaseReader::open(tmp.path()).unwrap();
+    assert_eq!(reader.header().target_backend, TargetBackend::CudaSm121);
+
+    // ...but a DENSE q6 tensor (or q6 outside the expert slabs) stays
+    // universal — Metal has dense q6 kernels.
+    let tmp2 = tempfile::NamedTempFile::new().unwrap();
+    let mut writer = BaseWriter::create(tmp2.path(), make_header()).unwrap();
+    let mut e = entry("layers.0.self_attn.q_proj.weight", vec![4, 8]);
+    e.dtype = TensorDtype::BaseQ6;
+    writer.add_tensor(TensorPayload {
+        entry: e,
+        data: vec![0u8; 24],
+    });
+    writer.finish().unwrap();
+    let reader = BaseReader::open(tmp2.path()).unwrap();
+    assert_eq!(reader.header().target_backend, TargetBackend::Metal);
+}

@@ -175,10 +175,81 @@ fn installed_single_path(reg: &MergedRegistry, id: &str) -> Result<Option<PathBu
                 .with_context(|| format!("installed model `{id}` has no artifact path"))?,
         )),
         many => {
+            // Multiple variants installed — e.g. a universal `default-q4` cached
+            // before the backend-qualified catalog entries existed, plus a native
+            // `cuda-q4mix` pulled after. Rather than erroring, apply the same
+            // backend preference the catalog resolver uses (backend-native >
+            // universal) so bare `serve <id>` keeps Just Working. The installed
+            // variant dir name carries the backend slot (`cuda-*`/`rocm-*`/`cpu-*`
+            // vs the universal `default-*`); on a backend that can't load a
+            // foreign-native bundle it simply won't be present.
+            let backend = base_hub::registry::CatalogRegistry::client_backend();
+            let native_prefix = format!("{backend}-");
+            let native: Vec<&ModelEntry> =
+                many.iter().copied().filter(|r| r.variant.starts_with(&native_prefix)).collect();
+            let pick = if native.len() == 1 {
+                Some(native[0])
+            } else if native.is_empty() {
+                let uni: Vec<&ModelEntry> =
+                    many.iter().copied().filter(|r| r.variant.starts_with("default-")).collect();
+                (uni.len() == 1).then(|| uni[0])
+            } else {
+                None
+            };
+            if let Some(one) = pick {
+                return Ok(Some(
+                    one.path
+                        .clone()
+                        .with_context(|| format!("installed model `{id}` has no artifact path"))?,
+                ));
+            }
             let variants = many.iter().map(|r| r.variant.as_str()).collect::<Vec<_>>().join(", ");
             bail!("model `{id}` has multiple installed variants ({variants}) — specify one as `{id}:<variant>`")
         }
     }
+}
+
+/// Installed artifact for `id` matching the requested variant `want`. Tries an
+/// EXACT variant-dir match first (honors `:default-q4` / `:cuda-q4mix`); failing
+/// that, matches by BIT WIDTH so the documented short `:q4` finds an installed
+/// `cuda-q4mix` or `default-q4` (the exact dir is named for the quant slot, not
+/// the bare bits), preferring the backend-native slot over universal — the same
+/// rule the catalog resolver's quant_matches + backend preference apply. Returns
+/// `None` when nothing installed matches (caller then auto-pulls).
+fn installed_best_variant(reg: &MergedRegistry, id: &str, want: &str) -> Option<PathBuf> {
+    if let Some(p) = reg.local.installed_path(id, want) {
+        return Some(p); // exact variant name present
+    }
+    let want_bits = base_hub::registry::quant_bits(want).unwrap_or(want);
+    let backend = base_hub::registry::CatalogRegistry::client_backend();
+    let native_prefix = format!("{backend}-");
+    // A foreign-native slot (e.g. `cuda-q4mix` on macOS) must be EXCLUDED, not
+    // just deprioritized: on a copied/shared cache it can't be loaded, and a bit-
+    // width tie would otherwise pick the lexicographically-earlier CUDA artifact
+    // over the runnable universal one. Runnable = universal (`default-*`), this
+    // client's native slot (`<backend>-*`), or a bare bit-width dir (no slot).
+    const KNOWN_BACKENDS: [&str; 4] = ["cuda", "rocm", "cpu", "metal"];
+    let runnable = |v: &str| -> bool {
+        match v.split_once('-') {
+            Some((slot, _)) if KNOWN_BACKENDS.contains(&slot) => slot == backend, // native only
+            _ => true,                                                            // default-*, bare bits, etc.
+        }
+    };
+    let installed = reg.local.list().ok()?;
+    let mut matches: Vec<&ModelEntry> = installed
+        .iter()
+        .filter(|r| {
+            r.id == id
+                && runnable(&r.variant)
+                && base_hub::registry::quant_bits(&r.variant).unwrap_or(r.variant.as_str()) == want_bits
+        })
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    // Backend-native slot first (stable so a deterministic pick when both exist).
+    matches.sort_by_key(|r| u8::from(!r.variant.starts_with(&native_prefix)));
+    matches[0].path.clone()
 }
 
 /// Fetch a not-yet-installed model on demand, then return its artifact path.
@@ -245,7 +316,7 @@ fn resolve_hub_model(token: &str, default_variant: Option<&str>) -> Result<PathB
     let reg = MergedRegistry::load()?;
 
     if let Some(v) = variant {
-        if let Some(p) = reg.local.installed_path(id, v) {
+        if let Some(p) = installed_best_variant(&reg, id, v) {
             return Ok(p);
         }
         return auto_pull_and_resolve(&reg, id, Some(v));

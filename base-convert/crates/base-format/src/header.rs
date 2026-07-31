@@ -183,6 +183,11 @@ pub enum TargetBackend {
     /// layouts.
     CudaSm89,
     CudaSm90,
+    /// NVIDIA GB10 (DGX Spark, consumer Blackwell). Serializes to
+    /// "cuda_sm121" — one of the two tags the C++ reader's CUDA build
+    /// accepts and Metal builds reject; used for bundles that carry
+    /// CUDA-only kernel requirements (base_q6 MoE experts today).
+    CudaSm121,
     /// AMD CDNA3 (MI300). MFMA tile layout.
     RocmCdna3,
     /// CPU AVX2 / NEON fallback paths. Row-major contiguous packing.

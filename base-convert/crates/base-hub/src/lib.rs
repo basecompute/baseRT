@@ -9,6 +9,7 @@
 pub mod cache;
 pub mod catalog;
 pub mod fetch;
+pub mod gen;
 pub mod registry;
 
 pub use cache::{models_dir, HubSidecar};
