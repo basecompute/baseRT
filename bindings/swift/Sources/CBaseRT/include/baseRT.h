@@ -63,14 +63,14 @@ extern "C" {
 // === Versioning ===
 
 #define BASERT_VERSION_MAJOR 0
-#define BASERT_VERSION_MINOR 1
-#define BASERT_VERSION_PATCH 7
+#define BASERT_VERSION_MINOR 2
+#define BASERT_VERSION_PATCH 0
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
 #define BASERT_VERSION ((BASERT_VERSION_MAJOR << 16) | (BASERT_VERSION_MINOR << 8) | BASERT_VERSION_PATCH)
 
-/// Runtime-resolved version string ("0.1.0"). Matches the linked
+/// Runtime-resolved version string ("0.2.0"). Matches the linked
 /// library; useful for diagnostics when a binding loads a different
 /// `.dylib` than it was compiled against.
 const char *baseRT_version_string(void);
@@ -130,6 +130,39 @@ void baseRT_set_max_batch_size(int n);
 /// unless --paged-kv is also on. Process-wide; persists across loads. Must be
 /// called before baseRT_load_model. Drive it via the baseRT_prefix_* API.
 void baseRT_set_prefix_cache(int enable);
+
+/// Override the prefill chunk size (tokens per prefill GEMM batch).
+///   n = 0  → per-chip default (recommended)
+///   n >= 16 → clamp to this; shrinks the batch_* scratch footprint
+///     (~linearly) so an oversized model fits a tighter GPU working-set
+///     budget, at a prefill-throughput cost. Values outside [16, chip max]
+///     are ignored. Process-wide; read at load. Set before baseRT_load_model.
+void baseRT_set_prefill_chunk(int n);
+
+/// Paged-weights load policy (issue #113): per-tensor pinned weight buffers
+/// for models past the OS wired-page budget.
+///   mode = 0 → auto (default): normal load, retry paged on GPU-OOM
+///   mode = 1 → force paged-weights on the first attempt (oversized/testing)
+///   mode = 2 → disable the retry (fail hard on OOM, pre-#113 behavior)
+/// Process-wide; read at load. Set before baseRT_load_model.
+void baseRT_set_paged_weights(int mode);
+
+/// Toggle the baked-decode fast path (DispatchTable replay).
+///   enable = 1 → on (default): replay the baked table when eligible
+///   enable = 0 → force the live fused decode path (baked-vs-live A/B)
+/// Process-wide; read per decode step.
+void baseRT_set_baked_decode(int enable);
+
+/// GPU-wait timeout in milliseconds (Metal backend).
+///   ms > 0   → (default: 300000, i.e. 5 min) return a loggable error if a
+///     committed command buffer doesn't reach a terminal status in time. The
+///     CPU unblocks; the wedged GPU work is NOT torn down (only a GPU
+///     reset/reboot reclaims it). Chosen far above any legitimate single
+///     command buffer so only a real wedge trips it.
+///   ms = 0   → block indefinitely in the GPU wait (opt out of the bound).
+/// No-op on non-Metal backends. Process-wide; read once per wait. The initial
+/// value also honors the BASERT_GPU_WAIT_TIMEOUT_MS environment variable.
+void baseRT_set_gpu_wait_timeout_ms(double ms);
 
 /// Free all resources associated with a model.
 void baseRT_free_model(baseRT_model_t model);
@@ -202,6 +235,26 @@ typedef bool (*baseRT_token_callback)(uint32_t token_id, const char *text, void 
 BaseRTGenerationStats baseRT_generate(baseRT_model_t model, const uint32_t *prompt_tokens, int n_prompt, int max_tokens,
                                       BaseRTSamplingConfig sampling, baseRT_token_callback callback, void *user_data);
 
+/// Generate tokens from a prompt WITH serial RadixCache prefix reuse.
+///
+/// Semantically identical to `baseRT_generate` (single default sequence, same
+/// greedy/sampled output), but when the model was loaded with BOTH `--paged-kv`
+/// and `--prefix-cache` it reuses the longest cached whole-block prompt prefix:
+/// it resets the default sequence, matches the prompt against the RadixCache,
+/// seeds the shared prefix blocks into the default sequence, prefills ONLY the
+/// divergent suffix `[matched_tokens, n_prompt)`, then inserts the full prompt
+/// back into the cache for later reuse on generation end.
+///
+/// Greedy output is BIT-IDENTICAL to a cold `baseRT_generate` (the seeded blocks
+/// hold the same KV a cold prefill would have produced). When the prefix cache
+/// or paged-KV is disabled this is an exact passthrough to `baseRT_generate`.
+///
+/// Attention-KV (non-hybrid) models only — hybrid-GDN models fall back to the
+/// plain path (their recurrent state is not block-shareable).
+BaseRTGenerationStats baseRT_generate_cached(baseRT_model_t model, const uint32_t *prompt_tokens, int n_prompt,
+                                             int max_tokens, BaseRTSamplingConfig sampling,
+                                             baseRT_token_callback callback, void *user_data);
+
 // === Multi-sequence generation (paged-KV only) ===
 
 /// Opaque per-sequence handle.
@@ -237,6 +290,27 @@ BaseRTGenerationStats baseRT_sequence_generate_continue(baseRT_sequence_t seq, c
 
 /// Release the sequence's blocks back to the pool and free the handle.
 void baseRT_sequence_free(baseRT_sequence_t seq);
+
+/// Fused batch step with per-sequence trailing PAD counts (serving grid
+/// alignment): counts[i] includes pads[i] throwaway tokens whose rows are
+/// computed but whose argmax row is skipped (the output token comes from the
+/// last REAL row). The caller must roll each padded sequence's KV back by
+/// pads[i] after the call (baseRT_sequence_rollback). Greedy only.
+int baseRT_batch_step_fused_pads(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs, const uint32_t *in_tokens,
+                                 const int *in_token_counts, const int *pads, uint32_t *out_tokens);
+
+/// Warm the batched-decode fast paths for batch sizes up to `max_batch`:
+/// each B runs two throwaway pure-decode ticks so shape-keyed caches (baked
+/// dispatch tables, stream-captured CUDA graphs, cuBLAS plans) are built at
+/// startup instead of on the first real requests — the same boot-time graph
+/// warmup vLLM performs. Requires --paged-kv; call after load, before serving.
+int baseRT_batch_warmup(baseRT_model_t model, int max_batch);
+
+/// Roll a sequence's KV state back to `length` tokens, returning any blocks
+/// past that point to the pool. `length` must be <= the current length; 0
+/// resets the sequence to empty. Used by the serving engine's shape-padding
+/// dummy lanes (their KV is discarded after every tick).
+int baseRT_sequence_rollback(baseRT_sequence_t seq, int length);
 
 /// Batched decode: drives ONE batched decode step across N sequences. Each
 /// sequence writes its `new_tokens[i]` to its own KV cache slot, and attention
@@ -330,6 +404,37 @@ int baseRT_batch_step(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs,
 int baseRT_batch_step_fused(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs, const uint32_t *in_tokens,
                             const int *in_token_counts, uint32_t *out_tokens);
 
+/// Fused batch step with per-sequence trailing PAD counts (serving grid
+/// alignment): counts[i] includes pads[i] throwaway tokens whose rows are
+/// computed but whose argmax row is skipped (the output token comes from the
+/// last REAL row). The caller must roll each padded sequence's KV back by
+/// pads[i] after the call (baseRT_sequence_rollback). Greedy only.
+///
+/// Backend note: the shape-padding fast path exists for CUDA-graph capture;
+/// on backends without stream capture (Metal) the pads are STRIPPED before
+/// dispatch — semantics identical (no pad KV is written, so the caller's
+/// rollback is a no-op), no wasted compute.
+int baseRT_batch_step_fused_pads(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs, const uint32_t *in_tokens,
+                                 const int *in_token_counts, const int *pads, uint32_t *out_tokens);
+
+/// Warm the batched-decode fast paths for batch sizes up to `max_batch`:
+/// each B runs throwaway pure-decode ticks so shape-keyed caches (baked
+/// dispatch tables, captured graphs, PSO/plan builds) are built at startup
+/// instead of on the first real requests — the same boot-time warmup vLLM
+/// performs. Requires --paged-kv; call after load, before serving.
+int baseRT_batch_warmup(baseRT_model_t model, int max_batch);
+
+/// Max prompt tokens the fused (varlen) prefill can process in one packed batch.
+/// The continuous-batching engine caps per-tick admitted prompt tokens by this
+/// so a burst of long prompts doesn't overflow the packed prefill. 0 on null.
+int baseRT_max_prefill_chunk(baseRT_model_t model);
+
+/// Roll a sequence's KV state back to `length` tokens, returning any blocks
+/// past that point to the pool. `length` must be <= the current length; 0
+/// resets the sequence to empty. Used by the serving engine's shape-padding
+/// dummy lanes (their KV is discarded after every tick).
+int baseRT_sequence_rollback(baseRT_sequence_t seq, int length);
+
 /// Multi-step autoregressive driver for baseRT_batch_step_fused. Step 0
 /// ingests the mixed-length input from `first_in_tokens` / `first_in_token_counts`
 /// (one row per seq, total length `sum(first_in_token_counts)`). Subsequent
@@ -406,6 +511,13 @@ BaseRTPrefixMatch baseRT_prefix_match(baseRT_model_t model, const uint32_t *toke
 /// paged / the sequence isn't empty.
 int baseRT_sequence_seed_prefix(baseRT_sequence_t seq, const int *blocks, int n_blocks, int n_tokens);
 
+/// Paged-KV block (page) size in tokens for this model, or 0 when the model
+/// was not loaded with --paged-kv. This is the block-alignment granularity for
+/// baseRT_prefix_match/_seed_prefix (matched_tokens == matched_blocks *
+/// page_size); the continuous-batching hybrid-GDN prefix-reuse path uses it to
+/// pick the block-aligned GDN snapshot boundary at admit.
+int baseRT_page_size(baseRT_model_t model);
+
 /// Publish `seq`'s KV blocks for the block-aligned prefix of `tokens` into the
 /// prefix cache so later requests can reuse them. Idempotent for an already-
 /// cached prefix (no double refcount). No-op when the cache is disabled.
@@ -415,7 +527,19 @@ int baseRT_prefix_insert(baseRT_model_t model, const uint32_t *tokens, int n_tok
 /// Release the lock a baseRT_prefix_match took on a prefix and free the match's
 /// bookkeeping. Call exactly once per non-zero handle, after the sequence that
 /// reused the prefix has been inserted/retired. No-op for handle==0.
+///
+/// Use this ONLY when the match's blocks WERE seeded into a sequence
+/// (baseRT_sequence_seed_prefix): the sequence owns those blocks and drops the
+/// match's ownership incref when it resets/frees. If the match was NOT seeded
+/// (you decided not to reuse it), call baseRT_prefix_release instead — unlock
+/// alone would leak the increfed blocks.
 void baseRT_prefix_unlock(baseRT_model_t model, uint64_t handle);
+
+/// Abandon a baseRT_prefix_match WITHOUT seeding it: drops the ownership incref
+/// on each matched block (which no sequence adopted) AND releases the trie lock.
+/// Call exactly once per non-zero handle when you matched a prefix but chose not
+/// to seed it (e.g. a boundary mismatch). No-op for handle==0.
+void baseRT_prefix_release(baseRT_model_t model, uint64_t handle);
 
 /// Evict least-recently-used UNLOCKED cached prefixes until at least `n_blocks`
 /// block-frees have been performed back to the pool. Returns the number freed
@@ -472,6 +596,25 @@ void baseRT_grammar_free(baseRT_grammar_t grammar);
 /// independent decodes — e.g. the server's n>1 loop, which otherwise
 /// would feed the second sample through a terminated grammar (garbage).
 void baseRT_grammar_reset(baseRT_grammar_t grammar);
+
+/// Grammar stepping for the continuous-batching server (xgrammar backend).
+/// The server applies the bitmask to a lane's logits row on the host, then
+/// accepts the sampled token to advance the grammar. A legacy-NPDA grammar
+/// reports `bitmask_size == 0` — the caller must keep it on the serial path.
+///   baseRT_grammar_bitmask_size : packed int32 words in the token bitmask
+///     (0 = not an xgrammar grammar; use the serial decode path instead).
+///   baseRT_grammar_fill_bitmask : fill `out_bitmask` (bitmask_size words) for
+///     the CURRENT grammar state; a set bit = allowed token. 1 on success.
+///   baseRT_grammar_accept_token : advance the grammar by one token. 1 on ok.
+///   baseRT_grammar_is_terminated: 1 once the grammar reaches an end state.
+///   baseRT_grammar_is_completed : 1 once a full match is accepted (a
+///     structured value is complete). Decoding should stop on terminated OR
+///     completed — matching the serial grammar loop.
+int baseRT_grammar_bitmask_size(baseRT_grammar_t grammar);
+int baseRT_grammar_fill_bitmask(baseRT_grammar_t grammar, int32_t *out_bitmask);
+int baseRT_grammar_accept_token(baseRT_grammar_t grammar, uint32_t token_id);
+int baseRT_grammar_is_terminated(baseRT_grammar_t grammar);
+int baseRT_grammar_is_completed(baseRT_grammar_t grammar);
 
 /// Generate tokens with grammar constraint.
 /// Grammar masks invalid tokens at each step, guaranteeing output conforms to the grammar.
@@ -632,11 +775,16 @@ void baseRT_reset(baseRT_model_t model);
 /// `current_length` prefix (not the unused tail), so the file size grows
 /// linearly with how much was prefilled+decoded. Returns 0 on success and
 /// a negative error code on failure; check `baseRT_get_error` for details.
+/// Hybrid linear-attention models (Qwen 3.5/3.6) are REJECTED: the format
+/// holds attention KV only, not the Gated-DeltaNet recurrent state.
 int baseRT_save_state(baseRT_model_t model, const char *path);
 
 /// Inverse of `baseRT_save_state`. The cache must have been allocated for
 /// a model with matching shape; mismatched files are rejected. After load,
 /// `baseRT_get_position` reflects the restored token count.
+/// Hybrid linear-attention models (Qwen 3.5/3.6) are REJECTED: the file
+/// holds attention KV only, and restoring it without the matching
+/// Gated-DeltaNet recurrent state would yield a corrupt hybrid state.
 int baseRT_load_state(baseRT_model_t model, const char *path);
 
 /// Install a LoRA adapter on this model. The adapter file is a `.base`
@@ -664,7 +812,79 @@ const char *baseRT_lora_id(baseRT_model_t model);
 /// shared chat-template prefix from a prior request — keeps the cached
 /// prefill of the common prefix while discarding the prior turn's
 /// user-message tail and assistant reply.
+/// Hybrid linear-attention models (Qwen 3.5/3.6): the recurrent state
+/// cannot be rewound to an arbitrary position. This call keeps its "KV
+/// length == to_position" promise only when `to_position` exactly matches
+/// the recurrent-state snapshot (see `baseRT_set_prefill_snapshot`); any
+/// other position degrades to a FULL reset (equivalent to `baseRT_reset`)
+/// — the caller must then prefill the entire prompt again. Use
+/// `baseRT_try_rollback` to detect what happened, or to resume from a
+/// snapshot that sits before the requested position.
 void baseRT_rollback(baseRT_model_t model, int to_position);
+
+/// Rollback that reports the position actually achieved. Non-hybrid
+/// models land on `min(to_position, current KV length)` — a target past
+/// the cache end cannot be "achieved" by a rollback and is clamped so
+/// callers prefilling from the returned position never skip tokens. Hybrid linear-attention models can only resume
+/// from their recurrent-state snapshot (see
+/// `baseRT_set_prefill_snapshot`): when the snapshot sits at or before
+/// `to_position` the state is restored there and the SNAPSHOT position is
+/// returned — the caller must prefill the prompt from that position
+/// onward. When the snapshot lies past `to_position` (divergent history)
+/// the call returns -1 and leaves the model state UNTOUCHED — fall back
+/// to `baseRT_reset` + a full prefill. `to_position == 0` always succeeds
+/// as a full reset.
+int baseRT_try_rollback(baseRT_model_t model, int to_position);
+
+/// Hybrid linear-attention models only (no-op otherwise): ask prompt
+/// prefills to capture the reuse snapshot once absolute KV position `pos`
+/// has been processed, instead of at the prompt end. Chat servers pass
+/// the rendered-history boundary (the prompt minus the generation
+/// scaffold): the scaffold tokens never reappear in the next request's
+/// render, so a prompt-end snapshot would never match, while the history
+/// boundary is exactly where the next request's shared prefix ends.
+/// PERSISTENT: stays armed until replaced by the next call (so n>1
+/// multi-choice requests re-snapshot the same boundary on every
+/// full-prefill choice); pass -1 to clear. Out-of-range values fall back
+/// to the prompt-end snapshot. Standalone `baseRT_prefill[_image/_audio]`
+/// calls always snapshot at their prompt end (hints apply to
+/// generate/generate_continue prefills only).
+void baseRT_set_prefill_snapshot(baseRT_model_t model, int pos);
+
+/// Portable GDN reuse-snapshot blob (hybrid linear-attention models only).
+/// The engine keeps a single most-recent boundary snapshot; a server-side
+/// keyed store keeps several (one per distinct prior prompt) and loads the
+/// best prefix match back before baseRT_try_rollback restores it. All three
+/// are no-ops / return 0 / -1 on non-hybrid models.
+///   baseRT_gdn_snapshot_size    : fixed blob byte length for this model
+///     (0 if not a hybrid model). Allocate this much for _capture.
+///   baseRT_gdn_snapshot_capture : serialize the CURRENT snapshot (the one a
+///     just-completed request's prompt prefill recorded) into `out` (capacity
+///     `cap`). Returns bytes written, or -1 if there is no snapshot / cap is
+///     too small / not hybrid.
+///   baseRT_gdn_snapshot_load    : deserialize `blob` back into the engine's
+///     snapshot slot (NOT live state — a following baseRT_try_rollback applies
+///     it). Returns the snapshot's KV position, or -1 on a length/model
+///     mismatch.
+int baseRT_gdn_snapshot_size(baseRT_model_t model);
+int baseRT_gdn_snapshot_capture(baseRT_model_t model, uint8_t *out, int cap);
+int baseRT_gdn_snapshot_load(baseRT_model_t model, const uint8_t *blob, int len);
+
+/// Per-sequence GDN snapshot (F6 M4: batched continuous-batching prefix reuse).
+/// Capture/restore a CB sequence's OWN Gated-DeltaNet lane (its per-lane pool
+/// slot) directly to/from a blob — distinct from the model-level snapshot APIs
+/// above, which serve the single-sequence path via the lane-0 shadow. The blob
+/// uses the same wire format and `baseRT_gdn_snapshot_size` byte length.
+///
+///   baseRT_sequence_gdn_capture : serialize the sequence's lane state,
+///     stamping its current KV length as the resume position. Call it when the
+///     lane's state is at the intended (block-aligned) boundary. Returns bytes
+///     written, or -1 (not hybrid / bad slot / cap too small).
+///   baseRT_sequence_gdn_restore : deserialize `blob` into the sequence's lane
+///     LIVE state. Returns the encoded position (the caller then sets the
+///     sequence's KV length and prefills the suffix), or -1 on a mismatch.
+int baseRT_sequence_gdn_capture(baseRT_sequence_t seq, uint8_t *out, int cap);
+int baseRT_sequence_gdn_restore(baseRT_sequence_t seq, const uint8_t *blob, int len);
 
 /// Generate tokens continuing from current KV cache state (no reset).
 /// Use for multi-turn chat: prefill new tokens only, then decode.
@@ -706,11 +926,20 @@ const char *baseRT_chat_template_jinja(baseRT_model_t model);
 /// BOS / EOS token strings (what minja substitutes for `{{ bos_token }}`
 /// and `{{ eos_token }}` in HF chat templates).
 const char *baseRT_bos_token(baseRT_model_t model);
+
+/// BOS token id, for callers that need to prepend BOS to raw token
+/// sequences (e.g. perplexity windows on BOS-sensitive models).
+uint32_t baseRT_bos_id(baseRT_model_t model);
 const char *baseRT_eos_token(baseRT_model_t model);
 
 /// Primary end-of-sequence token id (the one the continuous-batching engine and
 /// other token-id consumers stop on). Returns 0 on a null handle.
 uint32_t baseRT_eos_token_id(baseRT_model_t model);
+
+/// Max prompt tokens the fused (varlen) prefill can process in one packed batch.
+/// The continuous-batching engine caps per-tick admitted prompt tokens by this
+/// so a burst of long prompts doesn't overflow the packed prefill. 0 on null.
+int baseRT_max_prefill_chunk(baseRT_model_t model);
 
 // === Token counting ===
 

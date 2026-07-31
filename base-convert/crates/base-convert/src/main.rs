@@ -2015,6 +2015,10 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
         || mm_name.starts_with("visual.")
         || mm_name.starts_with("embed_audio")
         || mm_name.starts_with("embed_vision")
+        // gemma4_unified (gemma-4-12B-it) names its encoder-free patch
+        // embedder `vision_embedder.*` (pos_embedding, patch_dense,
+        // patch_ln1/2, pos_norm) rather than `vision_tower.*`.
+        || mm_name.starts_with("vision_embedder")
         || mm_name.starts_with("multi_modal_projector")
     {
         let canonical = base_arch::gemma::map_gemma4_mmproj_name(mm_name).unwrap_or_else(|| mm_name.to_string());

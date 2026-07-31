@@ -313,6 +313,10 @@ interface BaseRTLib {
   baseRT_set_kv_bits: (bits: number) => void;
   baseRT_set_paged_kv: (enable: number) => void;
   baseRT_set_max_batch_size: (n: number) => void;
+  baseRT_set_prefill_chunk: (n: number) => void;
+  baseRT_set_paged_weights: (mode: number) => void;
+  baseRT_set_baked_decode: (enable: number) => void;
+  baseRT_set_gpu_wait_timeout_ms: (ms: number) => void;
   baseRT_encode: (
     model: unknown,
     text: string,
@@ -444,6 +448,10 @@ function lib(): BaseRTLib {
     baseRT_set_kv_bits: k.func("void baseRT_set_kv_bits(int)"),
     baseRT_set_paged_kv: k.func("void baseRT_set_paged_kv(int)"),
     baseRT_set_max_batch_size: k.func("void baseRT_set_max_batch_size(int)"),
+    baseRT_set_prefill_chunk: k.func("void baseRT_set_prefill_chunk(int)"),
+    baseRT_set_paged_weights: k.func("void baseRT_set_paged_weights(int)"),
+    baseRT_set_baked_decode: k.func("void baseRT_set_baked_decode(int)"),
+    baseRT_set_gpu_wait_timeout_ms: k.func("void baseRT_set_gpu_wait_timeout_ms(double)"),
     baseRT_encode: k.func(
       "int baseRT_encode(void *, const char *, _Out_ uint32_t *, int)"
     ),
@@ -554,6 +562,22 @@ export const Engine = {
   /** Max in-flight batch size for batched decode (sizes logits scratch). */
   setMaxBatchSize(n: number): void {
     lib().baseRT_set_max_batch_size(n);
+  },
+  /** Override prefill chunk size (tokens/GEMM batch); 0 = per-chip default. */
+  setPrefillChunk(n: number): void {
+    lib().baseRT_set_prefill_chunk(n);
+  },
+  /** Paged-weights load policy: 0=auto, 1=force, 2=no-retry (issue #113). */
+  setPagedWeights(mode: number): void {
+    lib().baseRT_set_paged_weights(mode);
+  },
+  /** Toggle the baked-decode fast path: true=on (default), false=force live. */
+  setBakedDecode(enable: boolean): void {
+    lib().baseRT_set_baked_decode(enable ? 1 : 0);
+  },
+  /** GPU-wait timeout (ms); 0 = block indefinitely (default). Metal only. */
+  setGpuWaitTimeoutMs(ms: number): void {
+    lib().baseRT_set_gpu_wait_timeout_ms(ms);
   },
   /** Last thread-local error string, or null. */
   lastError(): string | null {
