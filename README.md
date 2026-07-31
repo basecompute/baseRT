@@ -2,23 +2,24 @@
 
 # BaseRT
 
-**Fastest LLM inference runtime for Apple Silicon.**
+**Fastest LLM inference on Apple Silicon — now on NVIDIA GB10 (DGX Spark), too.**
 
 Pull a model from HuggingFace, chat with it, or serve an OpenAI-compatible API — all from one CLI.
 
 [![Docs](https://img.shields.io/badge/docs-docs.basecompute.co-5b8fa8)](https://docs.basecompute.co)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-Apple%20Silicon%20%C2%B7%20NVIDIA%20GB10-black)](#requirements)
 [![Bindings](https://img.shields.io/badge/bindings-Python%20%C2%B7%20Node%20%C2%B7%20Rust%20%C2%B7%20Swift-444)](docs/bindings/index.md)
 
 </div>
 
 ---
 
-BaseRT runs large language models locally on Apple Silicon, accelerated by
-hand-written Metal kernels. This repository is the open ecosystem around the
-engine: the `basert` CLI (model hub + converter), the `.base` model format, the
-public C API, and language bindings for Python, Node, Rust, and Swift.
+BaseRT runs large language models locally on Apple Silicon (Metal) and NVIDIA
+GB10 / DGX Spark (CUDA), accelerated by hand-written GPU kernels. This repository
+is the open ecosystem around the engine: the `basert` CLI (model hub +
+converter), the `.base` model format, the public C API, and language bindings for
+Python, Node, Rust, and Swift.
 
 - **One CLI for everything** — `basert pull`, `chat`, `serve`, `convert`.
 - **OpenAI-compatible server** — chat, completions, embeddings, transcription,
@@ -33,7 +34,10 @@ public C API, and language bindings for Python, Node, Rust, and Swift.
 
 ## Requirements
 
+One of:
+
 - Apple Silicon (M1 or later), macOS 14+.
+- NVIDIA GB10 (DGX Spark), Linux / arm64 with a CUDA driver.
 
 ## Quickstart
 
@@ -43,8 +47,8 @@ public C API, and language bindings for Python, Node, Rust, and Swift.
 curl -LsSf https://basecompute.co/install.sh | sh
 ```
 
-This installs the prebuilt engine and the `basert` CLI to `~/.basert` and adds
-it to your `PATH`. Restart your shell afterward (or
+This installs the prebuilt engine for your platform and the `basert` CLI to
+`~/.basert` and adds it to your `PATH`. Restart your shell afterward (or
 `export PATH="$HOME/.basert:$PATH"`). See
 [Installation](docs/getting-started/installation.md) for building from source.
 
