@@ -425,6 +425,248 @@
       "quant": "default-q8",
       "size": 36228218880,
       "sha256": "11d093a918e2a0b917430547dafcdcab2fe1c2d689ec86b5343382f72d2b2c3b"
+    },
+    {
+      "id": "basecompute/Qwen3.5-2B",
+      "hf_repo": "basecompute/Qwen3.5-2B",
+      "source_repo": "Qwen/Qwen3.5-2B",
+      "arch": "qwen35",
+      "file": "Qwen3.5-2B-cuda-q4mix.base",
+      "quant": "cuda-q4mix",
+      "size": 1592131584,
+      "sha256": "db457f5dd499be915e51e757d0e999e279def9f861f0ecc206708deaa5ec49ca",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Qwen3.5-2B",
+      "hf_repo": "basecompute/Qwen3.5-2B",
+      "source_repo": "Qwen/Qwen3.5-2B",
+      "arch": "qwen35",
+      "file": "Qwen3.5-2B-cuda-q8.base",
+      "quant": "cuda-q8",
+      "size": 2301460480,
+      "sha256": "027907a8ce268e1a7ffc339cd2746db87c2e5f01867910284b19cbb52ec62d78",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Qwen3.5-35B-A3B",
+      "hf_repo": "basecompute/Qwen3.5-35B-A3B",
+      "source_repo": "Qwen/Qwen3.5-35B-A3B",
+      "arch": "qwen35moe",
+      "file": "Qwen3.5-35B-A3B-cuda-q4mix.base",
+      "quant": "cuda-q4mix",
+      "size": 21123661824,
+      "sha256": "1f836346dfe62bddb1c9b2a4f514c7b2fcea47b63d6d5dd1d8f4cfee95b50363",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Qwen3.5-35B-A3B",
+      "hf_repo": "basecompute/Qwen3.5-35B-A3B",
+      "source_repo": "Qwen/Qwen3.5-35B-A3B",
+      "arch": "qwen35moe",
+      "file": "Qwen3.5-35B-A3B-cuda-q8.base",
+      "quant": "cuda-q8",
+      "size": 36357767168,
+      "sha256": "7dbbe60e58c96ab845eedf14ad9684abaa5175ba04d137a3da704b2a16afacbd",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Qwen3.6-27B",
+      "hf_repo": "basecompute/Qwen3.6-27B",
+      "source_repo": "Qwen/Qwen3.6-27B",
+      "arch": "qwen35",
+      "file": "Qwen3.6-27B-cuda-q4mix.base",
+      "quant": "cuda-q4mix",
+      "size": 18159501312,
+      "sha256": "7aebf3944f2d0ba10b5b2d9ddbb9fd0bfe3f52f2eeea011da362416209709921",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Qwen3.6-27B",
+      "hf_repo": "basecompute/Qwen3.6-27B",
+      "source_repo": "Qwen/Qwen3.6-27B",
+      "arch": "qwen35",
+      "file": "Qwen3.6-27B-cuda-q8.base",
+      "quant": "cuda-q8",
+      "size": 28386312192,
+      "sha256": "d0be0cad29ccafde360cb92fa2298527abc35749e8ba390b2a5b7ce596ba938f",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Qwen3.6-35B-A3B",
+      "hf_repo": "basecompute/Qwen3.6-35B-A3B",
+      "source_repo": "Qwen/Qwen3.6-35B-A3B",
+      "arch": "qwen35moe",
+      "file": "Qwen3.6-35B-A3B-cuda-q4mix.base",
+      "quant": "cuda-q4mix",
+      "size": 21123661824,
+      "sha256": "75951215950ba8feb94dfb86351505b6f6fc818c6dbedd64d946c6cd9214fe4a",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Qwen3.6-35B-A3B",
+      "hf_repo": "basecompute/Qwen3.6-35B-A3B",
+      "source_repo": "Qwen/Qwen3.6-35B-A3B",
+      "arch": "qwen35moe",
+      "file": "Qwen3.6-35B-A3B-cuda-q8.base",
+      "quant": "cuda-q8",
+      "size": 36357767168,
+      "sha256": "350f09147443f1ed5e7e8709e41d43fe7d886138ad93129c69c8881208951a04",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/gemma-4-26B-A4B-it",
+      "hf_repo": "basecompute/gemma-4-26B-A4B-it",
+      "source_repo": null,
+      "arch": "gemma4",
+      "file": "gemma-4-26B-A4B-it-cuda-q4mix.base",
+      "quant": "cuda-q4mix",
+      "size": 16108079360,
+      "sha256": "42175b1a0eb73da799e8a3745ec7d29d03803d5b3b61767fd7c77825ad9e7fef",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/gemma-4-26B-A4B-it",
+      "hf_repo": "basecompute/gemma-4-26B-A4B-it",
+      "source_repo": null,
+      "arch": "gemma4",
+      "file": "gemma-4-26B-A4B-it-cuda-q8.base",
+      "quant": "cuda-q8",
+      "size": 27029195008,
+      "sha256": "6f8c9ebeab8106c4b4489ae19c41cec9bffcd9ed1aaf8489833bd365a86200d5",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Qwen3-30B-A3B-Instruct-2507",
+      "hf_repo": "basecompute/Qwen3-30B-A3B-Instruct-2507",
+      "source_repo": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+      "arch": "qwen3_moe",
+      "file": "Qwen3-30B-A3B-Instruct-2507-cuda-q4mix.base",
+      "quant": "cuda-q4mix",
+      "size": 17794174976,
+      "sha256": "97bd85655b771a3f36e72784616ed1a31e91439e82e388d74668ff3fff551aea",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Qwen3-30B-A3B-Instruct-2507",
+      "hf_repo": "basecompute/Qwen3-30B-A3B-Instruct-2507",
+      "source_repo": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+      "arch": "qwen3_moe",
+      "file": "Qwen3-30B-A3B-Instruct-2507-cuda-q8.base",
+      "quant": "cuda-q8",
+      "size": 31494377472,
+      "sha256": "36c5ed1a61e59449e23b5a4ec582dac844ec011efe91e6fb10e55a00380c9f53",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Llama-3.2-1B-Instruct",
+      "hf_repo": "basecompute/Llama-3.2-1B-Instruct",
+      "source_repo": "meta-llama/Llama-3.2-1B-Instruct",
+      "arch": "llama",
+      "file": "Llama-3.2-1B-Instruct-cuda-q4mix.base",
+      "quant": "cuda-q4mix",
+      "size": 767528960,
+      "sha256": "fbb077c79d7a1eb3594f8b4c8aa8ef636a54284eb90975d09a73010f0e046f6c",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Llama-3.2-1B-Instruct",
+      "hf_repo": "basecompute/Llama-3.2-1B-Instruct",
+      "source_repo": "meta-llama/Llama-3.2-1B-Instruct",
+      "arch": "llama",
+      "file": "Llama-3.2-1B-Instruct-cuda-q8.base",
+      "quant": "cuda-q8",
+      "size": 1281118208,
+      "sha256": "cf3be554b160c49b1a4d896950ba1d07f6fbce2f5392071dd8a29b10884f2c24",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Llama-3.2-3B-Instruct",
+      "hf_repo": "basecompute/Llama-3.2-3B-Instruct",
+      "source_repo": "meta-llama/Llama-3.2-3B-Instruct",
+      "arch": "llama",
+      "file": "Llama-3.2-3B-Instruct-cuda-q4mix.base",
+      "quant": "cuda-q4mix",
+      "size": 1912723456,
+      "sha256": "356df54aa2a2731cc048312e5082ed89549f3a106a9a7583bcbac2d455e2c933",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Llama-3.2-3B-Instruct",
+      "hf_repo": "basecompute/Llama-3.2-3B-Instruct",
+      "source_repo": "meta-llama/Llama-3.2-3B-Instruct",
+      "arch": "llama",
+      "file": "Llama-3.2-3B-Instruct-cuda-q8.base",
+      "quant": "cuda-q8",
+      "size": 3320125440,
+      "sha256": "69c8eb644cb9dd022af2d574d7c1ecd62abbc51d1abb36db3a3e642b86ae4738",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/gemma-3-1b-it",
+      "hf_repo": "basecompute/gemma-3-1b-it",
+      "source_repo": "google/gemma-3-1b-it",
+      "arch": "gemma3",
+      "file": "gemma-3-1b-it-cuda-q4mix.base",
+      "quant": "cuda-q4mix",
+      "size": 655100160,
+      "sha256": "bf12127dd688be09db683c050cbe14f637382aab41d30e52752cdfd6910b2f34",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/gemma-3-1b-it",
+      "hf_repo": "basecompute/gemma-3-1b-it",
+      "source_repo": "google/gemma-3-1b-it",
+      "arch": "gemma3",
+      "file": "gemma-3-1b-it-cuda-q8.base",
+      "quant": "cuda-q8",
+      "size": 1047890176,
+      "sha256": "bd6dd1f20e55bef8364f0c1ed76b953f406c1500ea768532a78c6f000ad82ecc",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/gemma-4-E2B-it",
+      "hf_repo": "basecompute/gemma-4-E2B-it",
+      "source_repo": null,
+      "arch": "gemma4",
+      "file": "gemma-4-E2B-it-cuda-q4mix.base",
+      "quant": "cuda-q4mix",
+      "size": 4298522624,
+      "sha256": "47e5da7e8d4d339bacdaf82b0550b5de53506fcbf1effd52e0fe8b680b68e214",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/gemma-4-E2B-it",
+      "hf_repo": "basecompute/gemma-4-E2B-it",
+      "source_repo": null,
+      "arch": "gemma4",
+      "file": "gemma-4-E2B-it-cuda-q8.base",
+      "quant": "cuda-q8",
+      "size": 5350326272,
+      "sha256": "115c4ae330c2b4acd9dfc586a3ebe6a2080efb9de10f893f8d42eaf960a8e5d4",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Qwen3-0.6B",
+      "hf_repo": "basecompute/Qwen3-0.6B",
+      "source_repo": "Qwen/Qwen3-0.6B",
+      "arch": "qwen",
+      "file": "Qwen3-0.6B-cuda-q4mix.base",
+      "quant": "cuda-q4mix",
+      "size": 541935616,
+      "sha256": "e63b22721c17a352b605b7e58a2157192069c1e1576748ecefbe715c66ac0e07",
+      "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Qwen3-0.6B",
+      "hf_repo": "basecompute/Qwen3-0.6B",
+      "source_repo": "Qwen/Qwen3-0.6B",
+      "arch": "qwen",
+      "file": "Qwen3-0.6B-cuda-q8.base",
+      "quant": "cuda-q8",
+      "size": 782403584,
+      "sha256": "6a99cc4edaf52c60da74edad11d45aea50fa105da05aed3215dc3544cab77161",
+      "backend": "cuda"
     }
   ]
 }
