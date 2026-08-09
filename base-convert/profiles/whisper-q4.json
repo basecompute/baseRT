@@ -1,0 +1,18 @@
+{
+  "name": "whisper-q4",
+  "arch": "whisper",
+  "rules": [
+    {"pattern": "encoder.conv{1,2}.weight", "dtype": "f16"},
+    {"pattern": "**.positional_embedding", "dtype": "f16"},
+    {"pattern": "decoder.token_embedding.weight", "dtype": "f16"},
+    {"pattern": "**.attn_ln.weight", "dtype": "f16"},
+    {"pattern": "**.cross_attn_ln.weight", "dtype": "f16"},
+    {"pattern": "**.mlp_ln.weight", "dtype": "f16"},
+    {"pattern": "encoder.ln_post.weight", "dtype": "f16"},
+    {"pattern": "decoder.ln.weight", "dtype": "f16"},
+    {"pattern": "**.{attn,cross_attn}.{query,key,value,out}.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.mlp.{0,2}.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.bias", "dtype": "f16"},
+    {"pattern": "**", "dtype": "f16"}
+  ]
+}

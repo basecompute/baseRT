@@ -1,0 +1,7 @@
+{
+  "name": "whisper-f16",
+  "arch": "whisper",
+  "rules": [
+    {"pattern": "**", "dtype": "f16"}
+  ]
+}

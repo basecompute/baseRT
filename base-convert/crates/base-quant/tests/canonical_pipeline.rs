@@ -66,6 +66,7 @@ fn make_header() -> Header {
         },
         tokenizer: TokenizerBlob { fields: BTreeMap::new() },
         config: ModelConfig { fields: BTreeMap::new() },
+        metadata: BTreeMap::new(),
         target_backend: TargetBackend::Metal,
         quant_profile: "smoke-q4-q8".into(),
         alignment: AlignmentConfig::default(),

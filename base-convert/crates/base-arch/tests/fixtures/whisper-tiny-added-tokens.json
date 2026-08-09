@@ -1,0 +1,436 @@
+{
+ "added_tokens": [
+  {
+   "id": 50257,
+   "content": "<|endoftext|>"
+  },
+  {
+   "id": 50258,
+   "content": "<|startoftranscript|>"
+  },
+  {
+   "id": 50259,
+   "content": "<|en|>"
+  },
+  {
+   "id": 50260,
+   "content": "<|zh|>"
+  },
+  {
+   "id": 50261,
+   "content": "<|de|>"
+  },
+  {
+   "id": 50262,
+   "content": "<|es|>"
+  },
+  {
+   "id": 50263,
+   "content": "<|ru|>"
+  },
+  {
+   "id": 50264,
+   "content": "<|ko|>"
+  },
+  {
+   "id": 50265,
+   "content": "<|fr|>"
+  },
+  {
+   "id": 50266,
+   "content": "<|ja|>"
+  },
+  {
+   "id": 50267,
+   "content": "<|pt|>"
+  },
+  {
+   "id": 50268,
+   "content": "<|tr|>"
+  },
+  {
+   "id": 50269,
+   "content": "<|pl|>"
+  },
+  {
+   "id": 50270,
+   "content": "<|ca|>"
+  },
+  {
+   "id": 50271,
+   "content": "<|nl|>"
+  },
+  {
+   "id": 50272,
+   "content": "<|ar|>"
+  },
+  {
+   "id": 50273,
+   "content": "<|sv|>"
+  },
+  {
+   "id": 50274,
+   "content": "<|it|>"
+  },
+  {
+   "id": 50275,
+   "content": "<|id|>"
+  },
+  {
+   "id": 50276,
+   "content": "<|hi|>"
+  },
+  {
+   "id": 50277,
+   "content": "<|fi|>"
+  },
+  {
+   "id": 50278,
+   "content": "<|vi|>"
+  },
+  {
+   "id": 50279,
+   "content": "<|he|>"
+  },
+  {
+   "id": 50280,
+   "content": "<|uk|>"
+  },
+  {
+   "id": 50281,
+   "content": "<|el|>"
+  },
+  {
+   "id": 50282,
+   "content": "<|ms|>"
+  },
+  {
+   "id": 50283,
+   "content": "<|cs|>"
+  },
+  {
+   "id": 50284,
+   "content": "<|ro|>"
+  },
+  {
+   "id": 50285,
+   "content": "<|da|>"
+  },
+  {
+   "id": 50286,
+   "content": "<|hu|>"
+  },
+  {
+   "id": 50287,
+   "content": "<|ta|>"
+  },
+  {
+   "id": 50288,
+   "content": "<|no|>"
+  },
+  {
+   "id": 50289,
+   "content": "<|th|>"
+  },
+  {
+   "id": 50290,
+   "content": "<|ur|>"
+  },
+  {
+   "id": 50291,
+   "content": "<|hr|>"
+  },
+  {
+   "id": 50292,
+   "content": "<|bg|>"
+  },
+  {
+   "id": 50293,
+   "content": "<|lt|>"
+  },
+  {
+   "id": 50294,
+   "content": "<|la|>"
+  },
+  {
+   "id": 50295,
+   "content": "<|mi|>"
+  },
+  {
+   "id": 50296,
+   "content": "<|ml|>"
+  },
+  {
+   "id": 50297,
+   "content": "<|cy|>"
+  },
+  {
+   "id": 50298,
+   "content": "<|sk|>"
+  },
+  {
+   "id": 50299,
+   "content": "<|te|>"
+  },
+  {
+   "id": 50300,
+   "content": "<|fa|>"
+  },
+  {
+   "id": 50301,
+   "content": "<|lv|>"
+  },
+  {
+   "id": 50302,
+   "content": "<|bn|>"
+  },
+  {
+   "id": 50303,
+   "content": "<|sr|>"
+  },
+  {
+   "id": 50304,
+   "content": "<|az|>"
+  },
+  {
+   "id": 50305,
+   "content": "<|sl|>"
+  },
+  {
+   "id": 50306,
+   "content": "<|kn|>"
+  },
+  {
+   "id": 50307,
+   "content": "<|et|>"
+  },
+  {
+   "id": 50308,
+   "content": "<|mk|>"
+  },
+  {
+   "id": 50309,
+   "content": "<|br|>"
+  },
+  {
+   "id": 50310,
+   "content": "<|eu|>"
+  },
+  {
+   "id": 50311,
+   "content": "<|is|>"
+  },
+  {
+   "id": 50312,
+   "content": "<|hy|>"
+  },
+  {
+   "id": 50313,
+   "content": "<|ne|>"
+  },
+  {
+   "id": 50314,
+   "content": "<|mn|>"
+  },
+  {
+   "id": 50315,
+   "content": "<|bs|>"
+  },
+  {
+   "id": 50316,
+   "content": "<|kk|>"
+  },
+  {
+   "id": 50317,
+   "content": "<|sq|>"
+  },
+  {
+   "id": 50318,
+   "content": "<|sw|>"
+  },
+  {
+   "id": 50319,
+   "content": "<|gl|>"
+  },
+  {
+   "id": 50320,
+   "content": "<|mr|>"
+  },
+  {
+   "id": 50321,
+   "content": "<|pa|>"
+  },
+  {
+   "id": 50322,
+   "content": "<|si|>"
+  },
+  {
+   "id": 50323,
+   "content": "<|km|>"
+  },
+  {
+   "id": 50324,
+   "content": "<|sn|>"
+  },
+  {
+   "id": 50325,
+   "content": "<|yo|>"
+  },
+  {
+   "id": 50326,
+   "content": "<|so|>"
+  },
+  {
+   "id": 50327,
+   "content": "<|af|>"
+  },
+  {
+   "id": 50328,
+   "content": "<|oc|>"
+  },
+  {
+   "id": 50329,
+   "content": "<|ka|>"
+  },
+  {
+   "id": 50330,
+   "content": "<|be|>"
+  },
+  {
+   "id": 50331,
+   "content": "<|tg|>"
+  },
+  {
+   "id": 50332,
+   "content": "<|sd|>"
+  },
+  {
+   "id": 50333,
+   "content": "<|gu|>"
+  },
+  {
+   "id": 50334,
+   "content": "<|am|>"
+  },
+  {
+   "id": 50335,
+   "content": "<|yi|>"
+  },
+  {
+   "id": 50336,
+   "content": "<|lo|>"
+  },
+  {
+   "id": 50337,
+   "content": "<|uz|>"
+  },
+  {
+   "id": 50338,
+   "content": "<|fo|>"
+  },
+  {
+   "id": 50339,
+   "content": "<|ht|>"
+  },
+  {
+   "id": 50340,
+   "content": "<|ps|>"
+  },
+  {
+   "id": 50341,
+   "content": "<|tk|>"
+  },
+  {
+   "id": 50342,
+   "content": "<|nn|>"
+  },
+  {
+   "id": 50343,
+   "content": "<|mt|>"
+  },
+  {
+   "id": 50344,
+   "content": "<|sa|>"
+  },
+  {
+   "id": 50345,
+   "content": "<|lb|>"
+  },
+  {
+   "id": 50346,
+   "content": "<|my|>"
+  },
+  {
+   "id": 50347,
+   "content": "<|bo|>"
+  },
+  {
+   "id": 50348,
+   "content": "<|tl|>"
+  },
+  {
+   "id": 50349,
+   "content": "<|mg|>"
+  },
+  {
+   "id": 50350,
+   "content": "<|as|>"
+  },
+  {
+   "id": 50351,
+   "content": "<|tt|>"
+  },
+  {
+   "id": 50352,
+   "content": "<|haw|>"
+  },
+  {
+   "id": 50353,
+   "content": "<|ln|>"
+  },
+  {
+   "id": 50354,
+   "content": "<|ha|>"
+  },
+  {
+   "id": 50355,
+   "content": "<|ba|>"
+  },
+  {
+   "id": 50356,
+   "content": "<|jw|>"
+  },
+  {
+   "id": 50357,
+   "content": "<|su|>"
+  },
+  {
+   "id": 50358,
+   "content": "<|translate|>"
+  },
+  {
+   "id": 50359,
+   "content": "<|transcribe|>"
+  },
+  {
+   "id": 50360,
+   "content": "<|startoflm|>"
+  },
+  {
+   "id": 50361,
+   "content": "<|startofprev|>"
+  },
+  {
+   "id": 50362,
+   "content": "<|nocaptions|>"
+  },
+  {
+   "id": 50363,
+   "content": "<|notimestamps|>"
+  },
+  {
+   "id": 50364,
+   "content": "<|0.00|>"
+  }
+ ]
+}

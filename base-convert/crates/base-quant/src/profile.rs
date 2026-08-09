@@ -490,4 +490,66 @@ mod tests {
         );
         assert_eq!(p.resolve("not_in_profile").map(|_| ()), None);
     }
+    /// The whisper profiles quantize ONLY the block linear projections
+    /// (attn/cross_attn query/key/value/out, mlp.0/mlp.2) and keep
+    /// conv, positional embeddings, token_embedding, norms and biases
+    /// f16. q8 → gs=128, q4 → gs=64, bf16 scales — the canonical
+    /// packed scheme the engine's quant whisper kernels expect.
+    #[test]
+    fn whisper_profiles_route_correctly() {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let profiles_dir = std::path::Path::new(&manifest)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("profiles");
+        for (file, dtype, gs) in [
+            ("whisper-q8.json", TensorDtype::BaseQ8, 128),
+            ("whisper-q4.json", TensorDtype::BaseQ4, 64),
+        ] {
+            let p = QuantProfile::from_path(&profiles_dir.join(file)).unwrap();
+            assert_eq!(p.arch, "whisper", "{file}");
+
+            // Block linears → quantized.
+            for name in [
+                "encoder.blocks.0.attn.query.weight",
+                "encoder.blocks.3.attn.key.weight",
+                "decoder.blocks.1.attn.value.weight",
+                "decoder.blocks.1.attn.out.weight",
+                "decoder.blocks.11.cross_attn.query.weight",
+                "decoder.blocks.11.cross_attn.out.weight",
+                "encoder.blocks.0.mlp.0.weight",
+                "decoder.blocks.2.mlp.2.weight",
+            ] {
+                let r = p.resolve(name).unwrap_or_else(|| panic!("{file}: no rule for {name}"));
+                assert_eq!(r.dtype, dtype, "{file}: {name}");
+                assert_eq!(r.group_size, gs, "{file}: {name}");
+                assert_eq!(r.scale_dtype, ScaleDtype::Bf16, "{file}: {name}");
+            }
+
+            // Everything the engine reads as raw half stays f16.
+            for name in [
+                "encoder.conv1.weight",
+                "encoder.conv2.weight",
+                "encoder.positional_embedding",
+                "decoder.positional_embedding",
+                "decoder.token_embedding.weight",
+                "encoder.ln_post.weight",
+                "decoder.ln.weight",
+                "encoder.blocks.0.attn_ln.weight",
+                "decoder.blocks.1.cross_attn_ln.weight",
+                "decoder.blocks.1.mlp_ln.weight",
+                "encoder.conv1.bias",
+                "encoder.blocks.0.attn.query.bias",
+                "decoder.blocks.1.cross_attn.out.bias",
+                "encoder.blocks.0.mlp.0.bias",
+                "decoder.ln.bias",
+            ] {
+                let r = p.resolve(name).unwrap_or_else(|| panic!("{file}: no rule for {name}"));
+                assert_eq!(r.dtype, TensorDtype::F16, "{file}: {name} must stay f16");
+            }
+        }
+    }
+
 }
