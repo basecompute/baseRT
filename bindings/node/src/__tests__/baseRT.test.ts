@@ -10,8 +10,14 @@
 import koffi from "koffi";
 import { __internal, type SamplingConfig } from "../index";
 
-const { ModelConfigC, SamplingConfigC, GenerationStatsC, TranscribeStatsC, toSamplingC } =
-  __internal;
+const {
+  ModelConfigC,
+  SamplingConfigC,
+  GenerationStatsC,
+  TranscribeStatsC,
+  TranscribeSegmentC,
+  toSamplingC,
+} = __internal;
 
 describe("C struct ABI (offsets match include/baseRT/types.h)", () => {
   test("BaseRTModelConfig includes sliding_window and places architecture at offset 60", () => {
@@ -62,6 +68,15 @@ describe("C struct ABI (offsets match include/baseRT/types.h)", () => {
 
   test("BaseRTTranscribeStats is 20 bytes (5 x 4-byte fields)", () => {
     expect(koffi.sizeof(TranscribeStatsC)).toBe(20);
+  });
+
+  test("BaseRTTranscribeSegment is 32 bytes with text at offset 8", () => {
+    // 2 x int, 8-byte-aligned char*, 4 x float — matches the C struct in
+    // include/baseRT/baseRT.h.
+    expect(koffi.sizeof(TranscribeSegmentC)).toBe(32);
+    expect(koffi.offsetof(TranscribeSegmentC, "text")).toBe(8);
+    expect(koffi.offsetof(TranscribeSegmentC, "avg_logprob")).toBe(16);
+    expect(koffi.offsetof(TranscribeSegmentC, "temperature")).toBe(28);
   });
 });
 

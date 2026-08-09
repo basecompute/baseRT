@@ -37,36 +37,60 @@ public enum BaseRTEngine {
 }
 
 // MARK: - Additional model surface
+//
+// Every method below touches the non-thread-safe C `handle`, so — exactly like
+// the core surface in `BaseRT.swift` — each goes through `withHandleLock`, which
+// rejects re-entry from a token/segment callback (throwing
+// `BaseRTError.reentrantModelCall`) before acquiring the non-recursive
+// `handleLock`. Ordinary concurrent callers block-and-wait on the lock as usual.
+// Because the guard can throw, these APIs are `throws` too.
 
 extension BaseRTModel {
 
     /// Total tokens currently in the KV cache.
-    public var positionTokens: Int { Int(baseRT_get_position(handle)) }
+    /// - Throws: `BaseRTError.reentrantModelCall` if read from within a callback.
+    public var positionTokens: Int {
+        get throws { try withHandleLock { Int(baseRT_get_position(handle)) } }
+    }
 
     /// Primary end-of-sequence token id.
-    public var eosTokenID: UInt32 { baseRT_eos_token_id(handle) }
+    /// - Throws: `BaseRTError.reentrantModelCall` if read from within a callback.
+    public var eosTokenID: UInt32 {
+        get throws { try withHandleLock { baseRT_eos_token_id(handle) } }
+    }
 
     /// BOS / EOS token strings (as substituted in HF chat templates).
-    public var bosToken: String { cString(baseRT_bos_token(handle)) }
-    public var eosToken: String { cString(baseRT_eos_token(handle)) }
+    /// - Throws: `BaseRTError.reentrantModelCall` if read from within a callback.
+    public var bosToken: String {
+        get throws { try withHandleLock { cString(baseRT_bos_token(handle)) } }
+    }
+    /// - Throws: `BaseRTError.reentrantModelCall` if read from within a callback.
+    public var eosToken: String {
+        get throws { try withHandleLock { cString(baseRT_eos_token(handle)) } }
+    }
 
     /// Raw Jinja chat template folded in from the `.base` bundle (empty if none).
-    public var chatTemplateJinja: String { cString(baseRT_chat_template_jinja(handle)) }
+    /// - Throws: `BaseRTError.reentrantModelCall` if read from within a callback.
+    public var chatTemplateJinja: String {
+        get throws { try withHandleLock { cString(baseRT_chat_template_jinja(handle)) } }
+    }
 
     /// Stateless single-token decode (does not advance the incremental decoder).
-    public func decodeTokenStatic(_ tokenID: UInt32) -> String {
-        cString(baseRT_decode_token_static(handle, tokenID))
+    /// - Throws: `BaseRTError.reentrantModelCall` if called from within a callback.
+    public func decodeTokenStatic(_ tokenID: UInt32) throws -> String {
+        try withHandleLock { cString(baseRT_decode_token_static(handle, tokenID)) }
     }
 
     /// Generate and return the full decoded text in one call.
+    /// - Throws: `BaseRTError.reentrantModelCall` if called from within a callback.
     @discardableResult
     public func generateText(
         tokens: [UInt32],
         maxTokens: Int,
         sampling: SamplingConfig = SamplingConfig()
-    ) -> String {
+    ) throws -> String {
         var out = ""
-        _ = generate(tokens: tokens, maxTokens: maxTokens, sampling: sampling) { tok in
+        _ = try generate(tokens: tokens, maxTokens: maxTokens, sampling: sampling) { tok in
             out += tok.text
             return true
         }
@@ -76,32 +100,40 @@ extension BaseRTModel {
     // MARK: Multimodal
 
     /// Number of image placeholder tokens the vision tower emits for an image.
-    public func imageTokenCount(imagePath: String) -> Int {
-        Int(baseRT_image_num_tokens(handle, imagePath))
+    /// - Throws: `BaseRTError.reentrantModelCall` if called from within a callback.
+    public func imageTokenCount(imagePath: String) throws -> Int {
+        try withHandleLock { Int(baseRT_image_num_tokens(handle, imagePath)) }
     }
 
     /// Multimodal prefill: run the vision tower on `imagePath`, splice features
     /// at image-token positions, then prefill. Returns the first generated token
     /// (0 on error — check `BaseRTEngine.lastError`).
-    public func prefillImage(tokens: [UInt32], imagePath: String) -> UInt32 {
-        tokens.withUnsafeBufferPointer { buf in
-            baseRT_prefill_image(handle, buf.baseAddress, Int32(tokens.count), imagePath)
+    /// - Throws: `BaseRTError.reentrantModelCall` if called from within a callback.
+    public func prefillImage(tokens: [UInt32], imagePath: String) throws -> UInt32 {
+        try withHandleLock {
+            tokens.withUnsafeBufferPointer { buf in
+                baseRT_prefill_image(handle, buf.baseAddress, Int32(tokens.count), imagePath)
+            }
         }
     }
 
     /// Number of audio placeholder tokens for `nSamples` of 16 kHz mono PCM.
-    public func audioTokenCount(nSamples: Int) -> Int {
-        Int(baseRT_audio_num_tokens(handle, Int32(nSamples)))
+    /// - Throws: `BaseRTError.reentrantModelCall` if called from within a callback.
+    public func audioTokenCount(nSamples: Int) throws -> Int {
+        try withHandleLock { Int(baseRT_audio_num_tokens(handle, Int32(nSamples))) }
     }
 
     /// Audio prefill: run the Conformer encoder on PCM (16 kHz mono Float32),
     /// splice features at audio-token positions, then prefill.
-    public func prefillAudio(tokens: [UInt32], pcm: [Float]) -> UInt32 {
-        tokens.withUnsafeBufferPointer { tBuf in
-            pcm.withUnsafeBufferPointer { pBuf in
-                baseRT_prefill_audio(
-                    handle, tBuf.baseAddress, Int32(tokens.count),
-                    pBuf.baseAddress, Int32(pcm.count))
+    /// - Throws: `BaseRTError.reentrantModelCall` if called from within a callback.
+    public func prefillAudio(tokens: [UInt32], pcm: [Float]) throws -> UInt32 {
+        try withHandleLock {
+            tokens.withUnsafeBufferPointer { tBuf in
+                pcm.withUnsafeBufferPointer { pBuf in
+                    baseRT_prefill_audio(
+                        handle, tBuf.baseAddress, Int32(tokens.count),
+                        pBuf.baseAddress, Int32(pcm.count))
+                }
             }
         }
     }
@@ -109,38 +141,46 @@ extension BaseRTModel {
     // MARK: KV-cache state
 
     /// Truncate the KV cache to `toPosition` tokens (drop everything after).
-    public func rollback(toPosition: Int) {
-        baseRT_rollback(handle, Int32(toPosition))
+    /// - Throws: `BaseRTError.reentrantModelCall` if called from within a callback.
+    public func rollback(toPosition: Int) throws {
+        try withHandleLock { baseRT_rollback(handle, Int32(toPosition)) }
     }
 
     /// Persist the current KV-cache state to `path`. Returns 0 on success.
+    /// - Throws: `BaseRTError.reentrantModelCall` if called from within a callback.
     @discardableResult
-    public func saveState(path: String) -> Int32 {
-        baseRT_save_state(handle, path)
+    public func saveState(path: String) throws -> Int32 {
+        try withHandleLock { baseRT_save_state(handle, path) }
     }
 
     /// Restore KV-cache state previously written by `saveState`. Returns 0 on success.
+    /// - Throws: `BaseRTError.reentrantModelCall` if called from within a callback.
     @discardableResult
-    public func loadState(path: String) -> Int32 {
-        baseRT_load_state(handle, path)
+    public func loadState(path: String) throws -> Int32 {
+        try withHandleLock { baseRT_load_state(handle, path) }
     }
 
     // MARK: LoRA
 
     /// Install a LoRA adapter (`.base` bundle). Replaces any active adapter.
     /// Returns 0 on success, negative on failure.
+    /// - Throws: `BaseRTError.reentrantModelCall` if called from within a callback.
     @discardableResult
-    public func loadLoRA(path: String) -> Int32 {
-        baseRT_lora_load(handle, path)
+    public func loadLoRA(path: String) throws -> Int32 {
+        try withHandleLock { baseRT_lora_load(handle, path) }
     }
 
     /// Detach the active LoRA adapter, if any.
-    public func unloadLoRA() {
-        baseRT_lora_unload(handle)
+    /// - Throws: `BaseRTError.reentrantModelCall` if called from within a callback.
+    public func unloadLoRA() throws {
+        try withHandleLock { baseRT_lora_unload(handle) }
     }
 
     /// Active adapter id (the path it was loaded from), or "" when none.
-    public var loraID: String { cString(baseRT_lora_id(handle)) }
+    /// - Throws: `BaseRTError.reentrantModelCall` if read from within a callback.
+    public var loraID: String {
+        get throws { try withHandleLock { cString(baseRT_lora_id(handle)) } }
+    }
 
     // MARK: helpers
 

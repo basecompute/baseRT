@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -240,6 +241,23 @@ typedef struct {
     float prefill_tokens_per_sec;
     float decode_tokens_per_sec;
 } BaseRTGenerationStats;
+
+/// Per-load configuration for baseRT_load_model_ex. Replaces the process-wide
+/// baseRT_set_* pre-load setters with values scoped to one load call, so a
+/// lazily-reloading host (e.g. a server's model registry) doesn't depend on
+/// globals set once at startup. Zero-initialize (`BaseRTLoadOptions opts = {0}`
+/// / value-init) and set `struct_size = sizeof(BaseRTLoadOptions)`; every
+/// zero field keeps today's default, so a zeroed struct behaves exactly like
+/// plain baseRT_load_model with no setters called.
+typedef struct {
+    size_t struct_size;      ///< must be sizeof(BaseRTLoadOptions); ABI guard
+    int kv_bits;             ///< 0 default, or 4 / 8 / 16 / 84 (84 = K@Q8, V@Q4)
+    int paged_kv;            ///< 0 default (off), 1 on
+    int max_batch_size;      ///< 0 default (1), else >= 1 decode lanes
+    int prefix_cache;        ///< 0 default (off), 1 on (needs paged_kv)
+    int prefill_chunk;       ///< 0 per-chip default, else tokens per prefill pass
+    int paged_weights_mode;  ///< 0 auto-retry on GPU-OOM, 1 force paged, 2 fail hard
+} BaseRTLoadOptions;
 
 #ifdef __cplusplus
 }

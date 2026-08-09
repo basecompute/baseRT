@@ -143,6 +143,35 @@ pub struct BaseRTTranscribeStats {
     pub total_ms: c_float,
 }
 
+/// One segment of the last transcription (verbose_json surface).
+/// `text` is borrowed from the engine — valid until the next transcription
+/// or model free.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BaseRTTranscribeSegment {
+    pub start_ms: c_int,
+    pub end_ms: c_int,
+    pub text: *const c_char,
+    pub avg_logprob: c_float,
+    pub no_speech_prob: c_float,
+    pub compression_ratio: c_float,
+    pub temperature: c_float,
+}
+
+impl Default for BaseRTTranscribeSegment {
+    fn default() -> Self {
+        Self {
+            start_ms: 0,
+            end_ms: 0,
+            text: std::ptr::null(),
+            avg_logprob: 0.0,
+            no_speech_prob: 0.0,
+            compression_ratio: 0.0,
+            temperature: 0.0,
+        }
+    }
+}
+
 /// Sampling configuration for text generation.
 ///
 /// Extended in baseRT 0.2 with OpenAI-compat presence / frequency penalties,
@@ -298,6 +327,24 @@ extern "C" {
     ) -> *const c_char;
 
     pub fn baseRT_set_timestamps(model: baseRT_model_t, enabled: bool);
+
+    pub fn baseRT_set_task(model: baseRT_model_t, task: *const c_char) -> bool;
+
+    pub fn baseRT_set_initial_prompt(model: baseRT_model_t, text: *const c_char);
+
+    pub fn baseRT_set_condition_on_previous_text(model: baseRT_model_t, enabled: bool);
+
+    pub fn baseRT_transcribe_language(model: baseRT_model_t) -> *const c_char;
+
+    pub fn baseRT_transcribe_audio_duration_ms(model: baseRT_model_t) -> c_int;
+
+    pub fn baseRT_transcribe_segment_count(model: baseRT_model_t) -> c_int;
+
+    pub fn baseRT_transcribe_segment(
+        model: baseRT_model_t,
+        index: c_int,
+        out: *mut BaseRTTranscribeSegment,
+    ) -> bool;
 
     pub fn baseRT_is_whisper(model: baseRT_model_t) -> bool;
 

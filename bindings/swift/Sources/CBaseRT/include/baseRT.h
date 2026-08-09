@@ -64,7 +64,7 @@ extern "C" {
 
 #define BASERT_VERSION_MAJOR 0
 #define BASERT_VERSION_MINOR 2
-#define BASERT_VERSION_PATCH 0
+#define BASERT_VERSION_PATCH 1
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
@@ -93,6 +93,37 @@ typedef void *baseRT_model_t;
 /// Returns NULL on failure.
 baseRT_model_t baseRT_load_model(const char *model_path, const char *kernel_library_path, int max_context);
 
+/// Load a model with per-call options instead of the process-wide
+/// baseRT_set_* pre-load setters. `opts` may be NULL (identical to
+/// baseRT_load_model); otherwise set opts->struct_size =
+/// sizeof(BaseRTLoadOptions) and zero any field you want left at its default
+/// (see BaseRTLoadOptions in types.h). Loads through this entry point are
+/// serialized against each other; the legacy globals are untouched from the
+/// caller's point of view (saved, applied for the load, restored). A
+/// concurrent plain baseRT_load_model on another thread races the applied
+/// values exactly as it would race the legacy setters — serialize loads if
+/// you mix the two forms.
+baseRT_model_t baseRT_load_model_ex(const char *model_path, const char *kernel_library_path, int max_context,
+                                    const BaseRTLoadOptions *opts);
+
+/// Capability flags reported by baseRT_capabilities(). A scheduler should
+/// branch on these instead of probing entry points for BASERT_ERR_UNSUPPORTED
+/// or inferring support from BaseRTModelConfig fields.
+enum {
+    BASERT_CAP_PAGED_KV = 1u << 0,      ///< loaded with paged KV (sequences, prefix seeding)
+    BASERT_CAP_SEQUENCES = 1u << 1,     ///< baseRT_sequence_create works: continuous batching
+    BASERT_CAP_HOST_LOGITS = 1u << 2,   ///< baseRT_batch_step_fused_logits + read_batch_logits work
+    BASERT_CAP_PREFIX_CACHE = 1u << 3,  ///< RadixCache prefix reuse is active
+    BASERT_CAP_GDN_SNAPSHOT = 1u << 4,  ///< hybrid-GDN recurrent-state snapshot/restore
+};
+
+/// What this loaded model supports, as BASERT_CAP_* flags. Pure query: no GPU
+/// work, no probe sequences, never touches the error state. Values are fixed
+/// at load time. When a capability is absent and the reason matters (e.g. an
+/// operator-facing "continuous batching disabled because ..." message), call
+/// the gated entry point once and read baseRT_get_error().
+uint32_t baseRT_capabilities(baseRT_model_t model);
+
 /// Override the KV cache element width for the next baseRT_load_model call.
 ///   bits = 0  → auto (per-model default; Q8_0 when head_dim%32==0)
 ///   bits = 8  → force Q8_0 K and V slabs (1.88x smaller; tiny precision cost)
@@ -103,7 +134,7 @@ void baseRT_set_kv_bits(int bits);
 
 /// Enable engine diagnostics (RoPE/tokenizer/GPU/architecture dumps, the
 /// per-token dispatch-command count, "Warming up"). Off by default so end
-/// users see only model output. Also honored via the BASERT_VERBOSE env var.
+/// users see only model output.
 void baseRT_set_verbose(int on);
 
 /// Toggle paged-KV mode for the next baseRT_load_model call.
@@ -153,6 +184,23 @@ void baseRT_set_paged_weights(int mode);
 /// Process-wide; read per decode step.
 void baseRT_set_baked_decode(int enable);
 
+/// CUDA decode-replay strategy for fused batch decode ticks.
+///   mode = 2 → stream capture (default): capture the live walk as a CUDA
+///     graph on a shape's second sighting; replay is numerically identical
+///     to the live tick it captured.
+///   mode = 1 → cmd-table replay (experiment; measured a net loss on GB10
+///     serving — see batch_step_fused_common).
+///   mode = 0 → neither: fused ticks run live (no capture, no cmd-table
+///     replay).
+/// Governs ONLY the CUDA fused-tick replay strategy. The baked DispatchTable
+/// fast path for pure-decode ticks is a separate mechanism with its own
+/// switch — baseRT_set_baked_decode(0) — matching the two knobs' historical
+/// independence. Process-wide; the fused decode paths latch the mode on
+/// first use, so set it before the first decode step. Other values are
+/// ignored. No effect on the Metal backend. (Replaces the
+/// BASERT_FUSED_BUCKETS / BASERT_STREAM_CAPTURE env gates.)
+void baseRT_set_decode_replay(int mode);
+
 /// GPU-wait timeout in milliseconds (Metal backend).
 ///   ms > 0   → (default: 300000, i.e. 5 min) return a loggable error if a
 ///     committed command buffer doesn't reach a terminal status in time. The
@@ -160,8 +208,7 @@ void baseRT_set_baked_decode(int enable);
 ///     reset/reboot reclaims it). Chosen far above any legitimate single
 ///     command buffer so only a real wedge trips it.
 ///   ms = 0   → block indefinitely in the GPU wait (opt out of the bound).
-/// No-op on non-Metal backends. Process-wide; read once per wait. The initial
-/// value also honors the BASERT_GPU_WAIT_TIMEOUT_MS environment variable.
+/// No-op on non-Metal backends. Process-wide; read once per wait.
 void baseRT_set_gpu_wait_timeout_ms(double ms);
 
 /// Free all resources associated with a model.
@@ -291,26 +338,9 @@ BaseRTGenerationStats baseRT_sequence_generate_continue(baseRT_sequence_t seq, c
 /// Release the sequence's blocks back to the pool and free the handle.
 void baseRT_sequence_free(baseRT_sequence_t seq);
 
-/// Fused batch step with per-sequence trailing PAD counts (serving grid
-/// alignment): counts[i] includes pads[i] throwaway tokens whose rows are
-/// computed but whose argmax row is skipped (the output token comes from the
-/// last REAL row). The caller must roll each padded sequence's KV back by
-/// pads[i] after the call (baseRT_sequence_rollback). Greedy only.
-int baseRT_batch_step_fused_pads(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs, const uint32_t *in_tokens,
-                                 const int *in_token_counts, const int *pads, uint32_t *out_tokens);
-
-/// Warm the batched-decode fast paths for batch sizes up to `max_batch`:
-/// each B runs two throwaway pure-decode ticks so shape-keyed caches (baked
-/// dispatch tables, stream-captured CUDA graphs, cuBLAS plans) are built at
-/// startup instead of on the first real requests — the same boot-time graph
-/// warmup vLLM performs. Requires --paged-kv; call after load, before serving.
-int baseRT_batch_warmup(baseRT_model_t model, int max_batch);
-
-/// Roll a sequence's KV state back to `length` tokens, returning any blocks
-/// past that point to the pool. `length` must be <= the current length; 0
-/// resets the sequence to empty. Used by the serving engine's shape-padding
-/// dummy lanes (their KV is discarded after every tick).
-int baseRT_sequence_rollback(baseRT_sequence_t seq, int length);
+// baseRT_batch_step_fused_pads / baseRT_batch_warmup /
+// baseRT_sequence_rollback are declared once, below with the rest of the
+// batched-decode API (their doc blocks had already started drifting apart).
 
 /// Batched decode: drives ONE batched decode step across N sequences. Each
 /// sequence writes its `new_tokens[i]` to its own KV cache slot, and attention
@@ -469,6 +499,55 @@ int baseRT_batch_step_fused_logits(baseRT_model_t model, baseRT_sequence_t *seqs
 /// `n_seqs` must match the batch of the preceding step and be <= max_batch_size.
 int baseRT_read_batch_logits(baseRT_model_t model, int n_seqs, void *out_logits_f16);
 
+// === Host-side logits-row operations ===
+//
+// Companions to baseRT_read_batch_logits for schedulers that sample on the
+// host: they encapsulate the engine's logits element type and row layout so
+// the caller never casts raw buffers or re-implements dtype-sensitive math
+// (which must stay bit-compatible with the engine's own greedy/sampled paths).
+// A "row" below is one sequence's logits inside the buffer written by
+// baseRT_read_batch_logits: row `s` starts at byte offset
+// `s * baseRT_batch_logits_stride(model)`.
+
+/// Bytes between consecutive sequence rows in the baseRT_read_batch_logits
+/// output buffer (also the size of one row). Size the readback buffer as
+/// `n_seqs * stride` bytes. Returns 0 on a null model.
+size_t baseRT_batch_logits_stride(baseRT_model_t model);
+
+/// Apply a grammar bitmask (from baseRT_grammar_fill_bitmask; a SET bit =
+/// allowed token) to one logits row IN PLACE: every disallowed token's logit
+/// becomes -inf, so subsequent sampling and logprob reads on the row see the
+/// constrained distribution. Returns BASERT_OK or an error code.
+int baseRT_mask_logits_row(baseRT_model_t model, void *row, const int32_t *bitmask);
+
+/// Run the full CPU sampling pipeline (temperature / top-k / top-p / min-p /
+/// repetition + presence + frequency penalties / logit_bias) over one logits
+/// row. `prev_tokens`/`n_prev` feed the repetition penalties;
+/// `repeat_window` bounds how many trailing prev_tokens are penalized (0 =
+/// all). When cfg->seed != 0 the sampling RNG is reseeded with
+/// cfg->seed + seed_offset first — pass the per-sequence generated-token
+/// count as seed_offset for deterministic per-lane streams under batch
+/// interleaving. Returns the sampled token id (0 with the error state set on
+/// invalid arguments).
+uint32_t baseRT_sample_logits_row(baseRT_model_t model, const void *row, const BaseRTSamplingConfig *cfg,
+                                  const uint32_t *prev_tokens, int n_prev, int repeat_window, uint32_t seed_offset);
+
+/// Lowest-index argmax over one logits row — the exact tie-break of the GPU
+/// argmax and the CPU greedy fast path, which sampling with top_k=1 does NOT
+/// guarantee (equal-logit ties are common with f16 logits). Use this for
+/// greedy lanes in a host-sampled batch. Returns 0 with the error state set
+/// on invalid arguments.
+uint32_t baseRT_argmax_logits_row(baseRT_model_t model, const void *row);
+
+/// Log-softmax over one logits row: writes the chosen token's logprob to
+/// *out_token_logprob and the top `top_k` alternatives (ids + logprobs,
+/// descending) to out_ids/out_logprobs, which must hold top_k entries.
+/// top_k = 0 computes only the chosen token's logprob. Returns the number of
+/// alternatives written, or < 0 with the error state set on invalid
+/// arguments.
+int baseRT_logits_row_logprobs(baseRT_model_t model, const void *row, uint32_t token, int top_k,
+                               float *out_token_logprob, uint32_t *out_ids, float *out_logprobs);
+
 // === Prefix cache — scheduler-driven primitives ===
 //
 // A scheduler (e.g. the continuous-batching BatchEngine) reuses the KV of a
@@ -507,8 +586,11 @@ BaseRTPrefixMatch baseRT_prefix_match(baseRT_model_t model, const uint32_t *toke
 
 /// Seed a freshly-created, empty sequence with the shared blocks from a match
 /// so it reuses their KV instead of re-prefilling. `n_tokens` must equal
-/// `n_blocks * page_size`. Returns BASERT_OK, or an error if the model isn't
-/// paged / the sequence isn't empty.
+/// `n_blocks * page_size`. An empty match (n_blocks == 0 && n_tokens == 0) is
+/// a successful no-op; any other zero/null combination is rejected with
+/// BASERT_ERR_INVALID_ARGUMENT (nothing was adopted — release the match).
+/// Returns BASERT_OK, or an error if the model isn't paged / the sequence
+/// isn't empty.
 int baseRT_sequence_seed_prefix(baseRT_sequence_t seq, const int *blocks, int n_blocks, int n_tokens);
 
 /// Paged-KV block (page) size in tokens for this model, or 0 when the model
@@ -634,7 +716,8 @@ BaseRTGenerationStats baseRT_generate_grammar_continue(baseRT_model_t model, con
 /// Runs each layer in its own command buffer for accurate GPU timing.
 /// Much slower than normal decode — use only for profiling.
 /// timing_out: array of (n_layers + 3) floats [embedding, norm, layer0..N-1, logit, argmax]
-/// Returns number of timing entries written.
+/// Returns number of timing entries written, or -1 on a failed step
+/// (details via baseRT_get_error).
 int baseRT_profile_decode_step(baseRT_model_t model, uint32_t token_id, int position, float *timing_out,
                                int max_entries);
 
@@ -936,10 +1019,7 @@ const char *baseRT_eos_token(baseRT_model_t model);
 /// other token-id consumers stop on). Returns 0 on a null handle.
 uint32_t baseRT_eos_token_id(baseRT_model_t model);
 
-/// Max prompt tokens the fused (varlen) prefill can process in one packed batch.
-/// The continuous-batching engine caps per-tick admitted prompt tokens by this
-/// so a burst of long prompts doesn't overflow the packed prefill. 0 on null.
-int baseRT_max_prefill_chunk(baseRT_model_t model);
+// (baseRT_max_prefill_chunk is declared once, with the batched-decode API.)
 
 // === Token counting ===
 
@@ -981,6 +1061,54 @@ const char *baseRT_transcribe_stream(baseRT_model_t model, const char *wav_path,
 /// When enabled (default): produces [start --> end] text segments with seeking.
 /// When disabled: faster greedy decode, plain text output.
 void baseRT_set_timestamps(baseRT_model_t model, bool enabled);
+
+/// Set the Whisper task: "transcribe" (default) or "translate" (any-to-English).
+/// NULL resets to "transcribe". Returns false (with baseRT_get_error set) on an
+/// unknown task string, or on "translate" with an English-only model.
+bool baseRT_set_task(baseRT_model_t model, const char *task);
+
+/// Set an initial prompt for Whisper transcription (reference `initial_prompt`):
+/// tokenized and fed after <|startofprev|> ahead of the first window's prompt,
+/// biasing the decode (names, spellings, style). NULL or "" clears it.
+/// On models whose tokenizer cannot encode text (legacy GGML whisper files
+/// without BPE merges) the prompt is ignored with a warning at transcribe time.
+void baseRT_set_initial_prompt(baseRT_model_t model, const char *text);
+
+/// condition_on_previous_text (default true, reference semantics): feed each
+/// window the previous windows' decoded text after <|startofprev|>. Disable if
+/// the model gets stuck in repetition loops on your audio.
+void baseRT_set_condition_on_previous_text(baseRT_model_t model, bool enabled);
+
+/// Language code of the LAST transcription: the detected code when the request
+/// language was NULL/""/"auto", otherwise the requested code. Empty string if
+/// no transcription has run. Valid until the next transcription or model free.
+const char *baseRT_transcribe_language(baseRT_model_t model);
+
+/// Duration of the LAST transcription's source audio, in milliseconds
+/// (n_samples at 16 kHz — the OpenAI verbose_json `duration` field is this
+/// value in fractional seconds). 0 if no transcription has run.
+int baseRT_transcribe_audio_duration_ms(baseRT_model_t model);
+
+/// Per-segment metadata for the LAST transcription (verbose_json surface).
+/// avg_logprob / no_speech_prob / compression_ratio / temperature are
+/// window-level values applied to every segment decoded in that 30 s window
+/// (the reference computes them per-decode-result; window-level is this
+/// engine's documented approximation for chain-decoded tokens).
+typedef struct {
+    int start_ms;
+    int end_ms;
+    const char *text;  // valid until the next transcription or model free
+    float avg_logprob;
+    float no_speech_prob;
+    float compression_ratio;
+    float temperature;
+} BaseRTTranscribeSegment;
+
+/// Number of segments produced by the last transcription (0 if none).
+int baseRT_transcribe_segment_count(baseRT_model_t model);
+
+/// Fetch one segment of the last transcription. Returns false on bad index.
+bool baseRT_transcribe_segment(baseRT_model_t model, int index, BaseRTTranscribeSegment *out);
 
 /// Check if loaded model is a Whisper model.
 bool baseRT_is_whisper(baseRT_model_t model);

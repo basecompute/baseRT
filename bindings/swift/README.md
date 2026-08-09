@@ -61,12 +61,12 @@ print("engine \(BaseRTEngine.version)")
 let model = try BaseRTModel(modelPath: "models/Qwen3-0.6B-Q4_0.base")
 
 // Check model info
-print("Architecture: \(model.config.architecture)")
-print("Memory: \(model.memoryUsage / 1_048_576) MB")
+print("Architecture: \(try model.config.architecture)")
+print("Memory: \(try model.memoryUsage / 1_048_576) MB")
 
 // Encode and generate
 let tokens = try model.encode(text: "Once upon a time")
-let stats = model.generate(tokens: tokens, maxTokens: 256) { token in
+let stats = try model.generate(tokens: tokens, maxTokens: 256) { token in
     print(token.text, terminator: "")
     return true  // return false to stop early
 }
@@ -84,7 +84,7 @@ let sampling = SamplingConfig(
     repeatPenalty: 1.1
 )
 
-model.generate(tokens: tokens, maxTokens: 512, sampling: sampling) { token in
+try model.generate(tokens: tokens, maxTokens: 512, sampling: sampling) { token in
     print(token.text, terminator: "")
     return true
 }
@@ -95,14 +95,14 @@ model.generate(tokens: tokens, maxTokens: 512, sampling: sampling) { token in
 ```swift
 // First turn
 let turn1 = try model.encode(text: "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n")
-model.generate(tokens: turn1, maxTokens: 256) { token in
+try model.generate(tokens: turn1, maxTokens: 256) { token in
     print(token.text, terminator: "")
     return true
 }
 
 // Continue from existing KV cache
 let turn2 = try model.encode(text: "<|im_end|>\n<|im_start|>user\nTell me more.<|im_end|>\n<|im_start|>assistant\n")
-model.generateContinue(tokens: turn2, maxTokens: 256) { token in
+try model.generateContinue(tokens: turn2, maxTokens: 256) { token in
     print(token.text, terminator: "")
     return true
 }
@@ -129,7 +129,7 @@ print(text)
 print("Took \(stats.totalMs)ms")
 
 // Disable timestamps for faster plain-text output
-whisper.setTimestamps(enabled: false)
+try whisper.setTimestamps(enabled: false)
 let (plainText, _) = try whisper.transcribe(wavPath: "audio.wav")
 print(plainText)
 
@@ -142,23 +142,34 @@ let (pcmText, pcmStats) = try whisper.transcribePCM(samples: samples)
 
 ```swift
 // Manual prefill + decode loop
-let firstToken = model.prefill(tokens: tokens)
+let firstToken = try model.prefill(tokens: tokens)
 var tok = firstToken
 for pos in tokens.count..<(tokens.count + 100) {
-    tok = model.decodeStep(tokenID: tok, position: pos)
-    print(model.decodeToken(tok), terminator: "")
+    tok = try model.decodeStep(tokenID: tok, position: pos)
+    print(try model.decodeToken(tok), terminator: "")
 }
 
 // Reset state for a new conversation
-model.reset()
+try model.reset()
 ```
+
+> Model APIs throw `BaseRTError.reentrantModelCall` if invoked from within a
+> generation/transcription callback (`onToken` / `onSegment`) **on the same
+> thread** — the native handle is exclusively busy for the callback's duration,
+> so the re-entrant call is rejected instead of corrupting state, and generation
+> continues past it. This guard is thread-local: if a callback instead hands work
+> **synchronously to another thread** that then calls the model (e.g.
+> `DispatchQueue.main.sync { try model.position }`), that call blocks on the busy
+> handle and can **deadlock**. That pattern violates the single-owner contract
+> (the handle is genuinely busy); do not call model APIs from a different thread
+> a callback is synchronously waiting on.
 
 ### Model Inspection
 
 ```swift
-for i in 0..<model.tensorCount {
-    if let name = model.tensorName(at: i) {
-        print("\(name): dtype=\(model.tensorDtype(at: i))")
+for i in 0..<(try model.tensorCount) {
+    if let name = try model.tensorName(at: i) {
+        print("\(name): dtype=\(try model.tensorDtype(at: i))")
     }
 }
 ```

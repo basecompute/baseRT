@@ -139,6 +139,27 @@ impl Default for SamplingConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Transcription segments
+// ---------------------------------------------------------------------------
+
+/// One segment of the last transcription (verbose_json surface), with the
+/// text copied into owned memory.
+///
+/// `avg_logprob` / `no_speech_prob` / `compression_ratio` / `temperature`
+/// are window-level values applied to every segment decoded in that 30 s
+/// window (the engine's documented approximation).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscribeSegment {
+    pub start_ms: i32,
+    pub end_ms: i32,
+    pub text: String,
+    pub avg_logprob: f32,
+    pub no_speech_prob: f32,
+    pub compression_ratio: f32,
+    pub temperature: f32,
+}
+
+// ---------------------------------------------------------------------------
 // Helper: read last error from C API
 // ---------------------------------------------------------------------------
 
@@ -284,7 +305,7 @@ impl Model {
     where
         F: FnMut(u32, &str) -> bool,
     {
-        let mut cb = CallbackWrapper { func: callback };
+        let mut cb = CallbackWrapper { func: callback, panic: None };
         let user_data = &mut cb as *mut CallbackWrapper<F> as *mut c_void;
 
         // Hold `_toks` / `_vals` alive across the FFI call — `ffi` carries
@@ -302,6 +323,9 @@ impl Model {
             )
         };
 
+        if let Some(payload) = cb.panic.take() {
+            std::panic::resume_unwind(payload);
+        }
         Ok(stats)
     }
 
@@ -318,7 +342,7 @@ impl Model {
     where
         F: FnMut(u32, &str) -> bool,
     {
-        let mut cb = CallbackWrapper { func: callback };
+        let mut cb = CallbackWrapper { func: callback, panic: None };
         let user_data = &mut cb as *mut CallbackWrapper<F> as *mut c_void;
 
         let (ffi, _toks, _vals) = sampling.to_ffi();
@@ -334,6 +358,9 @@ impl Model {
             )
         };
 
+        if let Some(payload) = cb.panic.take() {
+            std::panic::resume_unwind(payload);
+        }
         Ok(stats)
     }
 
@@ -478,7 +505,7 @@ impl Model {
         let lang_ptr = c_lang.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
 
         let mut stats = baseRT_sys::BaseRTTranscribeStats::default();
-        let mut wrapper = SegmentCallbackWrapper { func: &mut callback };
+        let mut wrapper = SegmentCallbackWrapper { func: &mut callback, panic: None };
         let user_data = &mut wrapper as *mut SegmentCallbackWrapper<F> as *mut c_void;
 
         let ptr = unsafe {
@@ -492,6 +519,9 @@ impl Model {
             )
         };
 
+        if let Some(payload) = wrapper.panic.take() {
+            std::panic::resume_unwind(payload);
+        }
         if ptr.is_null() {
             return Err(Error::Api(last_error()));
         }
@@ -514,7 +544,7 @@ impl Model {
         let lang_ptr = c_lang.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
 
         let mut stats = baseRT_sys::BaseRTTranscribeStats::default();
-        let mut wrapper = SegmentCallbackWrapper { func: &mut callback };
+        let mut wrapper = SegmentCallbackWrapper { func: &mut callback, panic: None };
         let user_data = &mut wrapper as *mut SegmentCallbackWrapper<F> as *mut c_void;
 
         let ptr = unsafe {
@@ -529,6 +559,9 @@ impl Model {
             )
         };
 
+        if let Some(payload) = wrapper.panic.take() {
+            std::panic::resume_unwind(payload);
+        }
         if ptr.is_null() {
             return Err(Error::Api(last_error()));
         }
@@ -540,6 +573,83 @@ impl Model {
     /// Enable or disable timestamp generation for Whisper transcription.
     pub fn set_timestamps(&self, enabled: bool) {
         unsafe { baseRT_sys::baseRT_set_timestamps(self.handle, enabled) }
+    }
+
+    /// Set the Whisper task: "transcribe" (default) or "translate".
+    ///
+    /// Errors on an unknown task or on "translate" with an English-only model.
+    pub fn set_task(&self, task: &str) -> Result<()> {
+        let c_task = CString::new(task).map_err(|_| Error::Api("task contains NUL".into()))?;
+        let ok = unsafe { baseRT_sys::baseRT_set_task(self.handle, c_task.as_ptr()) };
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::Api(last_error()))
+        }
+    }
+
+    /// Set an initial prompt to bias Whisper decoding (`None` clears it).
+    pub fn set_initial_prompt(&self, text: Option<&str>) -> Result<()> {
+        match text {
+            Some(t) => {
+                let c_text = CString::new(t).map_err(|_| Error::Api("prompt contains NUL".into()))?;
+                unsafe { baseRT_sys::baseRT_set_initial_prompt(self.handle, c_text.as_ptr()) };
+            }
+            None => unsafe { baseRT_sys::baseRT_set_initial_prompt(self.handle, std::ptr::null()) },
+        }
+        Ok(())
+    }
+
+    /// Condition each 30s window on previous decoded text (default true).
+    pub fn set_condition_on_previous_text(&self, enabled: bool) {
+        unsafe { baseRT_sys::baseRT_set_condition_on_previous_text(self.handle, enabled) }
+    }
+
+    /// Language code of the last transcription (detected or requested).
+    pub fn transcribe_language(&self) -> String {
+        let ptr = unsafe { baseRT_sys::baseRT_transcribe_language(self.handle) };
+        if ptr.is_null() {
+            return String::new();
+        }
+        unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+    }
+
+    /// Duration of the last transcription's source audio in milliseconds
+    /// (the OpenAI verbose_json `duration` field is this value in
+    /// fractional seconds). 0 if no transcription has run.
+    pub fn transcribe_audio_duration_ms(&self) -> i32 {
+        unsafe { baseRT_sys::baseRT_transcribe_audio_duration_ms(self.handle) }
+    }
+
+    /// Per-segment metadata for the last transcription (verbose_json
+    /// surface). Empty if no transcription has run. Segment text is copied
+    /// out, so the returned segments stay valid after later transcriptions.
+    pub fn transcribe_segments(&self) -> Vec<TranscribeSegment> {
+        let n = unsafe { baseRT_sys::baseRT_transcribe_segment_count(self.handle) };
+        let mut segments = Vec::with_capacity(n.max(0) as usize);
+        for i in 0..n {
+            let mut seg = baseRT_sys::BaseRTTranscribeSegment::default();
+            if !unsafe { baseRT_sys::baseRT_transcribe_segment(self.handle, i, &mut seg) } {
+                break;
+            }
+            let text = if seg.text.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(seg.text) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            segments.push(TranscribeSegment {
+                start_ms: seg.start_ms,
+                end_ms: seg.end_ms,
+                text,
+                avg_logprob: seg.avg_logprob,
+                no_speech_prob: seg.no_speech_prob,
+                compression_ratio: seg.compression_ratio,
+                temperature: seg.temperature,
+            });
+        }
+        segments
     }
 
     // === Embeddings ===
@@ -708,10 +818,17 @@ impl<'a> ExactSizeIterator for TensorIter<'a> {}
 
 struct CallbackWrapper<F> {
     func: F,
+    /// Panic payload captured in the trampoline. Unwinding across the
+    /// `extern "C"` boundary would abort the process, so the trampoline
+    /// stashes it here and the caller resumes it once the FFI call has
+    /// returned to safe Rust.
+    panic: Option<Box<dyn std::any::Any + Send>>,
 }
 
 struct SegmentCallbackWrapper<'a, F> {
     func: &'a mut F,
+    /// See [`CallbackWrapper::panic`].
+    panic: Option<Box<dyn std::any::Any + Send>>,
 }
 
 unsafe extern "C" fn trampoline<F>(
@@ -723,12 +840,24 @@ where
     F: FnMut(u32, &str) -> bool,
 {
     let wrapper = &mut *(user_data as *mut CallbackWrapper<F>);
+    if wrapper.panic.is_some() {
+        // A previous invocation panicked; keep telling the engine to stop.
+        return false;
+    }
     let text_str = if text.is_null() {
         ""
     } else {
         CStr::from_ptr(text).to_str().unwrap_or("")
     };
-    (wrapper.func)(token_id, text_str)
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (wrapper.func)(token_id, text_str)
+    })) {
+        Ok(keep_going) => keep_going,
+        Err(payload) => {
+            wrapper.panic = Some(payload);
+            false // stop generation so control returns to safe Rust
+        }
+    }
 }
 
 unsafe extern "C" fn segment_trampoline<F>(
@@ -741,12 +870,23 @@ where
     F: FnMut(i32, i32, &str) -> bool,
 {
     let wrapper = &mut *(user_data as *mut SegmentCallbackWrapper<F>);
+    if wrapper.panic.is_some() {
+        return false;
+    }
     let text_str = if text.is_null() {
         ""
     } else {
         CStr::from_ptr(text).to_str().unwrap_or("")
     };
-    (wrapper.func)(start_ms, end_ms, text_str)
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (wrapper.func)(start_ms, end_ms, text_str)
+    })) {
+        Ok(keep_going) => keep_going,
+        Err(payload) => {
+            wrapper.panic = Some(payload);
+            false // stop transcription so control returns to safe Rust
+        }
+    }
 }
 
 #[cfg(test)]
