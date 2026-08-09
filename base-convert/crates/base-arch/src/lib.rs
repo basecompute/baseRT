@@ -11,6 +11,7 @@ pub mod gemma;
 pub mod llama;
 pub mod qwen;
 pub mod tokenizer;
+pub mod whisper;
 
 /// What a converter needs to produce one layer's worth of canonical
 /// tensor names + fuse/route them into the `.base` writer.
@@ -119,6 +120,13 @@ pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMappe
         // text conversion skips like any other non-text tower. Config is
         // gemma4-shaped (uniform head_dim, rope_parameters, layer_types).
         "gemma4" | "gemma4_text" | "gemma4_unified" => Some(&gemma::Gemma4HfMapper),
+        // Whisper encoder-decoder speech models (openai/whisper-*). HF
+        // safetensors only — whisper GGML files are not GGUF, so the GGUF
+        // dispatch table stays untouched. Tensor renaming is
+        // whisper-specific (`whisper::map_hf_tensor_name`); the convert
+        // path emits everything as f16 (the engine's fused whisper
+        // kernels are f16-only in v1).
+        "whisper" => Some(&whisper::WhisperHfMapper),
         _ => None,
     }
 }
@@ -148,6 +156,7 @@ pub const SUPPORTED_HF_MODEL_TYPES: &[&str] = &[
     "gemma4",
     "gemma4_text",
     "gemma4_unified",
+    "whisper",
 ];
 
 pub trait GgufMapper: Sync {
@@ -299,6 +308,29 @@ pub struct ArchConfig {
     /// mRoPE interleaves the section frequencies rather than
     /// concatenating them (Qwen3.5 = true).
     pub mrope_interleaved: bool,
+
+    // ── Whisper encoder-decoder fields (zero/empty for other archs) ──
+    // The decoder half reuses the standard fields above (hidden_size /
+    // num_hidden_layers / num_attention_heads / intermediate_size /
+    // max_position_embeddings); the encoder half is described here.
+    /// Encoder transformer depth (`encoder_layers`). 0 = not an
+    /// encoder-decoder model.
+    pub encoder_layers: u32,
+    /// Encoder attention head count (`encoder_attention_heads`).
+    pub encoder_attention_heads: u32,
+    /// Encoder FFN width (`encoder_ffn_dim`).
+    pub encoder_ffn_dim: u32,
+    /// Decoder FFN width (`decoder_ffn_dim`). Mirrors
+    /// `intermediate_size`; emitted under its HF name so the runtime's
+    /// whisper config parser reads the contract key directly.
+    pub decoder_ffn_dim: u32,
+    /// Mel filterbank bin count (`num_mel_bins`, 80 or 128). The engine
+    /// computes the Slaney filterbank from this — it is not stored.
+    pub num_mel_bins: u32,
+    /// Encoder positional-embedding length (`max_source_positions`, 1500).
+    pub max_source_positions: u32,
+    /// Decoder positional-embedding length (`max_target_positions`, 448).
+    pub max_target_positions: u32,
 }
 
 impl ArchConfig {
@@ -470,6 +502,34 @@ impl ArchConfig {
         if !self.mrope_section.is_empty() {
             m.insert("mrope_section".into(), json!(self.mrope_section));
             m.insert("mrope_interleaved".into(), json!(self.mrope_interleaved));
+        }
+        // Whisper encoder-decoder fields — only emit when the encoder
+        // half is populated so decoder-only archs' headers stay tidy.
+        if self.encoder_layers > 0 {
+            m.insert("model_type".into(), json!("whisper"));
+            m.insert("encoder_layers".into(), json!(self.encoder_layers));
+            m.insert(
+                "encoder_attention_heads".into(),
+                json!(self.encoder_attention_heads),
+            );
+            m.insert("encoder_ffn_dim".into(), json!(self.encoder_ffn_dim));
+            m.insert("decoder_ffn_dim".into(), json!(self.decoder_ffn_dim));
+            // Whisper's encoder width equals the decoder width; emit the
+            // HF `d_model` key the runtime's whisper config parser reads.
+            m.insert("d_model".into(), json!(self.hidden_size));
+            m.insert("num_mel_bins".into(), json!(self.num_mel_bins));
+            m.insert(
+                "max_source_positions".into(),
+                json!(self.max_source_positions),
+            );
+            m.insert(
+                "max_target_positions".into(),
+                json!(self.max_target_positions),
+            );
+            // Whisper uses LayerNorm, not RMSNorm; the contract key is
+            // `norm_eps` (rms_norm_eps above carries the same value for
+            // struct-level uniformity).
+            m.insert("norm_eps".into(), json!(self.rms_norm_eps));
         }
         m
     }

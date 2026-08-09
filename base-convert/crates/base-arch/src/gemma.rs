@@ -430,7 +430,49 @@ impl GgufMapper for Gemma3Mapper {
         } else {
             "gemma"
         };
-        extract_config(m, prefix)
+        let mut config = extract_config(m, prefix)?;
+
+        // Gemma 3 interleaves 5 sliding-window layers per 1 global layer, and
+        // the SWA layers use their OWN rope theta (10000) while global layers
+        // use `rope.freq_base` (1e6). `extract_config` is shared with gemma/
+        // gemma2 and reads neither, so a GGUF-sourced bundle came out with
+        // sliding_window = 0 and rope_local_theta = 0 — i.e. FULL attention at
+        // the global theta on every layer.
+        //
+        // That is silent and severe: greedy generation still looks fine
+        // (argmax is robust and recent context dominates) but teacher-forced
+        // NLL was +2.15 nats vs the HF reference, PPL 168 where converting the
+        // same weights from safetensors gives 19.4 against HF's 19.6.
+        //
+        // gemma3-only: gemma2's window/pattern differ and it has no local
+        // theta, so the fallback prefixes must keep the old behaviour.
+        if prefix == "gemma3" {
+            let u32_key = |k: &str| match m.get(k) {
+                Some(KvValue::U32(v)) => Some(*v),
+                Some(KvValue::U64(v)) => Some(*v as u32),
+                _ => None,
+            };
+            let f32_key = |k: &str| m.get(k).and_then(|v| v.as_f32());
+            // Window size is model-dependent (512 on 1B, 1024 on 4B/12B/27B)
+            // and IS exported — read it rather than assuming.
+            config.sliding_window = u32_key(&format!("{prefix}.attention.sliding_window"))
+                .unwrap_or(config.sliding_window);
+            // Pattern and local theta are Gemma-3 architecture constants that
+            // llama.cpp bakes in and does not export. Prefer a key if a future
+            // exporter adds one; otherwise fall back to the constants, which
+            // match every published gemma-3 config.json.
+            if config.sliding_window > 0 {
+                if config.sliding_window_pattern == 0 {
+                    config.sliding_window_pattern =
+                        u32_key(&format!("{prefix}.attention.sliding_window_pattern")).unwrap_or(6);
+                }
+                if config.rope_local_theta == 0.0 {
+                    config.rope_local_theta =
+                        f32_key(&format!("{prefix}.rope.local.freq_base")).unwrap_or(10_000.0);
+                }
+            }
+        }
+        Ok(config)
     }
 
     fn map_tensor_name(&self, n: &str) -> Option<String> {
@@ -905,6 +947,65 @@ mod tests {
     /// Mirrors the suffix predicate in `convert_hf_to_gguf.py`'s
     /// `Gemma3Model.norm_shift`. Embeddings, projections, and biases
     /// (1-D non-norm) are unaffected.
+    /// A GGUF-sourced gemma-3 bundle must carry the sliding-window config.
+    ///
+    /// `extract_config` is shared with gemma/gemma2 and reads none of these, so
+    /// the mapper used to emit sliding_window = 0 / rope_local_theta = 0 —
+    /// FULL attention at the global theta on all 26 layers. It is silent
+    /// (greedy output still reads fine) but measured +2.15 nats of
+    /// teacher-forced NLL vs the HF reference: PPL 168 from GGUF where the same
+    /// weights converted from safetensors give 19.4 against HF's 19.6.
+    ///
+    /// Window size IS exported and varies by size (512 on 1B, 1024 on 4B+), so
+    /// it must be read, not assumed. Pattern (6) and local theta (10000) are
+    /// architecture constants llama.cpp bakes in and does not export.
+    #[test]
+    fn gemma3_gguf_carries_sliding_window_config() {
+        let mut g: BTreeMap<String, KvValue> = BTreeMap::new();
+        // Exactly the keys gemma-3-1b-it-Q8_0.gguf exports.
+        g.insert("gemma3.embedding_length".into(), KvValue::U32(1152));
+        g.insert("gemma3.block_count".into(), KvValue::U32(26));
+        g.insert("gemma3.attention.head_count".into(), KvValue::U32(4));
+        g.insert("gemma3.attention.head_count_kv".into(), KvValue::U32(1));
+        g.insert("gemma3.attention.key_length".into(), KvValue::U32(256));
+        g.insert("gemma3.attention.value_length".into(), KvValue::U32(256));
+        g.insert("gemma3.feed_forward_length".into(), KvValue::U32(6912));
+        g.insert("gemma3.attention.layer_norm_rms_epsilon".into(), KvValue::F32(1e-6));
+        g.insert("gemma3.rope.freq_base".into(), KvValue::F32(1_000_000.0));
+        g.insert("gemma3.vocab_size".into(), KvValue::U32(262144));
+        g.insert("gemma3.attention.sliding_window".into(), KvValue::U32(512));
+
+        let c = Gemma3Mapper.config_from_gguf(&g).unwrap();
+        assert_eq!(c.sliding_window, 512, "read from the GGUF, not assumed");
+        assert_eq!(c.sliding_window_pattern, 6, "5 SWA : 1 global");
+        assert_eq!(c.rope_local_theta, 10_000.0, "SWA layers use their own theta");
+        assert_eq!(c.rope_theta, 1_000_000.0, "global layers keep freq_base");
+
+        // 4B/12B/27B ship a 1024 window — the value must track the file.
+        g.insert("gemma3.attention.sliding_window".into(), KvValue::U32(1024));
+        assert_eq!(Gemma3Mapper.config_from_gguf(&g).unwrap().sliding_window, 1024);
+    }
+
+    /// The gemma3 defaults must NOT leak onto the gemma2/gemma fallback
+    /// prefixes the same mapper accepts — their window and pattern differ and
+    /// they have no local theta at all.
+    #[test]
+    fn gemma2_gguf_keeps_legacy_behaviour() {
+        let mut g: BTreeMap<String, KvValue> = BTreeMap::new();
+        g.insert("gemma2.embedding_length".into(), KvValue::U32(2304));
+        g.insert("gemma2.block_count".into(), KvValue::U32(26));
+        g.insert("gemma2.attention.head_count".into(), KvValue::U32(8));
+        g.insert("gemma2.attention.head_count_kv".into(), KvValue::U32(4));
+        g.insert("gemma2.feed_forward_length".into(), KvValue::U32(9216));
+        g.insert("gemma2.attention.layer_norm_rms_epsilon".into(), KvValue::F32(1e-6));
+        g.insert("gemma2.vocab_size".into(), KvValue::U32(256000));
+        g.insert("gemma2.attention.sliding_window".into(), KvValue::U32(4096));
+
+        let c = Gemma3Mapper.config_from_gguf(&g).unwrap();
+        assert_eq!(c.sliding_window_pattern, 0, "no gemma3 pattern on gemma2");
+        assert_eq!(c.rope_local_theta, 0.0, "no gemma3 local theta on gemma2");
+    }
+
     #[test]
     fn gemma3_norm_shift_predicate() {
         let m = Gemma3HfMapper;

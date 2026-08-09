@@ -1,0 +1,125 @@
+{
+  "name": "dense-q4mix-cuda",
+  "arch": "*",
+  "_comment": "CUDA-loadable dense q4mix (bf16 scales). Same as dense-q4mix but the input embedding is base_q6, not base_q4: CUDA routes q4 embeddings to `embedding_lookup_q4_sbf16` which does not exist on the CUDA backend (q5/q6/q8 route to the generic `embedding_lookup_generic_sbf16`, which does) \u2014 a q4-embed bundle loads on Metal but fails on CUDA with 'no function named embedding_lookup_q4_sbf16'. lm_head stays q8. RTN (no AWQ calib) to match the qwen cuda-q4mix bundles.",
+  "rules": [
+    {
+      "pattern": "model.embed_tokens.weight",
+      "dtype": "base_q6",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "embed_tokens.weight",
+      "dtype": "base_q6",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "**.input_layernorm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.input_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.post_attention_layernorm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.post_attn_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.q_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.k_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.attn_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.ffn_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.pre_feedforward_layernorm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.post_feedforward_layernorm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.pre_ffw_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.post_ffw_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.post_attn_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.per_layer_post_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "model.norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "final_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "output_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.{q,k,v,o}_proj.weight",
+      "dtype": "base_q4",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "**.mlp.{gate,up,down}_proj.weight",
+      "dtype": "base_q4",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "lm_head.weight",
+      "dtype": "base_q8",
+      "scale_dtype": "bf16",
+      "group_size": 128
+    },
+    {
+      "pattern": "output.weight",
+      "dtype": "base_q8",
+      "scale_dtype": "bf16",
+      "group_size": 128
+    },
+    {
+      "pattern": "**.post_attention_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.weight",
+      "dtype": "base_q4",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "**.bias",
+      "dtype": "f16"
+    }
+  ]
+}

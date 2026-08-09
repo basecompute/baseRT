@@ -446,6 +446,7 @@ fn convert_gguf(
         config: ModelConfig {
             fields: config.to_config_map(),
         },
+        metadata: Default::default(),
         target_backend: TargetBackend::Metal,
         quant_profile: ctx.profile_name().unwrap_or("").to_string(),
         alignment: AlignmentConfig::default(),
@@ -771,6 +772,13 @@ fn convert_hf(
     let mapper = hf_mapper_for_model_type(model_type)
         .ok_or_else(|| anyhow::anyhow!("HF model_type {:?} not supported yet", model_type))?;
     let config = mapper.config_from_hf(&hf.config)?;
+    // Whisper is an encoder-decoder speech model with its own
+    // engine-native tensor naming, flat `whisper.*` token metadata, and
+    // an all-f16 tensor policy — none of which fit the decoder-only
+    // quantize path below. Dedicated path.
+    if mapper.canonical_arch() == "whisper" {
+        return convert_whisper(input, output, ctx, &hf, config);
+    }
     eprintln!(
         "  config:  hidden={}, layers={}, heads={}/{}, ffn={}, vocab={}",
         config.hidden_size,
@@ -849,6 +857,385 @@ fn convert_hf(
         &|n| mapper.norm_shift(n),
         &|n| mapper.rope_permute_heads(n, &config_for_permute),
     )
+}
+
+/// Convert an HF whisper safetensors directory to `.base`.
+///
+/// Whisper diverges from the decoder-only path on every axis that
+/// matters, so it gets its own writer loop:
+///
+/// - Tensor names map to the engine-native whisper convention
+///   (`encoder.blocks.N.attn.query.weight`, …) via
+///   `base_arch::whisper::map_hf_tensor_name`.
+/// - Default (no `--profile`): EVERY tensor is written as raw f16 (f32
+///   sources converted at write time) — the committed f16 bundle
+///   behavior. With a quant profile (`profiles/whisper-q8.json` /
+///   `whisper-q4.json`) ONLY the 2-D block linear projections
+///   (`whisper::is_quantizable_linear`: attn/cross_attn
+///   query/key/value/out + mlp.0/mlp.2, encoder and decoder) are packed
+///   at the profile's canonical scheme ([W | scales | biases], same
+///   layout as LLM tensors); conv1/conv2, positional embeddings,
+///   token_embedding, norms and biases stay f16 regardless of the
+///   profile's catch-alls. A bare `--target` is NOT honored: its
+///   default (base-q4) is indistinguishable from an explicit request,
+///   and the default whisper conversion must stay f16.
+/// - `proj_out` / `lm_head` is tied to `decoder.token_embedding.weight`
+///   (dropped by the name mapper; header carries TIED_EMBEDDINGS).
+/// - Flat `whisper.*` special-token metadata is derived from the repo's
+///   `tokenizer.json` added_tokens (exact IDs, never a vocab-size
+///   table), and the tokenizer.json is embedded verbatim.
+/// - Conversion fails loud when any contract-required tensor (derived
+///   from the config's encoder/decoder depths) is missing, or when the
+///   tokenizer lacks `<|startoftranscript|>`.
+fn convert_whisper(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    ctx: &QuantContext,
+    hf: &base_readers::hf::HfDir,
+    config: base_arch::ArchConfig,
+) -> Result<()> {
+    use base_arch::whisper;
+    use base_format::{
+        AlignmentConfig, BaseReader, BaseWriter, ComputeRegion, Header, HeaderFlags,
+        LayerDescriptor, LayerKind, LayerPrecision, ModelConfig, QuantScheme, ResidencyHint,
+        SourceInfo, TargetBackend, TensorDtype, TensorFlags, TensorPayload, TokenizerBlob,
+    };
+
+    eprintln!(
+        "  config:  d_model={}, enc_layers={}, dec_layers={}, heads={}, mels={}, vocab={}",
+        config.hidden_size,
+        config.encoder_layers,
+        config.num_hidden_layers,
+        config.num_attention_heads,
+        config.num_mel_bins,
+        config.vocab_size
+    );
+    if ctx.profile.is_none() && !matches!(ctx.target, TargetScheme::BaseQ4) {
+        eprintln!(
+            "  note:    whisper quantization is profile-driven; a bare --target is \
+             ignored (its default is indistinguishable from an explicit request, and \
+             the default whisper conversion stays f16). Pass --profile \
+             profiles/whisper-q8.json (or whisper-q4.json). Writing f16."
+        );
+    }
+
+    // Special-token metadata — hard requirement. A whisper bundle
+    // without exact token ids mis-transcribes silently (the historic
+    // vocab-size-table bug), so no tokenizer.json = no conversion.
+    let tokenizer_json = hf
+        .tokenizer_json
+        .as_ref()
+        .context("whisper: model dir has no tokenizer.json (required for whisper.* token metadata)")?;
+    let mut metadata = whisper::token_metadata_from_tokenizer(tokenizer_json, config.vocab_size as i64)?;
+    // large-v3-turbo distillation dropped the translation task; record it so
+    // the runtime rejects task=translate instead of silently emitting
+    // source-language text (see whisper::supports_translate for the config
+    // heuristic). 1 for every non-turbo checkpoint.
+    let translate_ok = whisper::supports_translate(&config);
+    metadata.insert(
+        "whisper.supports_translate".to_string(),
+        serde_json::Value::from(translate_ok as i64),
+    );
+    eprintln!(
+        "  tokens:  sot={} eot={} langs={} multilingual={} translate={}",
+        metadata["whisper.sot_token_id"],
+        metadata["whisper.eot_token_id"],
+        metadata["whisper.num_languages"],
+        metadata["whisper.is_multilingual"],
+        metadata["whisper.supports_translate"],
+    );
+
+    // Map source names → engine-native whisper names.
+    let mut mapped: Vec<(String, String)> = Vec::new();
+    let mut dropped = 0usize;
+    for n in hf.tensor_names() {
+        match whisper::map_hf_tensor_name(n) {
+            Some(c) => mapped.push((n.to_string(), c)),
+            None => {
+                // The only silently-droppable payload tensor is a key-
+                // projection bias, and only because whisper's k_proj is
+                // bias-free by construction (HF declares bias=False).
+                // A nonstandard export could materialize a NONZERO one —
+                // dropping that would silently change attention outputs.
+                if n.ends_with("k_proj.bias") {
+                    let f32s = hf
+                        .tensor_to_f32(n)
+                        .with_context(|| format!("reading {n} for the zero check"))?;
+                    if f32s.iter().any(|v| *v != 0.0) {
+                        bail!(
+                            "whisper: source ships a NONZERO {n} — the engine's attention \
+                             has no k-bias input, so converting would silently change \
+                             outputs. This checkpoint is not a standard whisper export."
+                        );
+                    }
+                }
+                dropped += 1;
+            }
+        }
+    }
+    eprintln!("  mapped:  {} tensors kept, {} dropped", mapped.len(), dropped);
+
+    // Sanity guard: every contract-required tensor must be present.
+    let have: std::collections::BTreeSet<&str> =
+        mapped.iter().map(|(_, c)| c.as_str()).collect();
+    let missing: Vec<String> = whisper::required_tensor_names(&config)
+        .into_iter()
+        .filter(|t| !have.contains(t.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "whisper: source is missing {} contract-required tensor(s): {}{}",
+            missing.len(),
+            missing[..missing.len().min(10)].join(", "),
+            if missing.len() > 10 { ", …" } else { "" }
+        );
+    }
+
+    // Per-tensor quant plan. Whisper quantization is profile-driven and
+    // touches ONLY the 2-D block linear projections
+    // (`whisper::is_quantizable_linear`); conv1/conv2 (3-D), positional
+    // embeddings, token_embedding, every norm and every bias are forced
+    // to f16 in the write loop below no matter what the profile says —
+    // the engine's whisper conv/norm/embedding kernels read half, and
+    // quantizing per-channel norm gains wrecks the model. The shipped
+    // whisper profiles (whisper-q8.json / whisper-q4.json) encode the
+    // same split; the code-side guard additionally makes a generic
+    // profile (default-q8.json's `**.weight` catch-all) safe here.
+    let quantizing = ctx.profile.is_some();
+    // Header quant_scheme reflects what the profile assigns to the
+    // linears (uniform across the shipped whisper profiles — probe the
+    // first eligible tensor); plain f16 otherwise.
+    let mut quant_scheme = QuantScheme::F16;
+    if let Some(profile) = &ctx.profile {
+        if let Some((_, canonical)) = mapped
+            .iter()
+            .find(|(_, c)| whisper::is_quantizable_linear(c))
+        {
+            let resolved = profile
+                .resolve_or_err(canonical)
+                .with_context(|| format!("profile lookup for tensor {canonical:?}"))?;
+            quant_scheme = match resolved.dtype {
+                TensorDtype::BaseQ2 => QuantScheme::BaseQ2,
+                TensorDtype::BaseQ3 => QuantScheme::BaseQ3,
+                TensorDtype::BaseQ4 => QuantScheme::BaseQ4,
+                TensorDtype::BaseQ5 => QuantScheme::BaseQ5,
+                TensorDtype::BaseQ6 => QuantScheme::BaseQ6,
+                TensorDtype::BaseQ8 => QuantScheme::BaseQ8,
+                TensorDtype::Mxfp4 => QuantScheme::Mxfp4,
+                TensorDtype::Nvfp4 => QuantScheme::Nvfp4,
+                TensorDtype::Bf16 => QuantScheme::Bf16,
+                _ => QuantScheme::F16,
+            };
+        }
+    }
+    let has_quant_tensors = !matches!(quant_scheme, QuantScheme::F16 | QuantScheme::Bf16);
+
+    let header = Header {
+        schema: 1,
+        arch: "whisper".to_string(),
+        // Default f16; with a profile, the scheme of the quantized
+        // linears (per-tensor dtypes below stay authoritative).
+        quant_scheme,
+        min_hw: "apple_m1".to_string(),
+        created: chrono_now(),
+        base_rt_version: env!("CARGO_PKG_VERSION").to_string(),
+        source: SourceInfo {
+            format: "hf_safetensors".to_string(),
+            sha256: "".to_string(), // streaming hash over a directory is a follow-up
+            filename: input
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string(),
+        },
+        tokenizer: TokenizerBlob {
+            fields: tokenizer_from_hf(hf),
+        },
+        config: ModelConfig {
+            fields: config.to_config_map(),
+        },
+        metadata,
+        target_backend: TargetBackend::Metal,
+        quant_profile: ctx.profile_name().unwrap_or("").to_string(),
+        alignment: AlignmentConfig::default(),
+        // QUANTIZED only when a profile routed the linears to a packed
+        // scheme; the default all-f16 bundle stays unflagged. lm_head
+        // shares bytes with decoder.token_embedding.weight.
+        flags: if has_quant_tensors {
+            HeaderFlags::TIED_EMBEDDINGS | HeaderFlags::QUANTIZED
+        } else {
+            HeaderFlags::TIED_EMBEDDINGS
+        },
+        // Layer map covers the decoder stack (the half that drives KV
+        // sizing); the encoder depth lives in config.encoder_layers.
+        layers: (0..config.num_hidden_layers)
+            .map(|_| LayerDescriptor {
+                kind: LayerKind::AttentionDense,
+                moe_n_experts: 0,
+                moe_n_active: 0,
+                shared_attn_layer: None,
+                compute_hint: Some(ComputeRegion::Accelerator),
+                precision: LayerPrecision::default(),
+            })
+            .collect(),
+        tensors: vec![],
+        mmproj: None,
+        calibration: None,
+        sig: None,
+    };
+
+    let mut writer = BaseWriter::create(output, header).context("create writer")?;
+
+    let pb = indicatif::ProgressBar::new(mapped.len() as u64);
+    let pb_template = if quantizing {
+        "  writing [{bar:28}] {pos}/{len} {msg}"
+    } else {
+        "  writing f16 [{bar:28}] {pos}/{len} {msg}"
+    };
+    pb.set_style(
+        indicatif::ProgressStyle::with_template(pb_template)
+            .expect("valid progress template")
+            .progress_chars("=>-"),
+    );
+    for (src_name, canonical) in &mapped {
+        pb.set_message(canonical.clone());
+        let shape = hf
+            .tensor_info(src_name)
+            .map(|t| t.shape.clone())
+            .ok_or_else(|| anyhow::anyhow!("tensor {src_name} missing"))?;
+        let f32s = hf
+            .tensor_to_f32(src_name)
+            .with_context(|| format!("reading {src_name}"))?;
+
+        // Embeddings / positional tables / 1-D norms+biases → GPU region
+        // (page-aligned, zero-copy, always resident). Conv + linear
+        // weights → Accelerator region, resident with their layer.
+        let is_gpu_resident = shape.len() == 1
+            || canonical == "decoder.token_embedding.weight"
+            || canonical.ends_with("positional_embedding");
+        let (region, residency) = if is_gpu_resident {
+            (ComputeRegion::Gpu, ResidencyHint::Hot)
+        } else {
+            (ComputeRegion::Accelerator, ResidencyHint::Warm)
+        };
+
+        let (entry, data) = if quantizing
+            && shape.len() == 2
+            && whisper::is_quantizable_linear(canonical)
+        {
+            // Profile-routed block linear: pack at the canonical scheme,
+            // [W | scales | biases] in one blob — exactly the layout the
+            // LLM quant tensors use. A profile may still route these to
+            // f16 (whisper-f16.json); pack_tensor then returns raw f16
+            // bytes with empty scale/bias streams and the entry
+            // degenerates to the plain case.
+            let in_features = shape.last().copied().map(|d| d as usize);
+            let (packed, dtype) = ctx
+                .pack_tensor(canonical, &f32s, in_features)
+                .with_context(|| format!("packing {canonical}"))?;
+            let mut data = Vec::with_capacity(
+                packed.packed_weights.len() + packed.scales.len() + packed.biases.len(),
+            );
+            data.extend_from_slice(&packed.packed_weights);
+            let scale_off = data.len() as u64;
+            data.extend_from_slice(&packed.scales);
+            let bias_off = data.len() as u64;
+            data.extend_from_slice(&packed.biases);
+            let entry = base_format::TensorEntry {
+                name: canonical.clone(),
+                dtype,
+                shape,
+                offset: 0,
+                length: data.len() as u64,
+                scale_offset: if !packed.scales.is_empty() {
+                    Some(scale_off)
+                } else {
+                    None
+                },
+                scale_length: if !packed.scales.is_empty() {
+                    Some(packed.scales.len() as u64)
+                } else {
+                    None
+                },
+                bias_offset: if !packed.biases.is_empty() {
+                    Some(bias_off)
+                } else {
+                    None
+                },
+                bias_length: if !packed.biases.is_empty() {
+                    Some(packed.biases.len() as u64)
+                } else {
+                    None
+                },
+                awq_scale_offset: None,
+                awq_scale_length: None,
+                group_size: if packed.group_size > 0 {
+                    Some(packed.group_size)
+                } else {
+                    None
+                },
+                layout: None,
+                residency: Some(residency),
+                compute_region: region,
+                scale_dtype: packed.scale_dtype,
+                symmetric: false,
+                flags: TensorFlags::empty(),
+                checksum_xxh64: None,
+                source_ggml_type: None,
+            };
+            (entry, data)
+        } else {
+            // Everything else — and every tensor on the default path —
+            // is raw f16.
+            let bytes: Vec<u8> = f32s
+                .iter()
+                .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
+                .collect();
+            let entry = base_format::TensorEntry {
+                name: canonical.clone(),
+                dtype: TensorDtype::F16,
+                shape,
+                offset: 0,
+                length: bytes.len() as u64,
+                scale_offset: None,
+                scale_length: None,
+                bias_offset: None,
+                bias_length: None,
+                awq_scale_offset: None,
+                awq_scale_length: None,
+                group_size: None,
+                layout: None,
+                residency: Some(residency),
+                compute_region: region,
+                scale_dtype: None,
+                symmetric: false,
+                flags: TensorFlags::empty(),
+                checksum_xxh64: None,
+                source_ggml_type: None,
+            };
+            (entry, bytes)
+        };
+        writer.add_tensor(TensorPayload { entry, data });
+        pb.inc(1);
+    }
+    pb.finish_and_clear();
+
+    writer.finish().context("writing bundle")?;
+
+    let reader = BaseReader::open(output).context("reopen for verification")?;
+    for t in reader.header().tensors.iter() {
+        if t.compute_region == ComputeRegion::Gpu
+            && !reader.tensor_is_zero_copy_eligible(&t.name)?
+        {
+            bail!("tensor {:?} failed zero-copy alignment check", t.name);
+        }
+    }
+    eprintln!(
+        "  wrote {} tensors ({} MB)",
+        reader.header().tensors.len(),
+        std::fs::metadata(output)?.len() / (1024 * 1024)
+    );
+    Ok(())
 }
 
 /// Convert from an MLX-quantized safetensors directory.
@@ -1414,6 +1801,7 @@ fn convert_generic(
         config: ModelConfig {
             fields: config.to_config_map(),
         },
+        metadata: Default::default(),
         target_backend: TargetBackend::Metal,
         quant_profile: ctx.profile_name().unwrap_or("").to_string(),
         alignment: AlignmentConfig::default(),
@@ -2287,6 +2675,7 @@ fn convert_synthetic_with_ctx(
                 f
             },
         },
+        metadata: Default::default(),
         target_backend: TargetBackend::Metal,
         quant_profile: ctx
             .profile_name()
@@ -2556,6 +2945,7 @@ fn convert_synthetic(output: &std::path::Path, target: TargetScheme) -> Result<(
                 f
             },
         },
+        metadata: Default::default(),
         target_backend: TargetBackend::Metal,
         quant_profile: String::new(),
         alignment: AlignmentConfig::default(),
@@ -2989,11 +3379,34 @@ fn cmd_inspect(args: InspectArgs) -> Result<()> {
     println!("n_tensors:     {}", h.tensors.len());
     println!("signed:        {}", h.sig.is_some());
 
+    // Flat converter-derived metadata (whisper.* token ids, lora.*, …).
+    if !h.metadata.is_empty() {
+        println!("metadata:");
+        for (k, v) in h.metadata.iter() {
+            println!("  {k} = {v}");
+        }
+    }
+
     let mut total: u64 = 0;
     for t in h.tensors.iter() {
         total += t.length;
     }
     println!("weights bytes: {}", total);
+
+    // Per-dtype tensor breakdown (count + bytes) — quick audit that a
+    // quant profile routed the right tensors (e.g. whisper: linears
+    // base_q8/base_q4, everything else f16).
+    let mut by_dtype: std::collections::BTreeMap<String, (usize, u64)> =
+        std::collections::BTreeMap::new();
+    for t in h.tensors.iter() {
+        let e = by_dtype.entry(format!("{:?}", t.dtype)).or_default();
+        e.0 += 1;
+        e.1 += t.length;
+    }
+    println!("dtypes:");
+    for (dtype, (count, bytes)) in &by_dtype {
+        println!("  {dtype:<8} {count:4} tensors  {bytes:>12} bytes");
+    }
 
     let slots = reader.slots()?;
     println!("n_slots:       {}", slots.len());

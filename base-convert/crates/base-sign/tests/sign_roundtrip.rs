@@ -26,6 +26,7 @@ fn make_header() -> Header {
         config: ModelConfig {
             fields: BTreeMap::new(),
         },
+        metadata: BTreeMap::new(),
         target_backend: TargetBackend::Metal,
         quant_profile: String::new(),
         alignment: AlignmentConfig::default(),

@@ -131,6 +131,10 @@ pub enum QuantScheme {
     BaseQ8,
     #[serde(rename = "bf16")]
     Bf16,
+    /// Plain half-precision, no quantization. Used by archs whose fused
+    /// kernels are f16-only (whisper v1) — every tensor ships as raw f16.
+    #[serde(rename = "f16")]
+    F16,
     #[serde(rename = "mxfp4")]
     Mxfp4,
     #[serde(rename = "nvfp4")]
@@ -516,6 +520,13 @@ pub struct Header {
     pub source: SourceInfo,
     pub tokenizer: TokenizerBlob,
     pub config: ModelConfig,
+
+    /// Flat, open-namespace metadata keys the runtime reads directly
+    /// (e.g. `whisper.sot_token_id`, `lora.rank`). Distinct from `config`
+    /// — config mirrors the source model's config.json fields, metadata
+    /// carries converter-derived values. Absent/empty for most archs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 
     /// Hardware backend this bundle is packed for. Bundles aren't
     /// portable across backends — the converter writes one backend's

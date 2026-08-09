@@ -1,0 +1,94 @@
+{
+  "name": "gemma4-moe-q8-headq6",
+  "arch": "gemma4",
+  "rules": [
+    {
+      "pattern": "embed_tokens.weight",
+      "dtype": "base_q6",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "model.embed_tokens.weight",
+      "dtype": "base_q6",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "model.language_model.embed_tokens.weight",
+      "dtype": "base_q6",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "**.input_layernorm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.post_attention_layernorm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.q_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.k_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "model.norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.ffn_down_exps.weight",
+      "dtype": "base_q8",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "**.experts.**.down_proj.weight",
+      "dtype": "base_q8",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "**.mlp.down_proj.weight",
+      "dtype": "base_q8",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "**.ffn_down_exps.scale",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.{q,k,v,o}_proj.weight",
+      "dtype": "base_q8",
+      "scale_dtype": "bf16",
+      "group_size": 128
+    },
+    {
+      "pattern": "**.{gate,up,down}_proj.weight",
+      "dtype": "base_q8",
+      "scale_dtype": "bf16",
+      "group_size": 128
+    },
+    {
+      "pattern": "lm_head.weight",
+      "dtype": "base_q8",
+      "scale_dtype": "bf16",
+      "group_size": 128
+    },
+    {
+      "pattern": "**.weight",
+      "dtype": "base_q8",
+      "scale_dtype": "bf16",
+      "group_size": 128
+    },
+    {
+      "pattern": "**.bias",
+      "dtype": "f16"
+    }
+  ]
+}
