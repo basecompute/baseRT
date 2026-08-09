@@ -1,0 +1,88 @@
+{
+  "name": "gemma4-moe-q4mix",
+  "arch": "*",
+  "calibration": {
+    "method": "awq",
+    "tokens": 1024,
+    "dataset": "wikitext-103"
+  },
+  "rules": [
+    {"pattern": "**.embed_tokens.weight", "dtype": "f16"},
+    {"pattern": "model.language_model.embed_tokens.weight", "dtype": "f16"},
+
+    {"pattern": "**.input_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.input_norm.weight", "dtype": "f16"},
+    {"pattern": "**.post_attention_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.post_attention_norm.weight", "dtype": "f16"},
+    {"pattern": "**.post_attn_norm.weight", "dtype": "f16"},
+    {"pattern": "**.pre_feedforward_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.pre_feedforward_layernorm_*.weight", "dtype": "f16"},
+    {"pattern": "**.post_feedforward_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.post_feedforward_layernorm_*.weight", "dtype": "f16"},
+    {"pattern": "**.post_ffw_norm.weight", "dtype": "f16"},
+    {"pattern": "**.post_ffw_norm_*.weight", "dtype": "f16"},
+    {"pattern": "**.pre_ffw_norm.weight", "dtype": "f16"},
+    {"pattern": "**.pre_ffw_norm_*.weight", "dtype": "f16"},
+    {"pattern": "**.per_layer_post_norm.weight", "dtype": "f16"},
+    {"pattern": "**.attn_norm.weight", "dtype": "f16"},
+    {"pattern": "**.ffn_norm.weight", "dtype": "f16"},
+    {"pattern": "**.q_norm.weight", "dtype": "f16"},
+    {"pattern": "**.k_norm.weight", "dtype": "f16"},
+    {"pattern": "**.attn_q_norm.weight", "dtype": "f16"},
+    {"pattern": "**.attn_k_norm.weight", "dtype": "f16"},
+    {"pattern": "**.layer_out_scale.weight", "dtype": "f16"},
+    {"pattern": "**.layer_scalar", "dtype": "f16"},
+    {"pattern": "**.norm.weight", "dtype": "f16"},
+    {"pattern": "final_norm.weight", "dtype": "f16"},
+    {"pattern": "output_norm.weight", "dtype": "f16"},
+    {"pattern": "per_layer_proj_norm.weight", "dtype": "f16"},
+
+    {"pattern": "**.router.weight", "dtype": "f16"},
+    {"pattern": "**.router.proj.weight", "dtype": "f16"},
+    {"pattern": "**.router.per_expert_scale", "dtype": "f16"},
+    {"pattern": "**.router.scale", "dtype": "f16"},
+    {"pattern": "**.ffn_gate_inp.weight", "dtype": "f16"},
+    {"pattern": "**.ffn_gate_inp.scale", "dtype": "f16"},
+    {"pattern": "**.mlp.gate.weight", "dtype": "f16"},
+
+    {"pattern": "**.ffn_down_exps.scale", "dtype": "f16"},
+    {"pattern": "**.ffn_up_exps.scale", "dtype": "f16"},
+    {"pattern": "**.ffn_gate_exps.scale", "dtype": "f16"},
+    {"pattern": "**.ffn_gate_up_exps.scale", "dtype": "f16"},
+
+    {"pattern": "**.{q,k,v,o}_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.{q,k,v,o}_proj.linear.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.attn_q.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.attn_k.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.attn_v.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.attn_output.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+
+    {"pattern": "**.mlp.{gate,up,down}_proj.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.mlp.{gate,up,down}_proj.linear.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 64},
+
+    {"pattern": "**.experts.**.{gate,up,down}_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.experts.{gate,up,down}_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.experts.{gate,up,down}_proj", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.experts.gate_up_proj", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.experts.gate_up_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.ffn_gate_exps.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.ffn_up_exps.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.ffn_down_exps.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.ffn_gate_up_exps.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+
+    {"pattern": "**.patch_embedder.input_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.patch_embedder.position_embedding_table", "dtype": "f16"},
+    {"pattern": "**.std_bias", "dtype": "f16"},
+    {"pattern": "**.std_scale", "dtype": "f16"},
+    {"pattern": "**.embedding_projection.weight", "dtype": "f16"},
+
+    {"pattern": "rope_freqs.weight", "dtype": "f32"},
+    {"pattern": "**.rope_freqs.weight", "dtype": "f32"},
+
+    {"pattern": "lm_head.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 128},
+    {"pattern": "output.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 128},
+
+    {"pattern": "**.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.bias", "dtype": "f16"}
+  ]
+}

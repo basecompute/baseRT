@@ -1216,11 +1216,11 @@ mod tests {
             "--variant".into(),
             "default-q8".into(),
             "--port".into(),
-            "8080".into(),
+            "8453".into(),
         ])
         .unwrap();
         assert_eq!(v.as_deref(), Some("default-q8"));
-        assert_eq!(rest, vec!["--model", "org/m", "--port", "8080"]);
+        assert_eq!(rest, vec!["--model", "org/m", "--port", "8453"]);
 
         // `--variant=<v>`
         let (v, rest) = extract_variant_flag(&["--variant=q8".into(), "org/m".into()]).unwrap();

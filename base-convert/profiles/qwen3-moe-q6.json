@@ -1,0 +1,64 @@
+{
+  "name": "qwen3-moe-q6",
+  "arch": "*",
+  "rules": [
+    {
+      "pattern": "model.embed_tokens.weight",
+      "dtype": "base_q6",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "embed_tokens.weight",
+      "dtype": "base_q6",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "**.input_layernorm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.post_attention_layernorm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.q_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.k_norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "model.norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.norm.weight",
+      "dtype": "f16"
+    },
+    {
+      "pattern": "**.ffn_gate_inp.weight",
+      "dtype": "base_q8",
+      "scale_dtype": "bf16",
+      "group_size": 128
+    },
+    {
+      "pattern": "**.mlp.gate.weight",
+      "dtype": "base_q8",
+      "scale_dtype": "bf16",
+      "group_size": 128
+    },
+    {
+      "pattern": "**.weight",
+      "dtype": "base_q6",
+      "scale_dtype": "bf16",
+      "group_size": 64
+    },
+    {
+      "pattern": "**.bias",
+      "dtype": "f16"
+    }
+  ]
+}

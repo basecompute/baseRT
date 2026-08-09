@@ -1,0 +1,61 @@
+{
+  "name": "qwen35-moe-cuda-q4mix",
+  "arch": "*",
+  "_comment": "Rules match the CANONICAL (post-mapper) .base tensor names the runtime fetches (attention.q/k/v/output, linear_attn.in_proj_*, ffn_*_exps, ffn_*_shexp) — verified against src/core/models/qwen3_5.cpp + src/core/moe_helpers.cpp get_tensor(). The prior revision used pre-canonicalization HF names (q_proj, mlp.experts.gate_up_proj), so EVERY attention / GDN / routed-expert weight missed its q4/q8 rule and fell through to the `**.weight` catch-all at base_q6 — inflating the bundle ~30% (29.4GB vs a byte-matched ~22GB) and costing ~12% decode vs llama.cpp Q4_K_M. The HF-name rules are kept below the canonical ones as a harmless fallback for other MoE variants.",
+  "rules": [
+    {"pattern": "model.embed_tokens.weight", "dtype": "f16"},
+    {"pattern": "embed_tokens.weight", "dtype": "f16"},
+    {"pattern": "token_embd.weight", "dtype": "f16"},
+    {"pattern": "model.norm.weight", "dtype": "f16"},
+    {"pattern": "output_norm.weight", "dtype": "f16"},
+    {"pattern": "final_norm.weight", "dtype": "f16"},
+
+    {"pattern": "**.attention_norm.weight", "dtype": "f16"},
+    {"pattern": "**.ffn_norm.weight", "dtype": "f16"},
+    {"pattern": "**.attention.q_norm.weight", "dtype": "f16"},
+    {"pattern": "**.attention.k_norm.weight", "dtype": "f16"},
+    {"pattern": "**.linear_attn.norm.weight", "dtype": "f16"},
+    {"pattern": "**.ffn_gate_inp.weight", "dtype": "f16"},
+    {"pattern": "**.ffn_shexp_gate.weight", "dtype": "f16"},
+
+    {"pattern": "**.attention.q.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.attention.k.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.attention.v.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.attention.output.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+
+    {"pattern": "**.linear_attn.in_proj_qkv.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.linear_attn.in_proj_a.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.linear_attn.in_proj_b.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.linear_attn.in_proj_z.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.linear_attn.out_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+
+    {"pattern": "**.ffn_gate_up_exps.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.ffn_gate_exps.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.ffn_up_exps.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.ffn_down_exps.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+
+    {"pattern": "**.ffn_gate_shexp.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.ffn_up_shexp.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.ffn_down_shexp.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 64},
+
+    {"pattern": "lm_head.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "output.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 64},
+
+    {"pattern": "**.input_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.post_attention_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.attn_norm.weight", "dtype": "f16"},
+    {"pattern": "**.q_norm.weight", "dtype": "f16"},
+    {"pattern": "**.k_norm.weight", "dtype": "f16"},
+    {"pattern": "**.shared_expert_gate.weight", "dtype": "f16"},
+    {"pattern": "**.mlp.gate.weight", "dtype": "f16"},
+    {"pattern": "**.router.weight", "dtype": "f16"},
+    {"pattern": "**.{q,k,v,o}_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.shared_expert.{gate,up,down}_proj.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.mlp.shared_experts.{gate,up,down}_proj.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.experts.**.{gate,up,down}_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.experts.{gate,up,down}_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+
+    {"pattern": "**.weight", "dtype": "base_q6", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.bias", "dtype": "f16"}
+  ]
+}

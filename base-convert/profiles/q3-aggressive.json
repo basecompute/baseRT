@@ -1,0 +1,24 @@
+{
+  "name": "q3-aggressive",
+  "arch": "*",
+  "calibration": {
+    "method": "awq",
+    "tokens": 2048,
+    "dataset": "wikitext-103"
+  },
+  "rules": [
+    {"pattern": "model.embed_tokens.weight", "dtype": "f16"},
+    {"pattern": "**.input_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.post_attention_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.q_norm.weight", "dtype": "f16"},
+    {"pattern": "**.k_norm.weight", "dtype": "f16"},
+    {"pattern": "model.norm.weight", "dtype": "f16"},
+    {"pattern": "**.{q,k,v,o}_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.mlp.{gate,up,down}_proj.weight", "dtype": "base_q3", "scale_dtype": "bf16", "group_size": 32},
+    {"pattern": "**.experts.**.{gate,up,down}_proj.weight", "dtype": "base_q3", "scale_dtype": "bf16", "group_size": 32},
+    {"pattern": "**.router.weight", "dtype": "f16"},
+    {"pattern": "lm_head.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.weight", "dtype": "base_q3", "scale_dtype": "bf16", "group_size": 32},
+    {"pattern": "**.bias", "dtype": "f16"}
+  ]
+}

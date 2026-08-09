@@ -1,0 +1,22 @@
+{
+  "name": "qwen3-mixed-q3q5q6",
+  "arch": "qwen3",
+  "rules": [
+    {"pattern": "model.embed_tokens.weight", "dtype": "f16"},
+    {"pattern": "**.input_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.post_attention_layernorm.weight", "dtype": "f16"},
+    {"pattern": "**.q_norm.weight", "dtype": "f16"},
+    {"pattern": "**.k_norm.weight", "dtype": "f16"},
+    {"pattern": "model.norm.weight", "dtype": "f16"},
+    {"pattern": "**.q_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.k_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.v_proj.weight", "dtype": "base_q3", "scale_dtype": "bf16", "group_size": 32},
+    {"pattern": "**.o_proj.weight", "dtype": "base_q5", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.gate_proj.weight", "dtype": "base_q3", "scale_dtype": "bf16", "group_size": 32},
+    {"pattern": "**.up_proj.weight",   "dtype": "base_q3", "scale_dtype": "bf16", "group_size": 32},
+    {"pattern": "**.down_proj.weight", "dtype": "base_q6", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "lm_head.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.weight", "dtype": "f16"},
+    {"pattern": "**.bias", "dtype": "f16"}
+  ]
+}
