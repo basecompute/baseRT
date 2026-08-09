@@ -131,7 +131,7 @@ final class BaseRTTests: XCTestCase {
         let model = try BaseRTModel(modelPath: modelPath, kernelLibraryPath: nil)
         let tokens = try model.encode(text: "The capital of France is")
         XCTAssertFalse(tokens.isEmpty)
-        let text = model.generateText(tokens: tokens, maxTokens: 8)
+        let text = try model.generateText(tokens: tokens, maxTokens: 8)
         XCTAssertFalse(text.isEmpty)
     }
 }

@@ -11,6 +11,8 @@ import ctypes
 import os
 import struct
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -75,7 +77,10 @@ class TestBaseRTModelConfig:
         assert indices == sorted(indices)
 
     def test_field_count(self):
-        assert len(BaseRTModelConfig._fields_) == 87
+        # Keep this in sync with include/baseRT/types.h. The runtime ABI-size
+        # assertion below catches layout drift; this count catches accidental
+        # omission of same-sized fields from the ctypes mirror.
+        assert len(BaseRTModelConfig._fields_) == 95
 
     def test_architecture_field_is_char_array(self):
         # architecture should be a fixed 32-byte char array
@@ -443,8 +448,11 @@ class TestFindLibrary:
             result = _find_library()
             assert result == fake_path
 
-    def test_raises_when_not_found(self):
-        # Clear env var and point __file__ somewhere with no build dir nearby
+    def test_raises_when_not_found(self, tmp_path, monkeypatch):
+        # Clear every resolver input. In particular, isolate cwd so a shared
+        # library produced by an earlier test/CI build cannot satisfy the
+        # fallback lookup and make this test order-dependent.
+        monkeypatch.chdir(tmp_path)
         with mock.patch.dict(os.environ, {}, clear=True):
             with mock.patch("baseRT.__file__", "/nonexistent/bindings/python/baseRT/__init__.py"):
                 with pytest.raises(OSError, match="Cannot find"):
@@ -584,6 +592,193 @@ class TestStructSizes:
 # -------------------------------------------------------------------------
 # _get_lib caching
 # -------------------------------------------------------------------------
+
+
+def _make_mock_model():
+    """Build a Model backed by a MagicMock C library (no GPU/model file).
+
+    baseRT_load_model returns a truthy fake handle so __init__ succeeds; every
+    other native symbol is a MagicMock attribute the tests configure as needed.
+    """
+    fake_lib = mock.MagicMock()
+    fake_lib.baseRT_load_model.return_value = 0xABCD  # truthy fake handle
+    with mock.patch("baseRT._get_lib", return_value=fake_lib):
+        m = baseRT.Model("dummy.base")
+    return m, fake_lib
+
+
+class TestCallbackInitiatedClose:
+    """Issue 1: close() from within a direct-path callback must be rejected
+    BEFORE any lifecycle state changes (no half-closed model)."""
+
+    def test_close_in_callback_raises_before_state_change(self):
+        m, _lib = _make_mock_model()
+        original_handle = m._handle
+
+        # Simulate being inside a direct generate/transcribe callback on this
+        # thread (the trampoline calls enter_callback around the user callback).
+        m._handle_lock.enter_callback()
+        try:
+            with pytest.raises(BaseRTError):
+                m.close()
+        finally:
+            m._handle_lock.exit_callback()
+
+        # The rejection must have happened at the TOP of close(): no lifecycle
+        # state may have been mutated.
+        assert m._closing is False
+        assert m._handle == original_handle
+        assert m._pending_free_handle is None
+
+        # And the model is still fully usable (a guarded method does not raise
+        # "model is closed").
+        _ = m.position  # would raise BaseRTError if _ensure_open saw it closed
+
+    def test_normal_close_still_works(self):
+        m, lib = _make_mock_model()
+        # Not inside a callback -> depth 0 -> close proceeds normally.
+        m.close()
+        assert m._closing is True
+        assert m._handle is None
+        assert m._pending_free_handle is None
+        lib.baseRT_free_model.assert_called_once_with(0xABCD)
+
+    def test_is_reentrant_helper(self):
+        lock = baseRT._ReentrancyGuardedLock()
+        assert lock.is_reentrant() is False
+        assert lock.in_callback() is False
+        lock.enter_callback()
+        try:
+            assert lock.is_reentrant() is True
+            assert lock.in_callback() is True
+        finally:
+            lock.exit_callback()
+        assert lock.is_reentrant() is False
+
+
+class TestStreamLifecycle:
+    """Stream-start lifecycle hardening:
+
+    * A stream worker QUEUED on _handle_lock that gets cancelled while it waits
+      must skip baseRT_generate entirely (not burn GPU on a dead stream), yet
+      still fire its done event and queue sentinel so nothing hangs.
+    * stream() must reject a callback-initiated start and a start on a closing
+      model BEFORE registering a worker / mutating lifecycle state.
+    """
+
+    def test_queued_then_cancelled_worker_skips_generate(self):
+        m, lib = _make_mock_model()
+
+        # Hold _handle_lock so the stream worker QUEUES behind it, exactly as if
+        # another handle call were in flight ahead of it.
+        m._handle_lock.acquire()
+
+        results = []
+
+        def consume():
+            results.append(list(m.stream([1, 2, 3])))
+
+        consumer = threading.Thread(target=consume, daemon=True)
+        consumer.start()
+
+        # Wait until the worker has registered and is blocked on the lock.
+        deadline = time.time() + 5
+        while not m._streams and time.time() < deadline:
+            time.sleep(0.005)
+        assert m._streams, "stream worker never registered"
+        cancel, _worker, done = m._streams[0]
+
+        # Cancel while the worker is still QUEUED, THEN release the lock so it
+        # acquires it and re-checks the cancel flag before the native call.
+        cancel.set()
+        m._handle_lock.release()
+
+        consumer.join(timeout=5)
+        assert not consumer.is_alive(), "consumer never completed"
+
+        # The worker acquired the lock, saw the cancel flag set, and skipped
+        # generation instead of entering baseRT_generate.
+        lib.baseRT_generate.assert_not_called()
+        # Early-out path still fired the completion event and queue sentinel.
+        assert done.is_set()
+        assert results == [[]]  # sentinel delivered, no tokens yielded
+        assert m._streams == []  # consumer deregistered the entry
+
+    def test_stream_in_callback_raises_before_register(self):
+        m, lib = _make_mock_model()
+
+        # Simulate being inside a direct generate/transcribe callback on this
+        # thread; starting a stream must be rejected up front.
+        m._handle_lock.enter_callback()
+        try:
+            with pytest.raises(BaseRTError):
+                next(m.stream([1, 2, 3]))
+        finally:
+            m._handle_lock.exit_callback()
+
+        # No worker registered, no native call issued.
+        assert m._streams == []
+        lib.baseRT_generate.assert_not_called()
+
+    def test_stream_while_closing_raises_before_register(self):
+        m, lib = _make_mock_model()
+        m._closing = True  # model is shutting down
+
+        with pytest.raises(BaseRTError):
+            next(m.stream([1, 2, 3]))
+
+        assert m._streams == []
+        lib.baseRT_generate.assert_not_called()
+
+
+class TestCompoundMethodStableHandle:
+    """Issue 2: a compound guarded method captures the handle into a local and
+    uses it for every native call, even if self._handle is cleared mid-method."""
+
+    def test_embed_uses_captured_handle(self):
+        m, lib = _make_mock_model()
+        original_handle = m._handle
+        seen = []
+
+        # The first native call clears the self._handle ATTRIBUTE, mimicking a
+        # concurrent close() that took ownership between the two native calls.
+        def dim_side_effect(handle):
+            m._handle = None
+            return 4
+
+        def embed_side_effect(handle, arr, n, out, max_dims):
+            seen.append(handle)
+            return max_dims
+
+        lib.baseRT_embedding_dim.side_effect = dim_side_effect
+        lib.baseRT_embed.side_effect = embed_side_effect
+
+        result = m.embed([1, 2, 3])
+
+        # The second native call must have received the still-valid captured
+        # handle, NOT the cleared None attribute.
+        assert seen == [original_handle]
+        assert len(result) == 4
+
+    def test_tensors_uses_captured_handle(self):
+        m, lib = _make_mock_model()
+        original_handle = m._handle
+        seen = []
+
+        def count_side_effect(handle):
+            m._handle = None  # concurrent close() clears the attribute
+            return 2
+
+        lib.baseRT_tensor_count.side_effect = count_side_effect
+        lib.baseRT_tensor_name.side_effect = lambda h, i: seen.append(h) or b"t"
+        lib.baseRT_tensor_raw_dtype.side_effect = lambda h, i: b"Q4_0"
+        lib.baseRT_tensor_dtype.side_effect = lambda h, i: 7
+
+        infos = m.tensors()
+
+        assert len(infos) == 2
+        # Every per-index call saw the captured handle, never None.
+        assert seen == [original_handle, original_handle]
 
 
 class TestGetLib:

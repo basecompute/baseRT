@@ -207,6 +207,16 @@ const TranscribeStatsC = koffi.struct("BaseRTTranscribeStats", {
   total_ms: "float",
 });
 
+const TranscribeSegmentC = koffi.struct("BaseRTTranscribeSegment", {
+  start_ms: "int",
+  end_ms: "int",
+  text: "const char *",
+  avg_logprob: "float",
+  no_speech_prob: "float",
+  compression_ratio: "float",
+  temperature: "float",
+});
+
 // bool (*)(uint32_t token_id, const char *text, void *user_data)
 const TokenCallbackC = koffi.proto(
   "bool TokenCallback(uint32_t token_id, const char *text, void *user_data)"
@@ -286,6 +296,22 @@ export interface TranscribeStats {
 export interface TranscribeResult {
   text: string;
   stats: TranscribeStats;
+}
+
+/**
+ * One segment of the last transcription (verbose_json surface).
+ * avgLogprob / noSpeechProb / compressionRatio / temperature are
+ * window-level values applied to every segment decoded in that 30 s window
+ * (the engine's documented approximation).
+ */
+export interface TranscribeSegment {
+  startMs: number;
+  endMs: number;
+  text: string;
+  avgLogprob: number;
+  noSpeechProb: number;
+  compressionRatio: number;
+  temperature: number;
 }
 
 export type TokenCallback = (tokenId: number, text: string) => boolean;
@@ -397,19 +423,33 @@ interface BaseRTLib {
   baseRT_chat_template: (model: unknown) => string;
   baseRT_is_whisper: (model: unknown) => boolean;
   baseRT_set_timestamps: (model: unknown, enabled: boolean) => void;
+  baseRT_set_task: (model: unknown, task: string) => boolean;
+  baseRT_set_initial_prompt: (model: unknown, text: string | null) => void;
+  baseRT_set_condition_on_previous_text: (
+    model: unknown,
+    enabled: boolean
+  ) => void;
+  baseRT_transcribe_language: (model: unknown) => string;
+  baseRT_transcribe_audio_duration_ms: (model: unknown) => number;
+  baseRT_transcribe_segment_count: (model: unknown) => number;
+  baseRT_transcribe_segment: (
+    model: unknown,
+    index: number,
+    out: Record<string, unknown>
+  ) => boolean;
   baseRT_transcribe: (
     model: unknown,
     wavPath: string,
     language: string | null,
     statsOut: Record<string, unknown>
-  ) => string;
+  ) => string | null;
   baseRT_transcribe_pcm: (
     model: unknown,
     samples: Float32Array,
     n: number,
     language: string | null,
     statsOut: Record<string, unknown>
-  ) => string;
+  ) => string | null;
   baseRT_transcribe_stream: (
     model: unknown,
     wavPath: string,
@@ -505,6 +545,25 @@ function lib(): BaseRTLib {
     ),
     baseRT_is_whisper: k.func("bool baseRT_is_whisper(void *)"),
     baseRT_set_timestamps: k.func("void baseRT_set_timestamps(void *, bool)"),
+    baseRT_set_task: k.func("bool baseRT_set_task(void *, const char *)"),
+    baseRT_set_initial_prompt: k.func(
+      "void baseRT_set_initial_prompt(void *, const char *)"
+    ),
+    baseRT_set_condition_on_previous_text: k.func(
+      "void baseRT_set_condition_on_previous_text(void *, bool)"
+    ),
+    baseRT_transcribe_language: k.func(
+      "const char *baseRT_transcribe_language(void *)"
+    ),
+    baseRT_transcribe_audio_duration_ms: k.func(
+      "int baseRT_transcribe_audio_duration_ms(void *)"
+    ),
+    baseRT_transcribe_segment_count: k.func(
+      "int baseRT_transcribe_segment_count(void *)"
+    ),
+    baseRT_transcribe_segment: k.func(
+      "bool baseRT_transcribe_segment(void *, int, _Out_ BaseRTTranscribeSegment *)"
+    ),
     baseRT_transcribe: k.func(
       "const char *baseRT_transcribe(void *, const char *, const char *, _Out_ BaseRTTranscribeStats *)"
     ),
@@ -854,12 +913,17 @@ export class BaseRTModel {
 
   prefill(tokens: number[] | Uint32Array): number {
     const arr = tokens instanceof Uint32Array ? tokens : Uint32Array.from(tokens);
+    // baseRT_prefill returns the first generated token (argmax of prefill
+    // logits) with no 0-sentinel; token id 0 is a valid token, so it must not
+    // be treated as an error.
     return this._l.baseRT_prefill(this.handle, arr, arr.length);
   }
 
   prefillImage(tokens: number[] | Uint32Array, imagePath: string): number {
     const arr = tokens instanceof Uint32Array ? tokens : Uint32Array.from(tokens);
-    return this._l.baseRT_prefill_image(this.handle, arr, arr.length, imagePath);
+    const t = this._l.baseRT_prefill_image(this.handle, arr, arr.length, imagePath);
+    if (t === 0) throw new Error(`prefillImage failed: ${this._l.baseRT_get_error() || "?"}`);
+    return t;
   }
 
   imageNumTokens(imagePath: string): number {
@@ -868,7 +932,9 @@ export class BaseRTModel {
 
   prefillAudio(tokens: number[] | Uint32Array, pcm: Float32Array): number {
     const arr = tokens instanceof Uint32Array ? tokens : Uint32Array.from(tokens);
-    return this._l.baseRT_prefill_audio(this.handle, arr, arr.length, pcm, pcm.length);
+    const t = this._l.baseRT_prefill_audio(this.handle, arr, arr.length, pcm, pcm.length);
+    if (t === 0) throw new Error(`prefillAudio failed: ${this._l.baseRT_get_error() || "?"}`);
+    return t;
   }
 
   audioNumTokens(nSamples: number): number {
@@ -876,6 +942,8 @@ export class BaseRTModel {
   }
 
   decodeStep(tokenId: number, position: number): number {
+    // baseRT_decode_step returns the sampled token ID with no 0-sentinel;
+    // token id 0 is a valid token and must not be treated as an error.
     return this._l.baseRT_decode_step(this.handle, tokenId, position);
   }
 
@@ -888,7 +956,8 @@ export class BaseRTModel {
       count,
       buf
     );
-    return Array.from(buf.subarray(0, Math.max(0, n)));
+    if (n < 0) throw new Error(`chainDecode failed: ${this._l.baseRT_get_error() || "?"}`);
+    return Array.from(buf.subarray(0, n));
   }
 
   reset(): void {
@@ -938,6 +1007,63 @@ export class BaseRTModel {
     this._l.baseRT_set_timestamps(this.handle, enabled);
   }
 
+  /** Set the Whisper task: "transcribe" (default) or "translate". */
+  setTask(task: string): void {
+    if (!this._l.baseRT_set_task(this.handle, task)) {
+      throw new Error(
+        `setTask failed: ${this._l.baseRT_get_error() || "unknown error"}`
+      );
+    }
+  }
+
+  /** Set an initial prompt to bias Whisper decoding (null clears it). */
+  setInitialPrompt(text: string | null): void {
+    this._l.baseRT_set_initial_prompt(this.handle, text);
+  }
+
+  /** Condition each 30s window on previous decoded text (default true). */
+  setConditionOnPreviousText(enabled: boolean): void {
+    this._l.baseRT_set_condition_on_previous_text(this.handle, enabled);
+  }
+
+  /** Language code of the last transcription (detected or requested). */
+  transcribeLanguage(): string {
+    return this._l.baseRT_transcribe_language(this.handle) || "";
+  }
+
+  /**
+   * Duration of the last transcription's source audio in milliseconds (the
+   * OpenAI verbose_json `duration` field is this value in fractional
+   * seconds). 0 if no transcription has run.
+   */
+  transcribeAudioDurationMs(): number {
+    return this._l.baseRT_transcribe_audio_duration_ms(this.handle);
+  }
+
+  /**
+   * Per-segment metadata for the last transcription (verbose_json surface).
+   * Empty if no transcription has run. Segment text is copied out, so the
+   * returned array stays valid after later transcriptions.
+   */
+  transcribeSegments(): TranscribeSegment[] {
+    const n = this._l.baseRT_transcribe_segment_count(this.handle);
+    const out: TranscribeSegment[] = [];
+    for (let i = 0; i < n; i++) {
+      const seg: Record<string, unknown> = {};
+      if (!this._l.baseRT_transcribe_segment(this.handle, i, seg)) break;
+      out.push({
+        startMs: seg.start_ms as number,
+        endMs: seg.end_ms as number,
+        text: (seg.text as string) || "",
+        avgLogprob: seg.avg_logprob as number,
+        noSpeechProb: seg.no_speech_prob as number,
+        compressionRatio: seg.compression_ratio as number,
+        temperature: seg.temperature as number,
+      });
+    }
+    return out;
+  }
+
   transcribe(wavPath: string, language?: string): TranscribeResult {
     const stats: Record<string, number> = {};
     const text = this._l.baseRT_transcribe(
@@ -946,7 +1072,9 @@ export class BaseRTModel {
       language ?? null,
       stats
     );
-    return { text: text || "", stats: toTranscribeStats(stats) };
+    if (text == null)
+      throw new Error(`transcribe failed: ${this._l.baseRT_get_error() || "?"}`);
+    return { text, stats: toTranscribeStats(stats) };
   }
 
   transcribePcm(samples: Float32Array, language?: string): TranscribeResult {
@@ -958,7 +1086,9 @@ export class BaseRTModel {
       language ?? null,
       stats
     );
-    return { text: text || "", stats: toTranscribeStats(stats) };
+    if (text == null)
+      throw new Error(`transcribePcm failed: ${this._l.baseRT_get_error() || "?"}`);
+    return { text, stats: toTranscribeStats(stats) };
   }
 
   transcribeStream(
@@ -1030,6 +1160,7 @@ export const __internal = {
   SamplingConfigC,
   GenerationStatsC,
   TranscribeStatsC,
+  TranscribeSegmentC,
   toSamplingC,
   toModelConfig,
 };
