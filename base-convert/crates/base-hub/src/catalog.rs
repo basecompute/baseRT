@@ -307,6 +307,31 @@ mod tests {
         assert_eq!(e.arch.as_deref(), Some("llama"));
     }
 
+    /// Every catalog `quant` must expose its bit-width to `quant_bits`, because
+    /// `basert pull <id>` with no `--target` asks for "q4" and the Catalog arm
+    /// only serves the cataloged file when the bits match. A variant whose name
+    /// hides them — `kquant-dynamic`, where the `q` is followed by `u` — silently
+    /// falls through to picking a file by filename tag instead, which for a repo
+    /// named after its upstream GGUFs fails outright:
+    ///
+    ///   no pre-converted .base for quant "q4" in this repo; it offers: 17gb, dynamic
+    ///
+    /// Hence `q4k`, not `kquant`.
+    #[test]
+    fn every_catalog_quant_exposes_its_bit_width() {
+        let cat = Catalog::bundled().unwrap();
+        for e in &cat.models {
+            assert!(
+                crate::registry::quant_bits(&e.quant).is_some(),
+                "catalog quant {:?} (id {}) hides its bit width from quant_bits — a bare \
+                 `basert pull {}` cannot match it",
+                e.quant,
+                e.id,
+                e.id
+            );
+        }
+    }
+
     #[test]
     fn find_matches_exact_and_ci() {
         let cat = Catalog::from_json(

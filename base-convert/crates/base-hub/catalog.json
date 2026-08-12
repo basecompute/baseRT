@@ -667,6 +667,26 @@
       "size": 782403584,
       "sha256": "6a99cc4edaf52c60da74edad11d45aea50fa105da05aed3215dc3544cab77161",
       "backend": "cuda"
+    },
+    {
+      "id": "basecompute/Muse-Glimmer-30B",
+      "hf_repo": "basecompute/Muse-Glimmer-30B",
+      "file": "muse-glimmer-30B-kquant-dynamic.base",
+      "source_repo": "meta-models/Muse-Glimmer-30B-GGUF",
+      "arch": "muse_glimmer",
+      "quant": "default-q4k-dynamic",
+      "size": 20952383488,
+      "sha256": "1eb639041f638099f6b1f7415c808cd6762b52be672d4ff5ef97829cc7669876"
+    },
+    {
+      "id": "basecompute/Muse-Glimmer-30B",
+      "hf_repo": "basecompute/Muse-Glimmer-30B",
+      "file": "muse-glimmer-30B-kquant-17gb.base",
+      "source_repo": "meta-models/Muse-Glimmer-30B-GGUF",
+      "arch": "muse_glimmer",
+      "quant": "q4k-17gb",
+      "size": 18054873088,
+      "sha256": "9c323d37c192e45375a936828427f50c7a303d5772465f672df478b1f8cfc1d2"
     }
   ]
 }
