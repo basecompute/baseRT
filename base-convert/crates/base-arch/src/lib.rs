@@ -9,6 +9,7 @@
 pub mod bert;
 pub mod gemma;
 pub mod llama;
+pub mod muse_glimmer;
 pub mod qwen;
 pub mod tokenizer;
 pub mod whisper;
@@ -38,6 +39,14 @@ pub fn source_mapper_for_gguf(arch: &str) -> Option<&'static dyn GgufMapper> {
         "gemma" | "gemma2" | "gemma3" => Some(&gemma::Gemma3Mapper),
         "gemma4" => Some(&gemma::Gemma4Mapper),
         "nomic-bert" => Some(&bert::NomicBertMapper),
+        // Muse Glimmer. `general.architecture` in the llama.cpp-produced
+        // GGUF is the HYPHENATED "muse-glimmer" (llama.cpp's arch registry
+        // spells multi-word archs with hyphens: "nomic-bert",
+        // "deepseek2"...), while the HF `model_type` — and therefore the
+        // canonical `.base` `arch` field — is the UNDERSCORED
+        // "muse_glimmer". Both spellings resolve here so a hand-edited or
+        // future exporter that emits the underscore form still converts.
+        "muse-glimmer" | "muse_glimmer" => Some(&muse_glimmer::MuseGlimmerGgufMapper),
         _ => None,
     }
 }
@@ -71,6 +80,22 @@ pub trait HfMapper: Sync {
     /// so relative-position structure survives) but assigns every dim-pair
     /// the wrong trained frequency — retrieval collapses as context grows.
     fn rope_permute_heads(&self, _canonical: &str, _cfg: &ArchConfig) -> Option<u32> {
+        None
+    }
+
+    /// RMS-normalize each ROW of a 2-D tensor at HF→.base conversion
+    /// time, returning the epsilon to use, or None to leave it alone.
+    ///
+    /// Muse Glimmer applies a weightless RMSNorm to the token embedding
+    /// immediately after lookup (`MuseGlimmerTextNormedEmbedding`). Since
+    /// a lookup returns exactly one row and the norm mixes nothing across
+    /// rows, it is mathematically identical to normalizing every row of
+    /// the embedding matrix up front — so the runtime needs no extra op.
+    /// (The reference keeps them separate only because its DFlash drafter
+    /// needs the un-normed embedding.) Safe only while the embedding is
+    /// NOT tied to `lm_head`, which holds for Muse Glimmer
+    /// (`tie_word_embeddings=false`). Default: no normalization.
+    fn row_rms_normalize(&self, _canonical: &str, _cfg: &ArchConfig) -> Option<f32> {
         None
     }
 }
@@ -107,6 +132,12 @@ pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMappe
         "qwen3_5" | "qwen3_5_text" | "qwen35" => Some(&qwen::Qwen35HfMapper),
         "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen35_moe" => Some(&qwen::Qwen35MoeHfMapper),
         "nomic_bert" | "nomic-bert" => Some(&bert::NomicBertHfMapper),
+        // Muse Glimmer: dense SWA/global decoder with a perception (ViT)
+        // tower. The multimodal wrapper is `muse_glimmer`
+        // (`MuseGlimmerForConditionalGeneration`) with the text tower under
+        // `text_config.model_type = muse_glimmer_text`; both resolve here so
+        // a text-only checkpoint and the multimodal wrapper convert alike.
+        "muse_glimmer" | "muse_glimmer_text" => Some(&muse_glimmer::MuseGlimmerHfMapper),
         "gemma" | "gemma2" | "gemma3" | "gemma3_text" => Some(&gemma::Gemma3HfMapper),
         // gemma3n is a distinct arch (AltUp/Laurel/per-layer-FFN); the
         // existing local fixture historically named "gemma-4-e2b" was
@@ -156,6 +187,8 @@ pub const SUPPORTED_HF_MODEL_TYPES: &[&str] = &[
     "gemma4",
     "gemma4_text",
     "gemma4_unified",
+    "muse_glimmer",
+    "muse_glimmer_text",
     "whisper",
 ];
 
@@ -174,6 +207,57 @@ pub trait GgufMapper: Sync {
     /// `rope_freqs.weight` — we precompute RoPE elsewhere or recompute
     /// at runtime).
     fn map_tensor_name(&self, gguf_name: &str) -> Option<String>;
+
+    /// RoPE row-permutation head count for a canonical tensor on the GGUF
+    /// path, or None when the tensor's rows are already in the layout this
+    /// runtime's rope kernel expects. The INVERSE of
+    /// [`HfMapper::rope_permute_heads`]: that one converts HF split-half
+    /// rows INTO the interleaved-pair layout, this one converts GGUF
+    /// interleaved-pair rows BACK to split-half.
+    ///
+    /// Background. There are two rotary row layouts in the wild:
+    ///
+    ///   - "interleaved pair" (Meta original / GPT-J): rope rotates the
+    ///     element pairs `(2i, 2i+1)`. Runtime kernel: `rope_f16`.
+    ///   - "split half" (NeoX / HF `rotate_half`): rope pairs element `i`
+    ///     with `i + head_dim/2`. Runtime kernel: `rope_neox_f16`.
+    ///
+    /// `convert_hf_to_gguf.py::LlamaModel.permute` rewrites `q_proj` /
+    /// `k_proj` from split-half into interleaved-pair when it exports an
+    /// HF checkpoint, per head:
+    ///
+    /// ```text
+    ///   gguf_row[h*HD + 2j + k] = hf_row[h*HD + k*HD/2 + j]
+    /// ```
+    ///
+    /// so the inverse this hook drives is
+    ///
+    /// ```text
+    ///   hf_row[h*HD + k*HD/2 + j] = gguf_row[h*HD + 2j + k]
+    /// ```
+    ///
+    /// Whether a GGUF needs the inverse depends on which kernel the arch
+    /// runs, NOT on the source format:
+    ///
+    ///   - llama/mistral run `rope_f16` (interleaved). llama.cpp permutes
+    ///     on export, the HF path permutes at convert time, so both
+    ///     sources agree and the GGUF needs NOTHING here. Returning
+    ///     `Some(..)` for llama would actively break it.
+    ///   - gemma/qwen/nomic-bert run `rope_neox_f16`, and llama.cpp does
+    ///     NOT permute those archs on export — again nothing to do.
+    ///   - Muse Glimmer runs `rope_neox_f16` (split-half) but its
+    ///     llama.cpp exporter DOES apply the Llama permute. That is the
+    ///     one combination that needs undoing, and it is why this hook
+    ///     exists.
+    ///
+    /// The permutation moves whole ROWS (output features), never elements
+    /// within a row, so it can be applied to packed k-quant blocks by
+    /// reordering row-sized byte runs — no dequantization, fully lossless.
+    /// The caller must still check that each row is a whole number of
+    /// blocks (`in_features % block_elems == 0`).
+    fn rope_unpermute_heads(&self, _canonical: &str, _cfg: &ArchConfig) -> Option<u32> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -313,6 +397,37 @@ pub struct ArchConfig {
     // The decoder half reuses the standard fields above (hidden_size /
     // num_hidden_layers / num_attention_heads / intermediate_size /
     // max_position_embeddings); the encoder half is described here.
+    // ── Muse Glimmer fields (zero/empty for other archs) ─────────────
+    /// Multiplier applied to Q AFTER the scaleless (weightless) QK-norm,
+    /// on top of the standard `1/sqrt(head_dim)` attention scaling
+    /// (`qk_scale_factor`, 3.87 on the released checkpoint). 0 = not a
+    /// Muse-Glimmer-style model. Distinct from `attention_scale`, which
+    /// REPLACES the `1/sqrt(head_dim)` term rather than scaling it.
+    pub qk_scale_factor: f32,
+    /// Scale applied to the logits BEFORE the final tanh softcap
+    /// (`output_multiplier`; `1/sqrt(hidden_size/256)` on the released
+    /// checkpoint). 0 = no multiplier.
+    pub output_multiplier: f32,
+    /// Epsilon for the post-attention / post-FFN norms, which differs
+    /// from `rms_norm_eps` on Muse Glimmer (1e-8 vs 1e-5). 0 = reuse
+    /// `rms_norm_eps` for every norm.
+    pub post_norm_eps: f32,
+    /// Epsilon for a weightless RMSNorm the RUNTIME must apply to the token
+    /// embedding after lookup. 0 = the norm is already folded into the
+    /// embedding rows (the HF path does this via `row_rms_normalize`, which is
+    /// exact) or the arch has no such norm.
+    ///
+    /// The GGUF path cannot fold it: the rows arrive as packed k-quant
+    /// super-blocks, and folding would require dequantizing — the very thing
+    /// passthrough exists to avoid. So a GGUF-sourced Muse Glimmer bundle sets
+    /// this and pays for one extra kernel per prefill instead.
+    pub embed_norm_eps: f32,
+
+    /// Per-layer NoPE mask (true = layer applies NO rotary embedding).
+    /// Derived from `layer_rope_theta[i] == 0`. Empty = every layer
+    /// gets RoPE. Length = num_hidden_layers.
+    pub nope_layers: Vec<bool>,
+
     /// Encoder transformer depth (`encoder_layers`). 0 = not an
     /// encoder-decoder model.
     pub encoder_layers: u32,
@@ -492,6 +607,23 @@ impl ArchConfig {
         }
         if self.attn_output_gate {
             m.insert("attn_output_gate".into(), json!(self.attn_output_gate));
+        }
+        // Muse Glimmer scales / epsilons / NoPE schedule — emitted only
+        // when set so other archs' headers stay unchanged.
+        if self.qk_scale_factor > 0.0 {
+            m.insert("qk_scale_factor".into(), json!(self.qk_scale_factor));
+        }
+        if self.output_multiplier > 0.0 {
+            m.insert("output_multiplier".into(), json!(self.output_multiplier));
+        }
+        if self.post_norm_eps > 0.0 {
+            m.insert("post_norm_eps".into(), json!(self.post_norm_eps));
+        }
+        if !self.nope_layers.is_empty() {
+            m.insert("nope_layers".into(), json!(self.nope_layers));
+        }
+        if self.embed_norm_eps > 0.0 {
+            m.insert("embed_norm_eps".into(), json!(self.embed_norm_eps));
         }
         if self.partial_rotary_factor > 0.0 {
             m.insert(

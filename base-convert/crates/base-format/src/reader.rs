@@ -199,11 +199,25 @@ impl BaseReader {
     /// Compute the file offset where the slots section begins. One byte
     /// past the last tensor's end, rounded up to 8 bytes.
     fn slots_offset(&self) -> u64 {
-        let blob_end = self
+        // Multimodal bundles write the vision/audio tower payloads into the
+        // SAME blob but list them under `header.mmproj.tensors`, so scanning
+        // only `header.tensors` puts this offset in the middle of the tower
+        // data. read_slots then parses tensor bytes as a slot header and
+        // trips a wild length prefix (observed: a 6.3-exabyte allocation on
+        // a Muse Glimmer bundle). Walk both lists.
+        let main_end = self
             .header
             .tensors
             .iter()
-            .map(|t| self.blob_offset + t.offset + t.length)
+            .map(|t| self.blob_offset + t.offset + t.length);
+        let mmproj_end = self
+            .header
+            .mmproj
+            .iter()
+            .flat_map(|m| m.tensors.iter())
+            .map(|t| self.blob_offset + t.offset + t.length);
+        let blob_end = main_end
+            .chain(mmproj_end)
             .max()
             .unwrap_or(self.blob_offset);
         (blob_end + 7) & !7u64

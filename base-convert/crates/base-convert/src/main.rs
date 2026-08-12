@@ -129,6 +129,55 @@ struct ConvertArgs {
     /// the fp16 checkpoint locally.
     #[arg(long)]
     allow_quant_from_quant: bool,
+
+    /// GGUF sources only: copy Q4_K / Q5_K / Q6_K super-blocks into the
+    /// bundle VERBATIM instead of dequantizing and re-packing them.
+    ///
+    /// This is lossless — the exact block bytes land in the `.base`
+    /// weights blob, tagged with `layout = gguf_super`, `group_size =
+    /// 256` and the source `ggml_type` (12/13/14) so the runtime can
+    /// dispatch a native k-quant kernel. It is therefore NOT
+    /// "quant-from-quant" and does not need `--allow-quant-from-quant`;
+    /// the canonical-quant spec forbids dequant→requant precisely
+    /// because it compounds error, and passthrough introduces none.
+    ///
+    /// Opt-in rather than automatic: a bundle written this way needs
+    /// runtime kernels that read GGUF super-blocks, so flipping it on by
+    /// default would change what existing GGUF conversions produce.
+    /// Non-k-quant tensors (F32/F16 norms, Q4_0/Q8_0 weights) are
+    /// unaffected and take the normal path.
+    #[arg(long)]
+    kquant_passthrough: bool,
+
+    /// GGUF sources only: fold a companion `mmproj-*.gguf` perception tower
+    /// into the bundle, so one `.base` carries both the text model and the
+    /// vision encoder.
+    ///
+    /// Without this, a GGUF-sourced bundle is TEXT-ONLY: llama.cpp ships the
+    /// tower as a separate `mmproj` file and the text GGUF contains none of
+    /// its tensors. The HF/safetensors path has no equivalent flag because
+    /// the tower already lives in the same checkpoint.
+    ///
+    /// The tower's tensors are renamed into the same canonical `vision.*`
+    /// vocabulary the safetensors path produces (asserted by
+    /// `mmproj_hf_and_gguf_agree`), so both sources yield interchangeable
+    /// bundles. Tower weights honour `--kquant-passthrough` exactly like the
+    /// text weights do.
+    ///
+    /// NOTE: an mmproj GGUF carries the tower geometry (`clip.vision.*`) but
+    /// NOT the wrapper-level multimodal settings — image/video token ids,
+    /// pooling kernel, soft-token count, tower RoPE theta. Those come from a
+    /// per-projector-type table keyed on `clip.projector_type`, or from
+    /// `--mmproj-config` when you have the original HF configs. Every
+    /// assumed value is printed at conversion time.
+    #[arg(long, value_name = "PATH")]
+    mmproj: Option<PathBuf>,
+
+    /// HF `config.json` (and sibling `processor_config.json`, if present)
+    /// to source the multimodal settings an mmproj GGUF cannot carry.
+    /// Overrides the built-in per-projector-type defaults.
+    #[arg(long, value_name = "PATH", requires = "mmproj")]
+    mmproj_config: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -341,7 +390,13 @@ fn cmd_convert(args: ConvertArgs) -> Result<()> {
         .with_context(|| format!("detecting format for {:?}", args.input))?;
 
     match fmt {
-        SourceFormat::Gguf => convert_gguf(&args.input, &output, &ctx),
+        SourceFormat::Gguf => convert_gguf(
+            &args.input,
+            &output,
+            &ctx,
+            args.mmproj.as_deref(),
+            args.mmproj_config.as_deref(),
+        ),
         SourceFormat::HfSafetensors => convert_hf(&args.input, &output, &ctx),
         SourceFormat::MlxSafetensors => convert_mlx(&args.input, &output, &ctx),
     }
@@ -356,6 +411,8 @@ fn convert_gguf(
     input: &std::path::Path,
     output: &std::path::Path,
     ctx: &QuantContext,
+    mmproj: Option<&std::path::Path>,
+    mmproj_config: Option<&std::path::Path>,
 ) -> Result<()> {
     use base_arch::source_mapper_for_gguf;
     use base_format::{
@@ -373,6 +430,20 @@ fn convert_gguf(
         .ok_or_else(|| anyhow::anyhow!("GGUF missing general.architecture"))?;
     eprintln!("  arch:    {}", arch);
 
+    // `--kquant-passthrough`: which tensors will be copied verbatim.
+    // Only the 256-element k-quant super-block families qualify — those
+    // are the layouts `Layout::GgufSuper` + `source_ggml_type` describe
+    // and the ones the runtime knows how to dispatch natively.
+    let kquant_passthrough = ctx.kquant_passthrough;
+    let is_kquant = |t: GgmlType| matches!(t, GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K);
+    let has_kquant = gguf.tensors.iter().any(|t| is_kquant(t.ggml_type));
+    if kquant_passthrough && !has_kquant {
+        eprintln!(
+            "  warning: --kquant-passthrough set but no Q4_K/Q5_K/Q6_K tensors \
+             in this GGUF; every tensor takes the normal convert path"
+        );
+    }
+
     // Per CANONICAL_QUANT_SPEC.md: profile-driven canonical-quant
     // requires fp16/bf16/fp32 source. A GGUF with quantized weight
     // tensors (Q4_0/Q5_0/Q4_K/Q8_0/...) is already-quantized;
@@ -380,8 +451,16 @@ fn convert_gguf(
     // Reject by default; users explicitly opt in via
     // `--allow-quant-from-quant`. F16/BF16/F32 only-tensor GGUFs
     // (rare; usually only norms are non-quant) pass through silently.
+    //
+    // Tensors headed for k-quant PASSTHROUGH are exempt: they are never
+    // dequantized, so there is no compounded error to acknowledge. The
+    // guard still fires for anything else quantized in the same file
+    // (a stray Q4_0 / Q8_0 tensor does get dequant→requant).
     if ctx.profile.is_some() && !ctx.allow_quant_from_quant {
         for tensor in gguf.tensors.iter() {
+            if kquant_passthrough && is_kquant(tensor.ggml_type) {
+                continue;
+            }
             if !matches!(
                 tensor.ggml_type,
                 GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
@@ -412,16 +491,24 @@ fn convert_gguf(
         config.vocab_size
     );
 
-    let quant_scheme = match target {
-        TargetScheme::BaseQ2 => QuantScheme::BaseQ2,
-        TargetScheme::BaseQ3 => QuantScheme::BaseQ3,
-        TargetScheme::BaseQ4 => QuantScheme::BaseQ4,
-        TargetScheme::BaseQ5 => QuantScheme::BaseQ5,
-        TargetScheme::BaseQ6 => QuantScheme::BaseQ6,
-        TargetScheme::BaseQ8 => QuantScheme::BaseQ8,
-        TargetScheme::Bf16 => QuantScheme::Bf16,
-        TargetScheme::Mxfp4 => QuantScheme::Mxfp4,
-        TargetScheme::Nvfp4 => QuantScheme::Nvfp4,
+    // With passthrough active on a file that actually has k-quants, the
+    // bundle's dominant weight layout IS the GGUF super-block one — say
+    // so in the header rather than advertising a canonical scheme the
+    // big tensors don't use.
+    let quant_scheme = if kquant_passthrough && has_kquant {
+        QuantScheme::PassthroughGguf
+    } else {
+        match target {
+            TargetScheme::BaseQ2 => QuantScheme::BaseQ2,
+            TargetScheme::BaseQ3 => QuantScheme::BaseQ3,
+            TargetScheme::BaseQ4 => QuantScheme::BaseQ4,
+            TargetScheme::BaseQ5 => QuantScheme::BaseQ5,
+            TargetScheme::BaseQ6 => QuantScheme::BaseQ6,
+            TargetScheme::BaseQ8 => QuantScheme::BaseQ8,
+            TargetScheme::Bf16 => QuantScheme::Bf16,
+            TargetScheme::Mxfp4 => QuantScheme::Mxfp4,
+            TargetScheme::Nvfp4 => QuantScheme::Nvfp4,
+        }
     };
 
     let mut header = Header {
@@ -497,6 +584,8 @@ fn convert_gguf(
     // → GPU region.
     let mut dropped = 0usize;
     let mut kept = 0usize;
+    let mut passthrough_tensors = 0usize;
+    let mut unpermuted = 0usize;
     for info in gguf.tensors.iter() {
         let Some(canonical) = mapper.map_tensor_name(&info.name) else {
             dropped += 1;
@@ -504,9 +593,45 @@ fn convert_gguf(
         };
         kept += 1;
 
-        let bytes = gguf
+        let raw = gguf
             .tensor_bytes(info)
             .with_context(|| format!("reading {:?}", info.name))?;
+
+        // ── RoPE row layout fixup ───────────────────────────────────
+        // Some exporters (llama.cpp's Llama-family converter, and the
+        // Muse Glimmer converter derived from it) rewrite q/k rows from
+        // the split-half rotary layout into the interleaved-pair one.
+        // Archs whose runtime kernel is NeoX/split-half need that undone.
+        // Done on the RAW bytes, before any dequant, so the packed and
+        // the dequantized paths share one implementation — and so a
+        // k-quant tensor can be un-permuted without unpacking it (the
+        // permutation only ever moves whole rows).
+        let unpermuted_bytes = match mapper.rope_unpermute_heads(&canonical, &config) {
+            Some(n_heads) => {
+                let out = unpermute_rope_rows(info, raw, n_heads).with_context(|| {
+                    format!("rope row un-permute for {:?}", info.name)
+                })?;
+                unpermuted += 1;
+                Some(out)
+            }
+            None => None,
+        };
+        let bytes: &[u8] = unpermuted_bytes.as_deref().unwrap_or(raw);
+
+        // ── k-quant passthrough ─────────────────────────────────────
+        // Copy the super-blocks in verbatim. Must come BEFORE the
+        // dequant below: the canonical-quant spec forbids the
+        // dequantize-and-repack round trip as lossy, and passthrough is
+        // the lossless alternative. k-quants carry their scales and mins
+        // INSIDE each 256-element block, so there are no separate
+        // scale/bias regions — `scale_offset` / `bias_offset` stay None
+        // and the runtime keys off `source_ggml_type` + `Layout::GgufSuper`.
+        if kquant_passthrough && is_kquant(info.ggml_type) {
+            let (entry, data) = kquant_passthrough_entry(info, bytes, canonical);
+            passthrough_tensors += 1;
+            writer.add_tensor(TensorPayload { entry, data });
+            continue;
+        }
 
         let f32s = dequant_to_f32(info, bytes).with_context(|| {
             format!(
@@ -736,6 +861,232 @@ fn convert_gguf(
         writer.add_tensor(TensorPayload { entry, data });
     }
     eprintln!("  mapped:  {} tensors kept, {} dropped", kept, dropped);
+    if unpermuted > 0 {
+        eprintln!(
+            "  rope:    un-permuted {} q/k tensors into split-half (NeoX) row order",
+            unpermuted
+        );
+    }
+    if passthrough_tensors > 0 {
+        eprintln!(
+            "  kquant:  {} tensors passed through verbatim (no dequant/repack)",
+            passthrough_tensors
+        );
+    }
+
+    // ── Companion mmproj tower (--mmproj) ───────────────────────────
+    //
+    // llama.cpp ships the perception tower as a SEPARATE mmproj GGUF, so
+    // without this a GGUF-sourced bundle is text-only. The tensors go into
+    // the same blob but are listed under `header.mmproj.tensors`, so a
+    // text-only runtime skips them.
+    //
+    // No SSM / embedding / rope-permute special cases apply here: a ViT has
+    // none of those. What it does have is 1-D norms AND biases (every linear
+    // in this tower is biased), which must not be quantized — the shape
+    // check below catches both.
+    if let Some(mmproj_path) = mmproj {
+        let mm = GgufFile::open(mmproj_path)
+            .with_context(|| format!("opening mmproj GGUF {:?}", mmproj_path))?;
+        match mm.metadata.get("general.type").and_then(|v| v.as_str()) {
+            Some("mmproj") => {}
+            other => bail!(
+                "{:?} is not an mmproj GGUF (general.type = {:?}); pass the companion \
+                 mmproj-*.gguf, not the text model",
+                mmproj_path,
+                other.unwrap_or("<missing>")
+            ),
+        }
+
+        let hf_cfg = match mmproj_config {
+            Some(p) => {
+                let bytes = std::fs::read(p)
+                    .with_context(|| format!("reading --mmproj-config {:?}", p))?;
+                let v: serde_json::Value = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parsing --mmproj-config {:?}", p))?;
+                // Tower geometry still comes from the GGUF; this only
+                // supplies the wrapper-level scalars, which sit at the top
+                // level of an HF config.json.
+                Some(v)
+            }
+            None => None,
+        };
+        let (mm_cfg, patch_expand) = mmproj_config_from_gguf(&mm, hf_cfg.as_ref())?;
+
+        writer.set_mmproj_arch(format!("{}_mm", mapper.canonical_arch()));
+        writer.set_mmproj_config(mm_cfg);
+
+        let mut mm_kept = 0usize;
+        let mut mm_passthrough = 0usize;
+        for info in mm.tensors.iter() {
+            // Unknown names are fatal, not skipped: a silently dropped tower
+            // weight produces plausible-looking output, not an error.
+            let canonical = base_arch::muse_glimmer::map_mmproj_gguf_name(&info.name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unmapped mmproj tensor {:?} — refusing to drop a tower weight",
+                        info.name
+                    )
+                })?;
+            let raw = mm
+                .tensor_bytes(info)
+                .with_context(|| format!("reading mmproj {:?}", info.name))?;
+
+            // Same routing rule as the HF mmproj path (see convert_generic):
+            // only a plain, group-aligned 2-D linear weight may carry a
+            // packed dtype. The runtime reads pos_embed / patch_embed /
+            // norms / biases as raw F16 via `tensor_raw_ptr`, so giving any
+            // of them a packed dtype breaks the vision encoder — and
+            // pos_embed is 2-D AND group-aligned, so a shape check alone
+            // does not catch it. It surfaces as
+            // "pos_embed missing/unsupported dtype" and a null tower.
+            //
+            // Evaluated BEFORE the passthrough branch so a k-quant tower
+            // tensor cannot bypass it either.
+            // GGUF records ne innermost-first, so a Linear lands as
+            // [in, out] where the HF path records [out, in] — the SAME
+            // bytes, described in the opposite order. The vision encoder
+            // sizes its GEMMs from this shape, so it has to be normalized
+            // to the HF convention or every tower matmul is transposed.
+            let mm_shape: Vec<u64> = if info.shape.len() == 2 {
+                vec![info.shape[1], info.shape[0]]
+            } else {
+                info.shape.clone()
+            };
+            let logical_count: usize = info.shape.iter().map(|d| *d as usize).product();
+            let must_stay_raw = info.shape.len() != 2
+                || logical_count < 64
+                || logical_count % 64 != 0
+                || canonical.contains("pos_embed")
+                || canonical.contains("patch_embed")
+                || canonical.ends_with(".bias");
+
+            if !must_stay_raw && kquant_passthrough && is_kquant(info.ggml_type) {
+                let (entry, data) = kquant_passthrough_entry(info, raw, canonical);
+                mm_passthrough += 1;
+                mm_kept += 1;
+                writer.add_mmproj_tensor(TensorPayload { entry, data });
+                continue;
+            }
+
+            let mut f32s = dequant_to_f32(info, raw).with_context(|| {
+                format!(
+                    "dequant mmproj {:?} type={}",
+                    info.name,
+                    ggml_type_name(info.ggml_type)
+                )
+            })?;
+
+            // MMPROJ_PATCH_EXPAND — widen the collapsed patch embedder back
+            // to the checkpoint's temporal depth.
+            //
+            // llama.cpp stores `Wa + Wb` (the temporal halves SUMMED, verified
+            // byte-exact against the bf16 checkpoint) at width 3*patch^2,
+            // where the model's own embedder is a Linear over
+            // temporal*3*patch^2. The preprocessor feeds `[f; f]` — the same
+            // frame in every slice — so writing `[Wa+Wb | 0]` reproduces
+            // `(Wa+Wb)·f` exactly while keeping the declared width, and hence
+            // the encoder's whole dispatch, identical to the safetensors
+            // path. Zero-padding rather than halving keeps it exact instead
+            // of merely close.
+            //
+            // Row-major [out][in]: each output row gets its 588 real weights
+            // followed by (expand-1)*588 zeros.
+            let mut mm_shape = mm_shape;
+            if patch_expand > 1 && canonical == "vision.patch_embed.weight" {
+                let out_w = *info.shape.last().unwrap_or(&1) as usize;
+                let in_w = f32s.len() / out_w.max(1);
+                let new_in = in_w * patch_expand as usize;
+                let mut wide = vec![0.0f32; out_w * new_in];
+                for o in 0..out_w {
+                    wide[o * new_in..o * new_in + in_w]
+                        .copy_from_slice(&f32s[o * in_w..(o + 1) * in_w]);
+                }
+                f32s = wide;
+                mm_shape = vec![out_w as u64, new_in as u64];
+            }
+
+            let (entry, data) = if must_stay_raw {
+                let bytes: Vec<u8> = f32s
+                    .iter()
+                    .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
+                    .collect();
+                let entry = base_format::TensorEntry {
+                    name: canonical,
+                    dtype: TensorDtype::F16,
+                    shape: mm_shape.clone(),
+                    offset: 0,
+                    length: bytes.len() as u64,
+                    scale_offset: None,
+                    scale_length: None,
+                    bias_offset: None,
+                    bias_length: None,
+                    awq_scale_offset: None,
+                    awq_scale_length: None,
+                    group_size: None,
+                    layout: None,
+                    residency: Some(base_format::ResidencyHint::Hot),
+                    compute_region: ComputeRegion::Gpu,
+                    scale_dtype: None,
+                    symmetric: false,
+                    flags: TensorFlags::empty(),
+                    checksum_xxh64: None,
+                    source_ggml_type: None,
+                };
+                (entry, bytes)
+            } else {
+                // Tower linears take the plain target packing — no profile
+                // lookup. A quant profile's rules are written against text
+                // tensor names and would not match `vision.*` anyway.
+                let (packed, dtype) = pack_for_target(&f32s, target)?;
+                let mut data = Vec::with_capacity(
+                    packed.packed_weights.len() + packed.scales.len() + packed.biases.len(),
+                );
+                data.extend_from_slice(&packed.packed_weights);
+                let scale_off = data.len() as u64;
+                data.extend_from_slice(&packed.scales);
+                let bias_off = data.len() as u64;
+                data.extend_from_slice(&packed.biases);
+                let mut entry = base_format::TensorEntry {
+                    name: canonical,
+                    dtype,
+                    shape: mm_shape.clone(),
+                    offset: 0,
+                    length: 0,
+                    scale_offset: (!packed.scales.is_empty()).then_some(scale_off),
+                    scale_length: (!packed.scales.is_empty())
+                        .then_some(packed.scales.len() as u64),
+                    bias_offset: (!packed.biases.is_empty()).then_some(bias_off),
+                    bias_length: (!packed.biases.is_empty())
+                        .then_some(packed.biases.len() as u64),
+                    awq_scale_offset: None,
+                    awq_scale_length: None,
+                    group_size: (packed.group_size > 0).then_some(packed.group_size),
+                    layout: None,
+                    residency: Some(base_format::ResidencyHint::Warm),
+                    compute_region: ComputeRegion::Accelerator,
+                    scale_dtype: packed.scale_dtype,
+                    symmetric: false,
+                    flags: TensorFlags::empty(),
+                    checksum_xxh64: None,
+                    source_ggml_type: None,
+                };
+                entry.length = data.len() as u64;
+                (entry, data)
+            };
+            mm_kept += 1;
+            writer.add_mmproj_tensor(TensorPayload { entry, data });
+        }
+        eprintln!(
+            "  mmproj:  {} tower tensors folded in{}",
+            mm_kept,
+            if mm_passthrough > 0 {
+                format!(" ({} passed through verbatim)", mm_passthrough)
+            } else {
+                String::new()
+            }
+        );
+    }
 
     writer.finish().context("writing bundle")?;
 
@@ -754,6 +1105,157 @@ fn convert_gguf(
         std::fs::metadata(output)?.len() / (1024 * 1024)
     );
     Ok(())
+}
+
+/// Undo llama.cpp's per-head rotary ROW permutation on a GGUF tensor,
+/// operating on the raw (possibly still packed) bytes.
+///
+/// `convert_hf_to_gguf.py::LlamaModel.permute` rewrites `q_proj`/`k_proj`
+/// from the HF split-half layout into the interleaved-pair one:
+///
+/// ```text
+///   gguf_row[h*HD + 2j + k] = hf_row[h*HD + k*HD/2 + j]
+/// ```
+///
+/// so this applies the inverse, `dst[h*HD + k*HD/2 + j] = src[h*HD + 2j + k]`,
+/// restoring the split-half order the NeoX rope kernel expects. The two
+/// fixed points per head — rows `0` and `HD-1`, the only `(j,k)` with
+/// `2j+k == k*HD/2 + j` — are why a permuted and an unpermuted tensor
+/// still agree on exactly those rows; anything that "matches on rows 0 and
+/// HD-1 only" is this permutation.
+///
+/// Why this is safe on packed k-quants: the permutation moves whole
+/// ROWS (output features) and never reorders elements WITHIN a row. GGUF
+/// stores `ne[0]` (the in-features axis) contiguously, so one row is a
+/// contiguous byte run, and as long as the row length is a whole number
+/// of quant blocks the reorder is a pure `memcpy` shuffle — bit-exact,
+/// no dequantization. A row length that straddles a block boundary would
+/// NOT be safe, so that is checked and rejected rather than assumed.
+fn unpermute_rope_rows(
+    info: &base_readers::gguf::TensorInfo,
+    bytes: &[u8],
+    n_heads: u32,
+) -> Result<Vec<u8>> {
+    let n_heads = n_heads as usize;
+    if n_heads == 0 {
+        bail!("head count is zero");
+    }
+    // GGUF dimension order: ne[0] is the fastest-varying axis (in
+    // features); every later dim multiplies the row count.
+    let row_elems = *info
+        .shape
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("tensor has no dimensions"))? as usize;
+    let total_elems: u64 = info.shape.iter().product();
+    if row_elems == 0 || total_elems % row_elems as u64 != 0 {
+        bail!("shape {:?} is not a whole number of rows", info.shape);
+    }
+    let n_rows = (total_elems / row_elems as u64) as usize;
+
+    let (block_elems, block_bytes) = info.ggml_type.block_geometry();
+    if row_elems % block_elems != 0 {
+        bail!(
+            "row length {} is not a multiple of the {} block size {} — the rope \
+             row permute cannot be applied to packed blocks that straddle rows; \
+             re-convert this tensor from the fp16/bf16 checkpoint instead",
+            row_elems,
+            base_readers::gguf::ggml_type_name(info.ggml_type),
+            block_elems
+        );
+    }
+    let row_bytes = row_elems / block_elems * block_bytes;
+    if bytes.len() != n_rows * row_bytes {
+        bail!(
+            "byte length {} != rows {} x row_bytes {}",
+            bytes.len(),
+            n_rows,
+            row_bytes
+        );
+    }
+
+    if n_rows % n_heads != 0 {
+        bail!("row count {} not divisible by head count {}", n_rows, n_heads);
+    }
+    let hd = n_rows / n_heads;
+    if hd % 2 != 0 {
+        bail!("head_dim {} is odd — rotary needs dimension pairs", hd);
+    }
+    let half = hd / 2;
+
+    let mut out = vec![0u8; bytes.len()];
+    for h in 0..n_heads {
+        for k in 0..2usize {
+            for j in 0..half {
+                let src = h * hd + 2 * j + k;
+                let dst = h * hd + k * half + j;
+                out[dst * row_bytes..(dst + 1) * row_bytes]
+                    .copy_from_slice(&bytes[src * row_bytes..(src + 1) * row_bytes]);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Build the `.base` entry for a GGUF k-quant tensor copied through
+/// verbatim. The payload is the source super-block bytes unchanged.
+///
+/// A k-quant super-block is self-describing — the 256 elements, their
+/// 6-bit sub-scales, the block `d`/`dmin` and (Q5_K/Q6_K) the high-bit
+/// planes all live inside the block — so there are no separate scale or
+/// bias regions to point at. `dtype` records the bit-width so any tool
+/// that ignores `source_ggml_type` still sizes the tensor correctly,
+/// while the runtime's `BaseWeightStore::get_dtype` short-circuits on
+/// `source_ggml_type` and dispatches the native GGUF kernel.
+fn kquant_passthrough_entry(
+    info: &base_readers::gguf::TensorInfo,
+    bytes: &[u8],
+    canonical: String,
+) -> (base_format::TensorEntry, Vec<u8>) {
+    use base_format::{ComputeRegion, Layout, TensorDtype, TensorFlags};
+    use base_readers::gguf::GgmlType;
+
+    let (dtype, ggml_code) = match info.ggml_type {
+        GgmlType::Q4K => (TensorDtype::BaseQ4, 12u32),
+        GgmlType::Q5K => (TensorDtype::BaseQ5, 13u32),
+        GgmlType::Q6K => (TensorDtype::BaseQ6, 14u32),
+        // Unreachable: the caller gates on the same three types.
+        other => unreachable!("kquant passthrough called with {other:?}"),
+    };
+    // Same role-based routing the re-quantizing path uses: the
+    // embed/lm_head pair stays hot in the GPU region, bulk layer weights
+    // go warm to the accelerator region.
+    let is_embedding = canonical == "embed_tokens.weight" || canonical == "lm_head.weight";
+    let (region, residency) = if is_embedding {
+        (ComputeRegion::Gpu, base_format::ResidencyHint::Hot)
+    } else {
+        (ComputeRegion::Accelerator, base_format::ResidencyHint::Warm)
+    };
+
+    let data = bytes.to_vec();
+    let entry = base_format::TensorEntry {
+        name: canonical,
+        dtype,
+        shape: info.shape.clone(),
+        offset: 0,
+        length: data.len() as u64,
+        // Scales/mins live inside each super-block — no side regions.
+        scale_offset: None,
+        scale_length: None,
+        bias_offset: None,
+        bias_length: None,
+        awq_scale_offset: None,
+        awq_scale_length: None,
+        group_size: Some(256),
+        layout: Some(Layout::GgufSuper),
+        residency: Some(residency),
+        compute_region: region,
+        scale_dtype: None,
+        symmetric: false,
+        flags: TensorFlags::empty(),
+        checksum_xxh64: None,
+        source_ggml_type: Some(ggml_code),
+    };
+    (entry, data)
 }
 
 /// Convert from an HF safetensors directory.
@@ -856,6 +1358,7 @@ fn convert_hf(
         mmproj_cfg,
         &|n| mapper.norm_shift(n),
         &|n| mapper.rope_permute_heads(n, &config_for_permute),
+        &|n| mapper.row_rms_normalize(n, &config_for_permute),
     )
 }
 
@@ -1304,6 +1807,7 @@ fn convert_mlx(
         mmproj_cfg,
         &|n| mapper.norm_shift(n),
         &|n| mapper.rope_permute_heads(n, &config_for_permute),
+        &|n| mapper.row_rms_normalize(n, &config_for_permute),
     )
 }
 
@@ -1329,6 +1833,264 @@ fn tokenizer_from_hf(hf: &base_readers::hf::HfDir) -> std::collections::BTreeMap
         m.insert("tokenizer.chat_template".into(), json!(jinja));
     }
     m
+}
+
+/// Wrapper-level multimodal settings an mmproj GGUF cannot carry, keyed on
+/// `clip.projector_type`.
+///
+/// An mmproj GGUF describes the TOWER (`clip.vision.*`: depth, widths, head
+/// count, patch/image size, merge size) but nothing about how the text model
+/// splices its output in — the image/video token ids, the pooling kernel, the
+/// soft-token count and the tower's RoPE theta all live in the HF
+/// `config.json` / `processor_config.json` that llama.cpp consumed and did
+/// not re-emit. Without them the runtime cannot place image embeddings.
+///
+/// These values were read back out of a known-good HF-sourced bundle for the
+/// same checkpoint, so they are transcriptions rather than guesses — but they
+/// are still per-checkpoint constants, which is why an unknown projector type
+/// is a hard error and `--mmproj-config` always wins.
+struct ProjectorDefaults {
+    image_token_id: u64,
+    video_token_id: Option<u64>,
+    vision_soft_tokens_per_image: u64,
+    pooling_kernel_size: Option<u64>,
+    rope_theta: f32,
+    /// Temporal depth of the checkpoint's patch embedder. The published
+    /// mmproj may store fewer slices (llama.cpp collapses them by summing);
+    /// the tower is widened back to this before it reaches the runtime.
+    temporal_patch_size: u64,
+}
+
+fn projector_defaults(projector_type: &str) -> Option<ProjectorDefaults> {
+    match projector_type {
+        // meta-models/Muse-Glimmer-30B. Verified against muse-glimmer-q4.base
+        // (converted from the safetensors checkpoint): image token 200092,
+        // one soft token per image, tower RoPE theta 10000.
+        "muse-glimmer" => Some(ProjectorDefaults {
+            image_token_id: 200092,
+            video_token_id: None,
+            vision_soft_tokens_per_image: 1,
+            pooling_kernel_size: None,
+            rope_theta: 10000.0,
+            temporal_patch_size: 2,
+        }),
+        _ => None,
+    }
+}
+
+/// Build the mmproj config block from an mmproj GGUF's `clip.*` metadata,
+/// the tower's own tensor shapes, and either `--mmproj-config` or the
+/// per-projector-type table above.
+///
+/// Emits the SAME schema `mmproj_config_from_hf` does — a `vision_config`
+/// sub-object plus the wrapper-level scalars — because the runtime parses one
+/// shape regardless of which converter path wrote the bundle.
+fn mmproj_config_from_gguf(
+    mm: &base_readers::gguf::GgufFile,
+    hf_config: Option<&serde_json::Value>,
+) -> Result<(std::collections::BTreeMap<String, serde_json::Value>, u64)> {
+    use serde_json::json;
+    let meta = &mm.metadata;
+    let get_u64 = |k: &str| meta.get(k).and_then(|v| v.as_u64());
+    let get_f32 = |k: &str| meta.get(k).and_then(|v| v.as_f32());
+
+    let projector_type = meta
+        .get("clip.projector_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("mmproj GGUF missing clip.projector_type"))?
+        .to_string();
+
+    // Tower geometry — straight out of clip.vision.*.
+    let hidden = get_u64("clip.vision.embedding_length")
+        .ok_or_else(|| anyhow::anyhow!("mmproj missing clip.vision.embedding_length"))?;
+    let layers = get_u64("clip.vision.block_count")
+        .ok_or_else(|| anyhow::anyhow!("mmproj missing clip.vision.block_count"))?;
+    let heads = get_u64("clip.vision.attention.head_count")
+        .ok_or_else(|| anyhow::anyhow!("mmproj missing clip.vision.attention.head_count"))?;
+    let ffn = get_u64("clip.vision.feed_forward_length")
+        .ok_or_else(|| anyhow::anyhow!("mmproj missing clip.vision.feed_forward_length"))?;
+    let patch = get_u64("clip.vision.patch_size")
+        .ok_or_else(|| anyhow::anyhow!("mmproj missing clip.vision.patch_size"))?;
+    let image_size = get_u64("clip.vision.image_size")
+        .ok_or_else(|| anyhow::anyhow!("mmproj missing clip.vision.image_size"))?;
+    let out_hidden = get_u64("clip.vision.projection_dim")
+        .ok_or_else(|| anyhow::anyhow!("mmproj missing clip.vision.projection_dim"))?;
+    let merge = get_u64("clip.vision.spatial_merge_size").unwrap_or(1);
+    let eps = get_f32("clip.vision.attention.layer_norm_epsilon").unwrap_or(1e-5);
+
+    // Derived from tensor shapes rather than metadata, because llama.cpp
+    // does not record either. GGUF dims are innermost-first, so a Linear
+    // stored [in, out] means ne[1] is the output width.
+    let projector_hidden = mm
+        .tensor_by_name("mm.1.weight")
+        .and_then(|t| t.shape.get(1).copied())
+        .ok_or_else(|| anyhow::anyhow!("mmproj missing mm.1.weight (projector hidden width)"))?;
+    // The learned position table is a [pos_h * pos_w, dim] grid the runtime
+    // bilinearly resamples per image. The reader wants the two sides, not the
+    // product, and the grid is square for every projector shipped so far.
+    let pos_embed_size = mm
+        .tensor_by_name("v.position_embd.weight")
+        .and_then(|t| t.shape.get(1).copied())
+        .ok_or_else(|| anyhow::anyhow!("mmproj missing v.position_embd.weight"))?;
+    let pos_embed_side = (pos_embed_size as f64).sqrt().round() as u64;
+    if pos_embed_side * pos_embed_side != pos_embed_size {
+        bail!(
+            "position table has {} entries, which is not a square grid — cannot derive \
+             pos_emb_height/pos_emb_width for projector {:?}",
+            pos_embed_size,
+            projector_type
+        );
+    }
+
+    // Wrapper-level settings: --mmproj-config wins, else the table.
+    let from_hf = |k: &str| hf_config.and_then(|c| c.get(k)).cloned();
+    let defaults = projector_defaults(&projector_type);
+    if defaults.is_none() && hf_config.is_none() {
+        bail!(
+            "unknown clip.projector_type {:?}: the multimodal token ids, pooling kernel, \
+             soft-token count and tower RoPE theta are not present in any mmproj GGUF. \
+             Pass --mmproj-config <config.json> from the HF checkpoint, or add a \
+             projector_defaults() entry for this type.",
+            projector_type
+        );
+    }
+
+    let mut assumed: Vec<String> = Vec::new();
+    let mut resolve_u64 = |key: &str, fallback: Option<u64>| -> Option<serde_json::Value> {
+        if let Some(v) = from_hf(key) {
+            return Some(v);
+        }
+        fallback.map(|n| {
+            assumed.push(format!("{key}={n}"));
+            json!(n)
+        })
+    };
+
+    // Temporal depth of the patch embedder, derived from the weight itself.
+    //
+    // The HF checkpoint's patch embedding is a Linear over
+    // `temporal_patch_size * 3 * patch^2` (2*3*14*14 = 1176 for Muse
+    // Glimmer). llama.cpp's mmproj stores 3*patch^2 = 588 instead — NOT a
+    // truncation: it is the two temporal halves SUMMED. Verified against the
+    // bf16 checkpoint, `gguf == W[:, :588] + W[:, 588:]` to max|diff| = 0.0.
+    //
+    // That collapse is exact for still images, and only for them: the
+    // preprocessor fills every temporal slice with the same frame, so
+    // `W·[f;f] == (Wa+Wb)·f`. We therefore keep the CHECKPOINT's temporal
+    // depth and widen the weight back to it (MMPROJ_PATCH_EXPAND), rather
+    // than declaring a narrower tower — that way the encoder runs the exact
+    // dispatch the safetensors path already exercises.
+    //
+    // Getting the declared width out of step with the stored weight is
+    // silent at convert time and fatal at inference: the GEMM reads
+    // `n * K` past the end of a too-narrow weight, and ~49% of patch_embed
+    // comes back non-finite (750 of 1536 output columns), taking every
+    // later stage to 100% NaN.
+    let patch_in: u64 = mm
+        .tensor_by_name("v.patch_embd.weight")
+        .map(|pe| pe.shape.iter().rev().skip(1).product())
+        .ok_or_else(|| anyhow::anyhow!("mmproj missing v.patch_embd.weight"))?;
+    let per_frame = 3 * patch * patch;
+    if per_frame == 0 || patch_in % per_frame != 0 {
+        bail!(
+            "mmproj patch embedder has {} input elements, which is not a multiple of \
+             3 * patch^2 ({}) — cannot infer temporal_patch_size for projector {:?}",
+            patch_in,
+            per_frame,
+            projector_type
+        );
+    }
+    // The bundle always declares the checkpoint's own temporal depth, even
+    // when the mmproj stores the collapsed single-frame weight: the tower is
+    // widened back to `temporal_patch_size * 3 * patch^2` at write time (see
+    // MMPROJ_PATCH_EXPAND in the tensor loop). Keeping the declared width at
+    // the checkpoint's value means the encoder runs the exact same shape the
+    // safetensors path produces, instead of a second, narrower code path.
+    let gguf_temporal = patch_in / per_frame;
+    let temporal_patch_size = defaults
+        .as_ref()
+        .map(|d| d.temporal_patch_size)
+        .unwrap_or(gguf_temporal);
+    if temporal_patch_size % gguf_temporal != 0 {
+        bail!(
+            "mmproj patch embedder has {} temporal slice(s) but projector {:?} expects {} — \
+             not an integer multiple, cannot widen",
+            gguf_temporal,
+            projector_type,
+            temporal_patch_size
+        );
+    }
+
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(
+        "vision_config".into(),
+        json!({
+            "hidden_size": hidden,
+            "num_hidden_layers": layers,
+            "num_attention_heads": heads,
+            "intermediate_size": ffn,
+            "patch_size": patch,
+            "image_size": image_size,
+            // Key names below are the ones base_weight_store.cpp's
+            // muse_glimmer branch actually reads. They differ from the HF
+            // config spelling (merge_size vs spatial_merge_size,
+            // patch_temporal vs temporal_patch_size, pos_emb_height/width
+            // vs a single size, and rope_theta NESTED under
+            // rope_parameters). Every one of those has a default that
+            // happens to be right for this checkpoint, so spelling them
+            // the HF way looks correct in `basert inspect` and silently
+            // ignores whatever the file actually says.
+            "merge_size": merge,
+            "patch_temporal": temporal_patch_size,
+            "layer_norm_eps": eps,
+            "pos_emb_height": pos_embed_side,
+            "pos_emb_width": pos_embed_side,
+            "rope_parameters": {
+                "rope_theta": from_hf("rope_theta")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or_else(|| {
+                        let t = defaults.as_ref().map(|d| d.rope_theta).unwrap_or(10000.0);
+                        t as f64
+                    })
+            },
+        }),
+    );
+    m.insert("out_hidden_size".into(), json!(out_hidden));
+    m.insert("projector_hidden_size".into(), json!(projector_hidden));
+
+    if let Some(v) = resolve_u64("image_token_id", defaults.as_ref().map(|d| d.image_token_id)) {
+        m.insert("image_token_id".into(), v);
+    }
+    if let Some(v) = resolve_u64(
+        "video_token_id",
+        defaults.as_ref().and_then(|d| d.video_token_id),
+    ) {
+        m.insert("video_token_id".into(), v);
+    }
+    if let Some(v) = resolve_u64(
+        "vision_soft_tokens_per_image",
+        defaults
+            .as_ref()
+            .map(|d| d.vision_soft_tokens_per_image),
+    ) {
+        m.insert("vision_soft_tokens_per_image".into(), v);
+    }
+    if let Some(v) = resolve_u64(
+        "pooling_kernel_size",
+        defaults.as_ref().and_then(|d| d.pooling_kernel_size),
+    ) {
+        m.insert("pooling_kernel_size".into(), v);
+    }
+
+    if !assumed.is_empty() {
+        eprintln!(
+            "  mmproj:  assumed from projector_type={:?}: {}",
+            projector_type,
+            assumed.join(", ")
+        );
+        eprintln!("           (pass --mmproj-config to take these from the HF checkpoint)");
+    }
+    Ok((m, temporal_patch_size / gguf_temporal))
 }
 
 /// Extract the mmproj config block from an HF directory's `config.json`
@@ -1360,6 +2122,12 @@ fn mmproj_config_from_hf(hf: &base_readers::hf::HfDir) -> std::collections::BTre
         "boa_token_id",
         "eoa_token_id",
         "vision_soft_tokens_per_image",
+        // Muse Glimmer: video placeholder + projector widths (the ViT's
+        // post-pixel-shuffle width and the adapter's hidden width, which
+        // live at the wrapper level rather than inside `vision_config`).
+        "video_token_id",
+        "out_hidden_size",
+        "projector_hidden_size",
     ] {
         if let Some(v) = cfg.get(key) {
             m.insert(key.into(), v.clone());
@@ -1661,6 +2429,7 @@ fn convert_generic(
     mmproj_config: std::collections::BTreeMap<String, serde_json::Value>,
     norm_shift: &dyn Fn(&str) -> f32,
     rope_permute: &dyn Fn(&str) -> Option<u32>,
+    row_rms_normalize: &dyn Fn(&str) -> Option<f32>,
 ) -> Result<()> {
     use base_format::{
         AlignmentConfig, BaseReader, BaseWriter, ComputeRegion, Header, HeaderFlags, LayerKind,
@@ -1879,6 +2648,27 @@ fn convert_generic(
                 let rows = shape[0] as usize;
                 let cols = f32s.len() / rows;
                 f32s = rope_permute_rows(&f32s, rows, cols, n_heads);
+            }
+        }
+
+        // Per-arch hook: fold a weightless post-lookup RMSNorm into the
+        // embedding matrix (Muse Glimmer). Exact because an embedding
+        // lookup returns one whole row and the norm mixes nothing across
+        // rows, so normalizing every row up front is the same computation
+        // moved to convert time. Runs on the f32 values BEFORE quantization
+        // so the quantizer sees the final magnitudes.
+        if shape.len() == 2 {
+            if let Some(eps) = row_rms_normalize(canonical) {
+                let rows = shape[0] as usize;
+                let cols = f32s.len() / rows.max(1);
+                for row in f32s.chunks_mut(cols) {
+                    let mean_sq =
+                        row.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / cols as f64;
+                    let inv = 1.0 / (mean_sq + eps as f64).sqrt();
+                    for v in row.iter_mut() {
+                        *v = (*v as f64 * inv) as f32;
+                    }
+                }
             }
         }
 
@@ -2408,8 +3198,18 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
         // patch_ln1/2, pos_norm) rather than `vision_tower.*`.
         || mm_name.starts_with("vision_embedder")
         || mm_name.starts_with("multi_modal_projector")
+        // Muse Glimmer's projector is two siblings of the tower rather than
+        // a `multi_modal_projector.*` subtree: `vision_adapter.{fc1,fc2}`
+        // (6144→4096→4096, GELU) feeding `vision_projection` (4096→6656).
+        || mm_name.starts_with("vision_adapter")
+        || mm_name.starts_with("vision_projection")
     {
-        let canonical = base_arch::gemma::map_gemma4_mmproj_name(mm_name).unwrap_or_else(|| mm_name.to_string());
+        let canonical = if arch == "muse_glimmer" {
+            base_arch::muse_glimmer::map_mmproj_name(mm_name)
+        } else {
+            base_arch::gemma::map_gemma4_mmproj_name(mm_name)
+        }
+        .unwrap_or_else(|| mm_name.to_string());
         return Some(Canonical::Mmproj(canonical));
     }
 
@@ -2564,7 +3364,9 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
         // Pre-arch-aware code did the Gemma rename unconditionally,
         // silently breaking Llama-style MLX MoE (the pre-FFN norm
         // ended up under a name kBasePerLayerRules doesn't know).
-        if arch == "gemma4" || arch == "gemma3" {
+        // Muse Glimmer carries the same four per-layer norms as Gemma 3/4
+        // under the same HF names, so it shares the rename.
+        if arch == "gemma4" || arch == "gemma3" || arch == "muse_glimmer" {
             // Gemma 3 and Gemma 4 both have four per-layer norms
             // (input + post-attn + pre-FFN + post-FFN). HF and GGUF use
             // different names; map HF → GGUF-canonical so the runtime's
@@ -3146,6 +3948,8 @@ struct QuantContext {
     target: TargetScheme,
     /// Bypass the spec's already-quantized-source rejection.
     allow_quant_from_quant: bool,
+    /// Copy GGUF Q4_K/Q5_K/Q6_K super-blocks through verbatim.
+    kquant_passthrough: bool,
 }
 
 impl QuantContext {
@@ -3175,6 +3979,7 @@ impl QuantContext {
             awq_config: base_awq::AwqConfig::default(),
             target: args.target,
             allow_quant_from_quant: args.allow_quant_from_quant,
+            kquant_passthrough: args.kquant_passthrough,
         })
     }
 
@@ -4060,5 +4865,156 @@ mod rope_permute_tests {
         seen.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(seen, input);
         assert_ne!(out, input);
+    }
+}
+
+#[cfg(test)]
+mod gguf_passthrough_tests {
+    use super::{kquant_passthrough_entry, rope_permute_rows, unpermute_rope_rows};
+    use base_readers::gguf::{GgmlType, TensorInfo};
+
+    /// GGUF dimension order: ne[0] is the fastest-varying (in-features)
+    /// axis, so `shape = [cols, rows]` for a `[rows, cols]` weight.
+    fn info(cols: u64, rows: u64, ty: GgmlType) -> TensorInfo {
+        TensorInfo {
+            name: "blk.0.attn_q.weight".into(),
+            shape: vec![cols, rows],
+            ggml_type: ty,
+            data_offset: 0,
+        }
+    }
+
+    fn to_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    /// The un-permute must be the exact inverse of the forward permute the
+    /// HF path applies (and that llama.cpp applies on export). Round-trip
+    /// on a shape with a real head layout: 4 heads x HD=8, 3 columns.
+    #[test]
+    fn inverts_the_forward_rope_permute() {
+        let (n_heads, hd, cols) = (4u32, 8usize, 3usize);
+        let rows = n_heads as usize * hd;
+        let original: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
+        // What llama.cpp would have written into the GGUF.
+        let permuted = rope_permute_rows(&original, rows, cols, n_heads);
+        assert_ne!(permuted, original, "forward permute must actually move rows");
+
+        let out = unpermute_rope_rows(
+            &info(cols as u64, rows as u64, GgmlType::F32),
+            &to_bytes(&permuted),
+            n_heads,
+        )
+        .unwrap();
+        assert_eq!(out, to_bytes(&original));
+    }
+
+    /// The permutation's only fixed points are rows 0 and HD-1 of each
+    /// head — the experimental signature that identified it in the first
+    /// place (a dequantized GGUF q/k matched the HF original on exactly
+    /// those rows and nowhere else).
+    #[test]
+    fn fixed_points_are_first_and_last_row_of_each_head() {
+        let (n_heads, hd, cols) = (2u32, 8usize, 1usize);
+        let rows = n_heads as usize * hd;
+        let original: Vec<f32> = (0..rows).map(|i| i as f32).collect();
+        let permuted = rope_permute_rows(&original, rows, cols, n_heads);
+        for h in 0..n_heads as usize {
+            for r in 0..hd {
+                let idx = h * hd + r;
+                let is_fixed = permuted[idx] == original[idx];
+                let should_be_fixed = r == 0 || r == hd - 1;
+                assert_eq!(
+                    is_fixed, should_be_fixed,
+                    "head {h} row {r}: fixed={is_fixed}, expected {should_be_fixed}"
+                );
+            }
+        }
+    }
+
+    /// The whole point of doing this on raw bytes: a PACKED k-quant tensor
+    /// can be un-permuted without ever being dequantized, because rows are
+    /// contiguous whole numbers of super-blocks. 2 heads x HD=4, row =
+    /// 512 elements = 2 Q4_K super-blocks = 288 bytes.
+    #[test]
+    fn reorders_packed_q4k_rows_bit_exactly() {
+        let (n_heads, hd) = (2u32, 4usize);
+        let rows = n_heads as usize * hd;
+        let row_bytes = 2 * 144; // 512 elements / 256 per block x 144 B
+        // Give every row a distinct byte pattern so a mis-shuffle shows up.
+        let src: Vec<u8> = (0..rows)
+            .flat_map(|r| std::iter::repeat((r as u8) + 1).take(row_bytes))
+            .collect();
+        let out = unpermute_rope_rows(&info(512, rows as u64, GgmlType::Q4K), &src, n_heads)
+            .unwrap();
+        assert_eq!(out.len(), src.len());
+        // Expected destination rows: dst[h*HD + k*HD/2 + j] = src[h*HD + 2j + k].
+        // Head 0 src rows 0,1,2,3 → dst 0,2,1,3.
+        let dst_row = |i: usize| out[i * row_bytes] - 1;
+        assert_eq!(
+            (0..rows).map(dst_row).collect::<Vec<u8>>(),
+            vec![0, 2, 1, 3, 4, 6, 5, 7]
+        );
+        // Every byte within a row must be untouched (no partial-block
+        // rewriting, no dequant round trip).
+        for r in 0..rows {
+            let row = &out[r * row_bytes..(r + 1) * row_bytes];
+            assert!(row.iter().all(|&b| b == row[0]), "row {r} was rewritten");
+        }
+    }
+
+    /// A row that is not a whole number of quant blocks cannot be
+    /// reordered in packed form — that must fail loud rather than emit
+    /// silently scrambled attention weights.
+    #[test]
+    fn rejects_rows_that_straddle_blocks() {
+        // 100 elements per row is not a multiple of Q4_K's 256.
+        let err = unpermute_rope_rows(&info(100, 8, GgmlType::Q4K), &[], 2).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not a multiple"), "unhelpful error: {msg}");
+    }
+
+    /// Passthrough entries must describe a self-contained super-block
+    /// tensor: no side scale/bias regions, group_size 256, the GGUF
+    /// layout tag, and the source ggml code the runtime dispatches on.
+    #[test]
+    fn passthrough_entry_describes_gguf_super_blocks() {
+        use base_format::{ComputeRegion, Layout, TensorDtype};
+        for (ty, want_dtype, want_code) in [
+            (GgmlType::Q4K, TensorDtype::BaseQ4, 12u32),
+            (GgmlType::Q5K, TensorDtype::BaseQ5, 13u32),
+            (GgmlType::Q6K, TensorDtype::BaseQ6, 14u32),
+        ] {
+            let bytes: Vec<u8> = (0..64u8).collect();
+            let (entry, data) = kquant_passthrough_entry(
+                &info(256, 4, ty),
+                &bytes,
+                "layers.0.self_attn.q_proj.weight".into(),
+            );
+            assert_eq!(data, bytes, "payload must be byte-identical to the source");
+            assert_eq!(entry.dtype, want_dtype);
+            assert_eq!(entry.source_ggml_type, Some(want_code));
+            assert_eq!(entry.layout, Some(Layout::GgufSuper));
+            assert_eq!(entry.group_size, Some(256));
+            assert_eq!(entry.scale_offset, None);
+            assert_eq!(entry.scale_length, None);
+            assert_eq!(entry.bias_offset, None);
+            assert_eq!(entry.bias_length, None);
+            assert_eq!(entry.scale_dtype, None);
+            assert_eq!(entry.length, bytes.len() as u64);
+            assert_eq!(entry.compute_region, ComputeRegion::Accelerator);
+        }
+    }
+
+    /// embed/lm_head keep the hot GPU-region routing the re-quantizing
+    /// path gives them.
+    #[test]
+    fn passthrough_keeps_embedding_routing() {
+        use base_format::ComputeRegion;
+        for name in ["embed_tokens.weight", "lm_head.weight"] {
+            let (entry, _) =
+                kquant_passthrough_entry(&info(256, 4, GgmlType::Q6K), &[0u8; 8], name.into());
+            assert_eq!(entry.compute_region, ComputeRegion::Gpu, "{name}");
+        }
     }
 }

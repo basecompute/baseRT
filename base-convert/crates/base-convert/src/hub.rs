@@ -648,6 +648,14 @@ fn pull_and_convert(
         profile: profile_path,
         awq_profile: None,
         allow_quant_from_quant: false,
+        // Convert-on-pull always produces a canonical-quant bundle;
+        // k-quant passthrough stays an explicit `convert` opt-in.
+        kquant_passthrough: false,
+        // Convert-on-pull sources HF checkpoints, where the perception
+        // tower already lives in the same snapshot — the mmproj flags only
+        // apply to GGUF sources, which ship the tower separately.
+        mmproj: None,
+        mmproj_config: None,
     };
     crate::cmd_convert(conv).with_context(|| format!("converting {repo}"))?;
 
