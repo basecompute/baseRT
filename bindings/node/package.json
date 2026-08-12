@@ -1,6 +1,6 @@
 {
   "name": "@baseRT/node",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "Node.js bindings for BaseRT — LLM inference engine for Apple Silicon (Metal)",
   "main": "dist/index.js",
