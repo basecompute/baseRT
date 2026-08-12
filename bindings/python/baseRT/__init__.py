@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # ---------------------------------------------------------------------------
 # Library loading
@@ -195,6 +195,18 @@ class BaseRTModelConfig(ctypes.Structure):
         ("rope_high_freq_factor", ctypes.c_float),
         ("rope_orig_max_pos", ctypes.c_uint32),
         ("rope_scaling_type", ctypes.c_uint32),
+        # Muse Glimmer (0 / empty = not applicable)
+        ("qk_scale_factor", ctypes.c_float),
+        ("output_multiplier", ctypes.c_float),
+        ("post_norm_eps", ctypes.c_float),
+        ("nope_layers", ctypes.c_uint8 * 64),
+        ("embed_norm_eps", ctypes.c_float),
+        ("vision_window_layers", ctypes.c_uint8 * 64),
+        ("vision_window_size", ctypes.c_uint32),
+        ("vision_pos_embed_h", ctypes.c_uint32),
+        ("vision_pos_embed_w", ctypes.c_uint32),
+        ("vision_adapter_dim", ctypes.c_uint32),
+        ("video_token_id", ctypes.c_uint32),
     ]
 
 

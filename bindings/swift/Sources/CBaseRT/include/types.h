@@ -190,6 +190,50 @@ typedef struct {
     // 1 = llama3 (piecewise), 2 = linear (uniform divisor), 3 = other /
     // unsupported (skipped with a warning rather than mis-applied).
     uint32_t rope_scaling_type;
+
+    // ── Muse Glimmer (0 / empty = not applicable) ────────────────────
+    // Dense SWA/global decoder with a perception (ViT) tower. Shaped like
+    // Gemma 3 (four zero-centered per-layer norms, final logit softcap) with
+    // four twists the fields below carry.
+    //
+    // Multiplier applied to Q AFTER a scaleless (weightless) per-head
+    // RMSNorm, ON TOP OF the usual 1/sqrt(head_dim) — unlike
+    // `attention_scale`, which REPLACES that term. 0 = no QK-norm/scale.
+    // Because the norm is weightless there are no q_norm/k_norm tensors.
+    float qk_scale_factor;
+    // Scale applied to the logits BEFORE the final tanh softcap
+    // (`logit_softcap`). 0 = no multiplier.
+    float output_multiplier;
+    // Epsilon for the post-attention / post-FFN norms, which differs from
+    // `norm_eps` here (1e-8 vs 1e-5). 0 = reuse `norm_eps` everywhere.
+    float post_norm_eps;
+    // Per-layer NoPE mask: bit i = 1 means layer i applies NO rotary at all
+    // (the reference passes `position_embeddings=None` there). On Muse
+    // Glimmer these are exactly the global/full-attention layers, so the
+    // mask is the complement of `swa_layers` — but it is stored
+    // independently because the two are separate config keys upstream
+    // (`layer_types` vs `layer_rope_theta`) and need not agree.
+    // Up to 512 layers (64 bytes). All zero = every layer gets RoPE.
+    uint8_t nope_layers[64];
+    // Epsilon for a weightless RMSNorm the runtime applies to the token
+    // embedding right after lookup. 0 = already folded into the embedding
+    // rows at convert time (the HF path does this exactly), or no such norm.
+    // Only the GGUF path sets it: k-quant passthrough keeps the rows packed,
+    // so folding would mean dequantizing them.
+    float embed_norm_eps;
+
+    // Perception-tower extras (vision_arch == 2). The tower is a LayerNorm
+    // ViT with SEPARATE biased q/k/v projections, alternating window/full
+    // attention, a bias-free Linear patch embed over flattened pixels, and a
+    // bilinearly-resampled learned position grid.
+    // Per-layer window-attention mask: bit i = 1 means layer i attends only
+    // within its window; 0 = full attention across all patches.
+    uint8_t vision_window_layers[64];
+    uint32_t vision_window_size;  // window side in PIXELS (pos_emb_height * patch_size, e.g. 448)
+    uint32_t vision_pos_embed_h;  // learned position grid height (e.g. 32)
+    uint32_t vision_pos_embed_w;  // learned position grid width  (e.g. 32)
+    uint32_t vision_adapter_dim;  // projector hidden width (`projector_hidden_size`, e.g. 4096)
+    uint32_t video_token_id;      // text-side placeholder token for video features (0 = none)
 } BaseRTModelConfig;
 
 /// Transcription result statistics.

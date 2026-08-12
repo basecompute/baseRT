@@ -130,6 +130,18 @@ pub struct BaseRTModelConfig {
     pub rope_high_freq_factor: c_float,
     pub rope_orig_max_pos: u32,
     pub rope_scaling_type: u32,
+    // Muse Glimmer (0 / empty = not applicable)
+    pub qk_scale_factor: c_float,
+    pub output_multiplier: c_float,
+    pub post_norm_eps: c_float,
+    pub nope_layers: [u8; 64],
+    pub embed_norm_eps: c_float,
+    pub vision_window_layers: [u8; 64],
+    pub vision_window_size: u32,
+    pub vision_pos_embed_h: u32,
+    pub vision_pos_embed_w: u32,
+    pub vision_adapter_dim: u32,
+    pub video_token_id: u32,
 }
 
 /// Transcription result statistics.
@@ -453,7 +465,7 @@ mod tests {
             "config struct unexpectedly small ({})",
             mem::size_of::<BaseRTModelConfig>()
         );
-        assert_eq!(mem::size_of::<BaseRTModelConfig>(), 1540);
+        assert_eq!(mem::size_of::<BaseRTModelConfig>(), 1704);
     }
 
     #[test]
@@ -547,6 +559,11 @@ mod tests {
         assert_eq!(&base.rope_scaling_factor as *const _ as usize - base_ptr, 1520);
         assert_eq!(&base.rope_orig_max_pos as *const _ as usize - base_ptr, 1532);
         assert_eq!(&base.rope_scaling_type as *const _ as usize - base_ptr, 1536);
+        assert_eq!(&base.qk_scale_factor as *const _ as usize - base_ptr, 1540);
+        assert_eq!(&base.nope_layers as *const _ as usize - base_ptr, 1552);
+        assert_eq!(&base.embed_norm_eps as *const _ as usize - base_ptr, 1616);
+        assert_eq!(&base.vision_window_layers as *const _ as usize - base_ptr, 1620);
+        assert_eq!(&base.video_token_id as *const _ as usize - base_ptr, 1700);
     }
 
     #[test]

@@ -80,7 +80,7 @@ class TestBaseRTModelConfig:
         # Keep this in sync with include/baseRT/types.h. The runtime ABI-size
         # assertion below catches layout drift; this count catches accidental
         # omission of same-sized fields from the ctypes mirror.
-        assert len(BaseRTModelConfig._fields_) == 95
+        assert len(BaseRTModelConfig._fields_) == 106
 
     def test_architecture_field_is_char_array(self):
         # architecture should be a fixed 32-byte char array
@@ -567,7 +567,7 @@ class TestStructSizes:
         # Exact sizeof(BaseRTModelConfig) from include/baseRT/types.h; the
         # library cross-check happens at import via baseRT_model_config_sizeof.
         # Must match the Rust mirror test (bindings/rust/baseRT-sys).
-        assert ctypes.sizeof(BaseRTModelConfig) == 1540
+        assert ctypes.sizeof(BaseRTModelConfig) == 1704
 
     def test_sampling_config_size(self):
         size = ctypes.sizeof(BaseRTSamplingConfig)

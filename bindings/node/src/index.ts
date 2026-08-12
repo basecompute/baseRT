@@ -174,6 +174,18 @@ const ModelConfigC = koffi.struct("BaseRTModelConfig", {
   rope_high_freq_factor: "float",
   rope_orig_max_pos: "uint32",
   rope_scaling_type: "uint32",
+  // Muse Glimmer (0 / empty = not applicable)
+  qk_scale_factor: "float",
+  output_multiplier: "float",
+  post_norm_eps: "float",
+  nope_layers: koffi.array("uint8", 64),
+  embed_norm_eps: "float",
+  vision_window_layers: koffi.array("uint8", 64),
+  vision_window_size: "uint32",
+  vision_pos_embed_h: "uint32",
+  vision_pos_embed_w: "uint32",
+  vision_adapter_dim: "uint32",
+  video_token_id: "uint32",
 });
 
 const SamplingConfigC = koffi.struct("BaseRTSamplingConfig", {
