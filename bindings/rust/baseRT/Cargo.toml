@@ -1,6 +1,6 @@
 [package]
 name = "baseRT"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Safe Rust bindings for the BaseRT LLM inference engine (Apple Silicon)"
 license = "Apache-2.0"

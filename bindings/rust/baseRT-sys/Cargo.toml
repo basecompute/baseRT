@@ -1,6 +1,6 @@
 [package]
 name = "baseRT-sys"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Raw FFI bindings for the BaseRT LLM inference engine"
 license = "Apache-2.0"

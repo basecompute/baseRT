@@ -8,6 +8,7 @@
 
 pub mod cache;
 pub mod catalog;
+pub mod download;
 pub mod fetch;
 pub mod gen;
 pub mod registry;

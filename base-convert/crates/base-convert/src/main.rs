@@ -4943,7 +4943,7 @@ mod gguf_passthrough_tests {
         let row_bytes = 2 * 144; // 512 elements / 256 per block x 144 B
         // Give every row a distinct byte pattern so a mis-shuffle shows up.
         let src: Vec<u8> = (0..rows)
-            .flat_map(|r| std::iter::repeat((r as u8) + 1).take(row_bytes))
+            .flat_map(|r| std::iter::repeat_n((r as u8) + 1, row_bytes))
             .collect();
         let out = unpermute_rope_rows(&info(512, rows as u64, GgmlType::Q4K), &src, n_heads)
             .unwrap();
