@@ -4,6 +4,17 @@ All notable changes to BaseRT. This project is pre-1.0, so minor versions may
 include behavior changes. Format loosely based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **cc-bridge: native Anthropic Messages adapter.** A thin protocol bridge
+  (`cc-bridge/`) that lets Claude Code talk to a local `basert serve` through
+  `/v1/messages`, with native SSE streaming, thinking and tool blocks,
+  keep-alive pings, and cancellation propagation. Inbound requests are
+  authenticated against a required master key; the server binds to 127.0.0.1
+  by default. See `cc-bridge/README.md`.
+
 ## [0.2.0] — 2026-07-31
 
 **A second hardware backend.** BaseRT now runs on **NVIDIA GB10 (DGX Spark,
