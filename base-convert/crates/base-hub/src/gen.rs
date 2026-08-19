@@ -73,14 +73,6 @@ fn sha256_file(path: &Path) -> Result<String> {
 pub fn entry_from_base(path: &Path, id: &str, hf_repo: &str) -> Result<CatalogEntry> {
     let header = base_format::BaseReader::read_header(path)
         .with_context(|| format!("read .base header {}", path.display()))?;
-    let backend = backend_tag(header.target_backend)?;
-    let bits = crate::registry::quant_bits(&header.quant_profile)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{:?}", header.quant_scheme).to_ascii_lowercase());
-    let quant = match &backend {
-        Some(b) => format!("{b}-{bits}"),
-        None => format!("default-{bits}"),
-    };
     let size = std::fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
         .len();
@@ -90,10 +82,36 @@ pub fn entry_from_base(path: &Path, id: &str, hf_repo: &str) -> Result<CatalogEn
         .and_then(|s| s.to_str())
         .unwrap_or("model.base")
         .to_string();
+    entry_from_header(&header, id, hf_repo, &file, size, sha256)
+}
+
+/// Build the entry once the header and the file's identity are known, whatever
+/// read them.
+///
+/// Split out from [`entry_from_base`] so a bundle that is published but not
+/// present locally derives the SAME row: [`crate::scan`] reads the header over
+/// two ranged requests and takes size/sha256 from the Hub's own listing, and
+/// must not invent a second interpretation of the same bytes.
+pub fn entry_from_header(
+    header: &base_format::Header,
+    id: &str,
+    hf_repo: &str,
+    file: &str,
+    size: u64,
+    sha256: String,
+) -> Result<CatalogEntry> {
+    let backend = backend_tag(header.target_backend)?;
+    let bits = crate::registry::quant_bits(&header.quant_profile)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{:?}", header.quant_scheme).to_ascii_lowercase());
+    let quant = match &backend {
+        Some(b) => format!("{b}-{bits}"),
+        None => format!("default-{bits}"),
+    };
     Ok(CatalogEntry {
         id: id.to_string(),
         hf_repo: hf_repo.to_string(),
-        file,
+        file: file.to_string(),
         revision: "main".to_string(),
         source_repo: None,
         arch: Some(header.arch.clone()),

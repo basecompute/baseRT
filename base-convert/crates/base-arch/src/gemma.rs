@@ -846,15 +846,14 @@ mod tests {
         g.insert(
             "gemma4.attention.head_count_kv".into(),
             KvValue::Array(
-                std::iter::repeat([
+                std::iter::repeat_n([
                     KvValue::U32(8),
                     KvValue::U32(8),
                     KvValue::U32(8),
                     KvValue::U32(8),
                     KvValue::U32(8),
                     KvValue::U32(2),
-                ])
-                .take(5)
+                ], 5)
                 .flatten()
                 .collect(),
             ),
@@ -888,15 +887,14 @@ mod tests {
         g.insert(
             "gemma4.attention.sliding_window_pattern".into(),
             KvValue::Array(
-                std::iter::repeat([
+                std::iter::repeat_n([
                     KvValue::Bool(true),
                     KvValue::Bool(true),
                     KvValue::Bool(true),
                     KvValue::Bool(true),
                     KvValue::Bool(true),
                     KvValue::Bool(false),
-                ])
-                .take(5)
+                ], 5)
                 .flatten()
                 .collect(),
             ),

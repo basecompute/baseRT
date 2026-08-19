@@ -65,6 +65,8 @@ enum Cmd {
     Pull(PullArgs),
     /// List models in the local hub cache (and, with `--remote`, the catalog).
     List(ListArgs),
+    /// Regenerate the model catalog by scanning a published HF organization.
+    CatalogScan(CatalogScanArgs),
     /// Runtime commands — `serve`, `chat`, `complete`, `bench`, … — handled
     /// by the BaseRT runtime (dispatched in `hub::dispatch_external`).
     #[command(external_subcommand)]
@@ -267,6 +269,19 @@ struct PullArgs {
 }
 
 #[derive(Parser, Debug)]
+struct CatalogScanArgs {
+    /// Organization to scan.
+    #[arg(long, default_value = "basecompute")]
+    org: String,
+    /// Where to write the catalog. Defaults to the bundled one, in place.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Report what would change without writing anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Parser, Debug)]
 struct ListArgs {
     /// Also list catalog models that aren't installed yet.
     #[arg(long)]
@@ -339,6 +354,7 @@ fn main() -> Result<()> {
         Cmd::Keygen(a) => cmd_keygen(a),
         Cmd::Pull(a) => hub::cmd_pull(a),
         Cmd::List(a) => hub::cmd_list(a),
+        Cmd::CatalogScan(a) => hub::cmd_catalog_scan(a.org, a.out, a.dry_run),
         Cmd::External(argv) => hub::dispatch_external(argv),
     }
 }
@@ -4943,7 +4959,7 @@ mod gguf_passthrough_tests {
         let row_bytes = 2 * 144; // 512 elements / 256 per block x 144 B
         // Give every row a distinct byte pattern so a mis-shuffle shows up.
         let src: Vec<u8> = (0..rows)
-            .flat_map(|r| std::iter::repeat((r as u8) + 1).take(row_bytes))
+            .flat_map(|r| std::iter::repeat_n((r as u8) + 1, row_bytes))
             .collect();
         let out = unpermute_rope_rows(&info(512, rows as u64, GgmlType::Q4K), &src, n_heads)
             .unwrap();

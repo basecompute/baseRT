@@ -35,6 +35,32 @@ When no profile is given, convert-on-pull uses a generic default profile
 (`default-q4`). Tuned, model-specific quality is delivered through the catalog as
 pre-converted artifacts.
 
+## How downloads behave
+
+Model bundles are large — a 30B-class Q4 artifact is around 20 GB — so `basert
+pull` fetches them over many connections at once, in fixed chunks, rather than
+through a single stream.
+
+- **An interrupted pull resumes.** Chunk completion is recorded beside the
+  partial file as each chunk lands, so a crash, a `^C`, or a link that drops
+  overnight continues from what is already on disk, including after the process
+  has exited. Re-run the same `basert pull` command.
+- **A stalled transfer fails instead of hanging.** A connection that stops
+  delivering bytes without closing is cut off and retried.
+- **A short transfer is an error.** A download smaller than the size the Hub
+  advertised is reported rather than installed as a truncated model.
+
+Defaults are 24 connections of 16 MB; peak memory is connections × chunk. Both
+are tunable via the `BASERT_HF_*` variables in
+[Installation](../getting-started/installation.md#environment-variables).
+
+### Xet
+
+Setting `BASERT_HF_XET=1` routes large files through Xet's content-addressed
+store, which deduplicates chunks against models already fetched. It cannot
+resume: an interrupted Xet transfer restarts from the beginning, which is why it
+is not the default.
+
 ## Listing
 
 ```sh

@@ -12,11 +12,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/basecompute/baseRT"
-rust-version = "1.80"
+rust-version = "1.85"
 
 [workspace.dependencies]
 # Internal crates
@@ -43,8 +43,14 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 indicatif = "0.17"
 rayon = "1"
 tempfile = "3"
-# Sync-only `api::sync` client (ureq 3 → rustls; no tokio/reqwest/OpenSSL).
-# 0.5 is required: it resolves HF's relative `Location` redirects, which 0.3.2
-# could not (HF now 307s `resolve/...` to a relative `/api/resolve-cache/...`).
-hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+# 1.0 is required for Xet: `hf-xet` is a hard dependency there, so Xet-backed
+# repos (the default for new uploads on the Hub) transfer over the dedup CAS
+# path instead of falling back to plain HTTPS. 1.0 dropped the `ureq` feature —
+# it is reqwest/tokio underneath — so the sync surface is now the `blocking`
+# feature, which parks one current-thread runtime on a background thread.
+# `rustls-tls` keeps the build off OpenSSL, as the ureq stack did.
+hf-hub = { version = "1.0", default-features = false, features = [
+    "blocking",
+    "rustls-tls",
+] }
 dirs = "5"

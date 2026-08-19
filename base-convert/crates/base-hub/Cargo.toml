@@ -13,8 +13,14 @@ sha2.workspace = true
 base-format.workspace = true
 hf-hub.workspace = true
 dirs.workspace = true
-# Generic HTTPS GET for the hosted catalog (same ureq 3 / rustls stack as hf-hub).
+# Download progress bars: hf-hub 1.0 reports progress as events and draws
+# nothing itself (0.5 owned the bar behind `with_progress`).
+indicatif.workspace = true
+# Generic HTTPS GET for the hosted catalog.
 ureq = "3"
+# The HTTP client handed to hf-hub, so downloads carry our own timeouts.
+# Version must track hf-hub's reqwest, or the `Client` types do not unify.
+reqwest = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true
