@@ -20,6 +20,22 @@ pub fn quant_bits(quant: &str) -> Option<&str> {
     let b = quant.as_bytes();
     let mut i = 0;
     while i < b.len() {
+        // `f16` / `bf16` are bit widths too. Whisper publishes an F16 bundle
+        // beside its Q4 and Q8, and without this every one of them is
+        // uncatalogable — the catalog's own invariant is that a quant exposes
+        // its width so a bare `basert pull <id>:<width>` can match it.
+        if (b[i] == b'f' || (b[i] == b'b' && i + 1 < b.len() && b[i + 1] == b'f'))
+            && b[i..].len() > 1
+        {
+            let fstart = if b[i] == b'b' { i + 1 } else { i };
+            if fstart + 1 < b.len() && b[fstart + 1].is_ascii_digit() {
+                let mut j = fstart + 1;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                return Some(&quant[i..j]);
+            }
+        }
         if b[i] == b'q' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
             let start = i;
             let mut j = i + 1;
@@ -605,7 +621,19 @@ mod tests {
         assert_eq!(quant_bits("cuda-q4mix"), Some("q4"));
         assert_eq!(quant_bits("q8"), Some("q8"));
         assert_eq!(quant_bits("cuda-q4"), Some("q4"));
-        assert_eq!(quant_bits("bf16"), None); // no qN token
+        // Float widths now count. This assertion used to read `None` ("no qN
+        // token"), which was defensible while every catalog row was quantized
+        // — and wrong the moment one was not: Whisper publishes an F16 bundle
+        // beside its Q4 and Q8, and a row whose quant hides its width fails
+        // `every_catalog_quant_exposes_its_bit_width` and cannot be selected
+        // by `basert pull <id>:f16`. The alternative was to leave every
+        // published F16 bundle out of the catalog, which is not a smaller
+        // change, only a quieter one.
+        assert_eq!(quant_bits("bf16"), Some("bf16"));
+        assert_eq!(quant_bits("default-f16"), Some("f16"));
+        assert_eq!(quant_bits("f16"), Some("f16"));
+        // A bare `f` with no digits is not a width.
+        assert_eq!(quant_bits("default-fp"), None);
         assert_eq!(quant_bits("q40"), Some("q40")); // whole digit run, not "q4"
     }
 

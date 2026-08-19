@@ -32,17 +32,26 @@ const DEFAULT_HF_MAX_RETRIES: usize = 5;
 /// better trade — this threshold separates `config.json` from a weight shard.
 const RANGED_MIN_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Force every large file through the range downloader, even one the Hub
-/// serves over Xet (`$BASERT_HF_FORCE_RANGED`).
+/// Send large files over Xet's CAS path instead of ranged HTTPS
+/// (`$BASERT_HF_XET`).
 ///
-/// Two uses. It is how the range path gets exercised against huggingface.co
-/// at all — the Hub has migrated essentially every repository to Xet, so the
-/// fallback would otherwise only ever run against a non-migrated endpoint or
-/// an `$HF_ENDPOINT` mirror. And it is the escape hatch when hf-xet is the
-/// thing going wrong on a given link: the same bytes are still reachable over
-/// plain ranged HTTPS from the CDN.
-fn force_ranged() -> bool {
-    std::env::var("BASERT_HF_FORCE_RANGED")
+/// Off by default, which is the whole point of this knob's existence rather
+/// than its opposite. Xet cannot resume: hf-hub 1.0 builds its `XetSession`
+/// from a default `XetConfig` and exposes no way to pass one, so there is no
+/// chunk cache to pick up from, and an interrupted 20GB pull starts over.
+/// Measured on the 19.8GB Qwen3.5-35B-A3B bundle: killed at 2246MiB, the next
+/// attempt was 12s in with 328MiB.
+///
+/// It is not a speed trade either, which is what made this an easy call. Over
+/// three rounds on the same link the ranged path at its defaults matched or
+/// beat Xet every time (Xet 47.3 / 28.8 MiB/s; ranged 24x16MB 54.4 / 81.7).
+///
+/// What Xet still has is cross-model deduplication: chunks shared with
+/// something already fetched do not cross the wire at all. That does not show
+/// up in a cold single-model pull like the one measured, so this stays
+/// available for anyone pulling a family of related bundles.
+fn prefer_xet() -> bool {
+    std::env::var("BASERT_HF_XET")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
 }
@@ -71,6 +80,23 @@ pub trait Fetcher {
     fn staging_dir(&self, repo: &str) -> Option<PathBuf> {
         let _ = repo;
         None
+    }
+
+    /// Read `range` of `filename` without downloading the rest.
+    ///
+    /// A `.base` header is a 16-byte prefix plus a JSON blob, both at the front
+    /// of a file that may be tens of gigabytes. Two ranged reads are what let
+    /// [`crate::scan`] learn a published bundle's arch and backend without
+    /// fetching the bundle.
+    fn read_range(
+        &self,
+        repo: &str,
+        revision: &str,
+        filename: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>> {
+        let _ = (repo, revision, filename, range);
+        anyhow::bail!("this fetcher cannot read byte ranges")
     }
 }
 
@@ -333,7 +359,11 @@ impl Fetcher for HfFetcher {
         // strictly worse. Small files take the same path: not worth a chunk
         // plan, and a retry costs less there than planning one. A file the
         // listing does not describe goes there too, rather than guessing.
-        let facts = facts.filter(|f| (!f.xet || force_ranged()) && f.size >= RANGED_MIN_BYTES);
+        // Large files take the resumable path whatever transport the Hub
+        // offers. Xet is opt-in (see `prefer_xet`): it cannot resume, and a
+        // 20GB pull that has to restart is the failure this release exists to
+        // fix.
+        let facts = facts.filter(|f| !(f.xet && prefer_xet()) && f.size >= RANGED_MIN_BYTES);
         let Some(facts) = facts else {
             return handle
                 .download_file()
@@ -383,6 +413,29 @@ impl Fetcher for HfFetcher {
             self.staging_root
                 .join(format!("models--{}", repo.replace('/', "--"))),
         )
+    }
+
+    fn read_range(
+        &self,
+        repo: &str,
+        revision: &str,
+        filename: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>> {
+        let bytes = self
+            .repo(repo)
+            .download_file_to_bytes()
+            .filename(filename)
+            .revision(revision)
+            .range(range.clone())
+            .send()
+            .with_context(|| {
+                format!(
+                    "reading bytes {}..{} of {filename} from {repo}@{revision}",
+                    range.start, range.end
+                )
+            })?;
+        Ok(bytes.to_vec())
     }
 }
 

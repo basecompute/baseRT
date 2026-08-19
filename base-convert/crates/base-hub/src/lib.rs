@@ -12,6 +12,7 @@ pub mod download;
 pub mod fetch;
 pub mod gen;
 pub mod registry;
+pub mod scan;
 
 pub use cache::{models_dir, HubSidecar};
 pub use registry::{ModelEntry, ModelRef, Registry, SourceKind};

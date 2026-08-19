@@ -888,6 +888,79 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// `basert catalog-scan` — regenerate the catalog from what an organization
+/// has actually published.
+///
+/// The catalog used to be hand-edited, one JSON row per (model, quant,
+/// backend), and drifted from the Hub the moment anyone published without
+/// remembering to add a row. This derives it instead: the org listing names
+/// the repos, each repo's tree gives size and sha256, and two ranged reads of
+/// each bundle give the header that knows its arch, backend and quant. A row
+/// whose sha256 is unchanged is carried over untouched, so a rescan is cheap
+/// and hand-curated fields (`source_repo`) survive.
+pub fn cmd_catalog_scan(org: String, out: Option<PathBuf>, dry_run: bool) -> Result<()> {
+    let root = cache::models_dir()?;
+    let fetcher = HfFetcher::new(cache::hf_staging_dir(&root))?;
+
+    let known = base_hub::catalog::Catalog::bundled()
+        .context("reading the bundled catalog to reuse unchanged rows")?;
+    eprintln!("scanning {org} …");
+    let repos = base_hub::scan::list_org_repos(&org)?;
+    eprintln!("  {} repositories", repos.len());
+
+    let report = base_hub::scan::scan_org(&fetcher, &base_hub::scan::HubApi, &org, &repos, &known)?;
+
+    // What the scan decided, before anything is written. Silence here would
+    // make a dropped bundle indistinguishable from one that does not exist.
+    eprintln!(
+        "  {} rows ({} reused unchanged), {} repos with no bundle",
+        report.entries.len(),
+        report.reused,
+        report.empty_repos.len()
+    );
+    for (what, why) in &report.skipped {
+        eprintln!("  SKIPPED {what}: {why}");
+    }
+
+    let before: std::collections::BTreeSet<_> = known
+        .models
+        .iter()
+        .map(|m| (m.hf_repo.clone(), m.file.clone()))
+        .collect();
+    let after: std::collections::BTreeSet<_> = report
+        .entries
+        .iter()
+        .map(|m| (m.hf_repo.clone(), m.file.clone()))
+        .collect();
+    for (repo, file) in after.difference(&before) {
+        eprintln!("  + {repo}/{file}");
+    }
+    for (repo, file) in before.difference(&after) {
+        eprintln!("  - {repo}/{file}  (no longer published)");
+    }
+
+    let path = out.unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|p| p.join("base-hub/catalog.json"))
+            .unwrap_or_else(|| PathBuf::from("catalog.json"))
+    });
+    if dry_run {
+        eprintln!("dry run — {} not written", path.display());
+        return Ok(());
+    }
+
+    let doc = base_hub::catalog::Catalog {
+        schema: known.schema,
+        updated: report.updated_stamp(),
+        models: report.entries,
+    };
+    let json = serde_json::to_string_pretty(&doc)? + "\n";
+    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+    eprintln!("wrote {}", path.display());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

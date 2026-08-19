@@ -41,13 +41,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// Concurrent range requests. Eight saturates a fast link without looking like
-/// an attack to the CDN; the Hub's own Python client uses the same order.
-const DEFAULT_CONNECTIONS: usize = 8;
+/// Concurrent range requests.
+///
+/// Measured against the 19.8GB Qwen3.5-35B-A3B bundle, three rounds on the
+/// same link (MiB/s, 15s warmup + 45s window, cold cache each run):
+///
+///   connections x chunk    r1     r2     r3     mean
+///   8 x 32MB (old)        39.8     -      -
+///   16 x 16MB             49.4   53.3     -
+///   24 x 16MB             54.4   81.7   83.5    73.2
+///   32 x 8MB              58.3   77.1   77.8    71.1
+///
+/// 24 and 32 are indistinguishable; 24 is chosen for the smaller connection
+/// count at equal throughput. Eight — the previous default — is measurably
+/// short of the link.
+const DEFAULT_CONNECTIONS: usize = 24;
 /// Bytes per range request. Large enough that per-request overhead vanishes
-/// against a multi-GB file, small enough that a failed chunk is cheap to redo
-/// and that `connections * chunk` stays a sane peak memory footprint.
-const DEFAULT_CHUNK_MB: u64 = 32;
+/// against a multi-GB file, small enough that a failed chunk is cheap to redo.
+///
+/// Peak memory is `connections * chunk` — 384MB at the defaults, since each
+/// worker holds one chunk in flight. Lower either knob on a constrained box;
+/// 16MB earned its place over 8MB in round 3 (83.5 vs 62.4 at 24 connections).
+const DEFAULT_CHUNK_MB: u64 = 16;
 /// Seconds a read may stall before the chunk is failed and retried.
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 60;
 

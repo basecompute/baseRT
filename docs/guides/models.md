@@ -37,35 +37,29 @@ pre-converted artifacts.
 
 ## How downloads behave
 
-Model bundles are large — a 30B-class Q4 artifact is around 20 GB — so which
-transport a file takes matters. The Hub decides per file, and `basert` follows:
+Model bundles are large — a 30B-class Q4 artifact is around 20 GB — so `basert
+pull` fetches them over many connections at once, in fixed chunks, rather than
+through a single stream.
 
-- **Xet-backed repositories** (the default for new uploads, including the
-  pre-converted `basecompute/` bundles) transfer over the deduplicated CAS path.
-  This is the fast one, and there is nothing to enable.
-- **Everything else** is fetched over several connections at once, in fixed
-  chunks, rather than through a single stream.
+- **An interrupted pull resumes.** Chunk completion is recorded beside the
+  partial file as each chunk lands, so a crash, a `^C`, or a link that drops
+  overnight continues from what is already on disk, including after the process
+  has exited. Re-run the same `basert pull` command.
+- **A stalled transfer fails instead of hanging.** A connection that stops
+  delivering bytes without closing is cut off and retried.
+- **A short transfer is an error.** A download smaller than the size the Hub
+  advertised is reported rather than installed as a truncated model.
 
-Either way, a stalled transfer is cut off and retried rather than left hanging,
-and a transfer shorter than the size the Hub advertised is reported as an error
-instead of being installed as a truncated model.
+Defaults are 24 connections of 16 MB; peak memory is connections × chunk. Both
+are tunable via the `BASERT_HF_*` variables in
+[Installation](../getting-started/installation.md#environment-variables).
 
-### If a pull is interrupted
+### Xet
 
-The two transports differ, and the difference is worth knowing before an
-overnight pull:
-
-- A **ranged** download resumes. Chunk completion is recorded beside the partial
-  file as each chunk lands, so re-running the same `basert pull` continues from
-  what is already on disk, including after the process has exited.
-- A **Xet** download restarts from the beginning. It is fast enough that the
-  window is much smaller — but it is a restart, not a resume.
-
-On a link that drops often, `BASERT_HF_FORCE_RANGED=1` takes the ranged path
-even for a Xet-backed file, trading throughput for the ability to pick up where
-it stopped. The other `BASERT_HF_*` variables in
-[Installation](../getting-started/installation.md#environment-variables) tune
-connection count, chunk size, and the stall timeout.
+Setting `BASERT_HF_XET=1` routes large files through Xet's content-addressed
+store, which deduplicates chunks against models already fetched. It cannot
+resume: an interrupted Xet transfer restarts from the beginning, which is why it
+is not the default.
 
 ## Listing
 

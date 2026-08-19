@@ -88,11 +88,11 @@ basert serve --help
 | `BASERT_MODELS_DIR` | Where pulled/converted models are cached | `~/.cache/baseRT/models` |
 | `BASERT_LIB_PATH` / `BASERT_LIB_DIR` | Where bindings look for `libbaseRT.dylib` | `build/` at repo root |
 | `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | HuggingFace auth for gated/private repos | unset |
-| `BASERT_HF_CONNECTIONS` | Parallel range requests when a file is fetched over plain HTTPS | `8` |
-| `BASERT_HF_CHUNK_MB` | Bytes per range request | `32` |
+| `BASERT_HF_CONNECTIONS` | Parallel range requests per download | `24` |
+| `BASERT_HF_CHUNK_MB` | Bytes per range request (peak memory is connections × chunk) | `16` |
 | `BASERT_HF_READ_TIMEOUT_SECS` | How long a download may stall before it is retried | `60` |
 | `BASERT_HF_MAX_RETRIES` | Retries per chunk (`0` fails on the first error) | `5` |
-| `BASERT_HF_FORCE_RANGED` | Use ranged HTTPS even for a Xet-backed file | unset |
+| `BASERT_HF_XET` | Use Xet's CAS path for large files (deduplicated, but cannot resume) | unset |
 
 ## Next steps
 

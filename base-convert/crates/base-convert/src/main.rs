@@ -65,6 +65,8 @@ enum Cmd {
     Pull(PullArgs),
     /// List models in the local hub cache (and, with `--remote`, the catalog).
     List(ListArgs),
+    /// Regenerate the model catalog by scanning a published HF organization.
+    CatalogScan(CatalogScanArgs),
     /// Runtime commands — `serve`, `chat`, `complete`, `bench`, … — handled
     /// by the BaseRT runtime (dispatched in `hub::dispatch_external`).
     #[command(external_subcommand)]
@@ -267,6 +269,19 @@ struct PullArgs {
 }
 
 #[derive(Parser, Debug)]
+struct CatalogScanArgs {
+    /// Organization to scan.
+    #[arg(long, default_value = "basecompute")]
+    org: String,
+    /// Where to write the catalog. Defaults to the bundled one, in place.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Report what would change without writing anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Parser, Debug)]
 struct ListArgs {
     /// Also list catalog models that aren't installed yet.
     #[arg(long)]
@@ -339,6 +354,7 @@ fn main() -> Result<()> {
         Cmd::Keygen(a) => cmd_keygen(a),
         Cmd::Pull(a) => hub::cmd_pull(a),
         Cmd::List(a) => hub::cmd_list(a),
+        Cmd::CatalogScan(a) => hub::cmd_catalog_scan(a.org, a.out, a.dry_run),
         Cmd::External(argv) => hub::dispatch_external(argv),
     }
 }
