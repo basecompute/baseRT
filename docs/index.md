@@ -61,5 +61,5 @@ basert serve --model Qwen/Qwen3-4B --api-key "$(uuidgen)"   # OpenAI server
 ## Requirements
 
 - Apple Silicon (M1 or later), macOS 14+.
-- Rust 1.80+ to build the `basert` CLI.
+- Rust 1.85+ to build the `basert` CLI.
 - A binding toolchain as needed (Python 3.9+, Node 18+, Swift 5.9+).

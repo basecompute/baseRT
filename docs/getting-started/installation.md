@@ -36,7 +36,7 @@ BaseRT has two parts you put on your `PATH`:
 ### Requirements
 
 - Apple Silicon (M1 or later), macOS 14+.
-- Rust 1.80+ (to build the CLI).
+- Rust 1.85+ (to build the CLI).
 - For bindings: Python 3.9+, Node 18+, or Swift 5.9+ as needed.
 - [`gh`](https://cli.github.com) (optional, to download releases).
 
@@ -88,6 +88,11 @@ basert serve --help
 | `BASERT_MODELS_DIR` | Where pulled/converted models are cached | `~/.cache/baseRT/models` |
 | `BASERT_LIB_PATH` / `BASERT_LIB_DIR` | Where bindings look for `libbaseRT.dylib` | `build/` at repo root |
 | `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | HuggingFace auth for gated/private repos | unset |
+| `BASERT_HF_CONNECTIONS` | Parallel range requests when a file is fetched over plain HTTPS | `8` |
+| `BASERT_HF_CHUNK_MB` | Bytes per range request | `32` |
+| `BASERT_HF_READ_TIMEOUT_SECS` | How long a download may stall before it is retried | `60` |
+| `BASERT_HF_MAX_RETRIES` | Retries per chunk (`0` fails on the first error) | `5` |
+| `BASERT_HF_FORCE_RANGED` | Use ranged HTTPS even for a Xet-backed file | unset |
 
 ## Next steps
 
