@@ -785,9 +785,47 @@ fn download_source(repo: &str, revision: &str, fetcher: &dyn Fetcher) -> Result<
         if f.as_str() == "config.json" {
             continue;
         }
-        fetcher.get_file(repo, revision, f)?;
+        let fetched = fetcher.get_file(repo, revision, f)?;
+        link_into_snapshot(&fetched, &snapshot.join(f.as_str()))
+            .with_context(|| format!("linking {f} into the snapshot dir"))?;
     }
     Ok(snapshot)
+}
+
+/// Make `wanted` resolve at `expected`, without assuming `fetcher.get_file`
+/// already placed it there.
+///
+/// It usually did: small files go through hf-hub's own single-stream
+/// download, which writes its `snapshots/<rev>/<file>` symlink itself. Large
+/// files take `HfFetcher`'s parallel, resumable path instead, which knows
+/// nothing about the snapshot layout — it returns a path straight into the
+/// blob store (see `HfFetcher::get_file`'s ranged branch). Left alone, that
+/// leaves the very files this function exists to fetch missing from the
+/// snapshot dir it just promised the caller was complete, so a weight shard
+/// fetched this way is linked in here instead. Idempotent, and cheap enough
+/// to run unconditionally: a plain path comparison plus, at most, one symlink
+/// syscall (no-op when `wanted` already resolves at `expected`).
+fn link_into_snapshot(wanted: &Path, expected: &Path) -> Result<()> {
+    if wanted == expected {
+        return Ok(());
+    }
+    if let Some(parent) = expected.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // A prior run may have gotten this far before failing on a later file;
+    // treat an existing link (dangling or not) as already handled rather
+    // than erroring on it.
+    if expected.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(wanted, expected)
+        .with_context(|| format!("symlinking {} -> {}", expected.display(), wanted.display()))?;
+    #[cfg(not(unix))]
+    std::fs::hard_link(wanted, expected)
+        .with_context(|| format!("linking {} -> {}", expected.display(), wanted.display()))?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1209,6 +1247,95 @@ mod tests {
 
         let snapshot = download_source("org/model", "main", &fetcher).unwrap();
         assert_eq!(snapshot, repo_dir);
+    }
+
+    /// Mimics `HfFetcher`'s actual split, not just its end state: files named
+    /// in `ranged` come back as a raw path into a separate blob store, with
+    /// no snapshot symlink ever created for them — the shape of
+    /// `HfFetcher::get_file`'s parallel/resumable branch (see `fetch.rs`).
+    /// Everything else resolves inside `snapshots/<rev>/` already, the way
+    /// hf-hub's own single-stream download leaves it. `StagedFetcher` above
+    /// stages symlinks for every file up front and so never exercises this
+    /// split — it's why the bug this reproduces shipped uncaught.
+    struct RangedFetcher {
+        staging: PathBuf,
+        ranged: &'static [&'static str],
+    }
+
+    impl RangedFetcher {
+        fn repo_dir(&self, repo: &str) -> PathBuf {
+            self.staging.join(format!("models--{}", repo.replace('/', "--")))
+        }
+
+        fn content(filename: &str) -> Vec<u8> {
+            match filename {
+                "config.json" => br#"{"model_type":"llama"}"#.to_vec(),
+                other => format!("bytes-of-{other}").into_bytes(),
+            }
+        }
+    }
+
+    impl Fetcher for RangedFetcher {
+        fn get_file(&self, repo: &str, revision: &str, filename: &str) -> anyhow::Result<PathBuf> {
+            let rdir = self.repo_dir(repo);
+            let blobs = rdir.join("blobs");
+            std::fs::create_dir_all(&blobs)?;
+            let blob = blobs.join(format!("etag-{filename}"));
+            if !blob.exists() {
+                std::fs::write(&blob, Self::content(filename))?;
+            }
+            if self.ranged.contains(&filename) {
+                return Ok(blob);
+            }
+            let snap = rdir.join("snapshots").join(revision);
+            std::fs::create_dir_all(&snap)?;
+            let link = snap.join(filename);
+            if link.symlink_metadata().is_err() {
+                std::os::unix::fs::symlink(&blob, &link)?;
+            }
+            Ok(link)
+        }
+
+        fn list_files(&self, _repo: &str, _revision: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![
+                "config.json".into(),
+                "model.safetensors".into(),
+                "tokenizer.json".into(),
+            ])
+        }
+
+        fn staging_dir(&self, repo: &str) -> Option<PathBuf> {
+            Some(self.repo_dir(repo))
+        }
+    }
+
+    #[test]
+    fn download_source_links_ranged_weight_into_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetcher = RangedFetcher {
+            staging: tmp.path().join(".src").join("hf"),
+            ranged: &["model.safetensors"],
+        };
+
+        let snapshot = download_source("org/model", "main", &fetcher).unwrap();
+
+        // The weight file must resolve inside the returned snapshot dir, not
+        // just somewhere in the blob store — that's what the conversion
+        // pipeline reads from next.
+        let linked = snapshot.join("model.safetensors");
+        assert!(
+            linked.symlink_metadata().is_ok(),
+            "model.safetensors was never linked into the snapshot dir"
+        );
+        assert_eq!(
+            std::fs::read(&linked).unwrap(),
+            RangedFetcher::content("model.safetensors")
+        );
+
+        // Re-running against the same (already-linked) snapshot must not
+        // error — this is also what makes a retry over a partially-broken
+        // real cache self-healing instead of repeating the failure.
+        download_source("org/model", "main", &fetcher).unwrap();
     }
 
     #[test]
