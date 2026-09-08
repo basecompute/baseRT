@@ -21,6 +21,7 @@ Run models:
 Manage models:
   pull        Download a model from the BaseRT catalog or Hugging Face
   list        List installed models (`--remote` adds the catalog)
+  rm          Remove all installed variants of a model
 
 Convert & author:
   convert     Convert a GGUF / safetensors model to `.base`
@@ -65,6 +66,8 @@ enum Cmd {
     Pull(PullArgs),
     /// List models in the local hub cache (and, with `--remote`, the catalog).
     List(ListArgs),
+    /// Remove all installed variants of a model, retaining HF source staging.
+    Rm(RmArgs),
     /// Regenerate the model catalog by scanning a published HF organization.
     CatalogScan(CatalogScanArgs),
     /// Runtime commands — `serve`, `chat`, `complete`, `bench`, … — handled
@@ -291,6 +294,13 @@ struct ListArgs {
     json: bool,
 }
 
+#[derive(Parser, Debug)]
+struct RmArgs {
+    /// Installed model id (org/model), as shown by `basert list`.
+    #[arg(value_name = "MODEL")]
+    model: String,
+}
+
 /// BaseRT wordmark banner (mirrors the C++ CLIs — tools/basert_banner.h).
 /// White→lime vertical gradient anchored on brand Lime #E8FFBD (the brand
 /// tone alone is too close to white to read as terminal text). Printed only
@@ -354,6 +364,7 @@ fn main() -> Result<()> {
         Cmd::Keygen(a) => cmd_keygen(a),
         Cmd::Pull(a) => hub::cmd_pull(a),
         Cmd::List(a) => hub::cmd_list(a),
+        Cmd::Rm(a) => hub::cmd_rm(a),
         Cmd::CatalogScan(a) => hub::cmd_catalog_scan(a.org, a.out, a.dry_run),
         Cmd::External(argv) => hub::dispatch_external(argv),
     }
