@@ -68,6 +68,13 @@ pub struct CatalogEntry {
     /// Optional integrity check for the downloaded `.base`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// For a bundle the Hub's file cap split into `<file>.part-NNN` pieces:
+    /// the sha256 of each part, in order. The Hub knows only these, never a
+    /// whole-file hash, so this is what proves the listing still describes
+    /// the bundle `sha256` was pinned against, and what each part is checked
+    /// against as it lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parts_sha256: Option<Vec<String>>,
     /// Backend requirement. `None` = universal (runs on every backend —
     /// f16/bf16 weights and bf16-scale q4/q8 bundles). `Some("cuda")` /
     /// `Some("metal")` restricts resolution to clients of that backend
@@ -215,6 +222,17 @@ impl Catalog {
             if e.quant.is_empty() {
                 anyhow::bail!("{}: empty quant", e.id);
             }
+            if let Some(parts) = &e.parts_sha256 {
+                if parts.is_empty() {
+                    anyhow::bail!("{}: parts_sha256 is present but empty", e.id);
+                }
+                if let Some(bad) = parts
+                    .iter()
+                    .find(|p| p.len() != 64 || !p.bytes().all(|b| b.is_ascii_hexdigit()))
+                {
+                    anyhow::bail!("{}: parts_sha256 entry {bad:?} is not a sha256", e.id);
+                }
+            }
             // A model may carry a universal row AND a per-backend variant of the
             // same quant (the resolver prefers the backend-native one); those are
             // distinguished by `backend`, so the uniqueness key includes it. Two
@@ -290,7 +308,10 @@ mod tests {
     #[test]
     fn bundled_catalog_is_populated_and_resolves_default_q4() {
         let cat = Catalog::bundled().unwrap();
-        assert!(!cat.models.is_empty(), "bundled catalog should not be empty");
+        assert!(
+            !cat.models.is_empty(),
+            "bundled catalog should not be empty"
+        );
         // Every entry carries the fields the resolver/installer need.
         for e in &cat.models {
             assert!(e.id.starts_with("basecompute/"), "id: {}", e.id);

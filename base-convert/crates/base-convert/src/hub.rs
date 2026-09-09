@@ -10,6 +10,7 @@ use crate::{AwqMode, ConvertArgs, ListArgs, PullArgs, TargetScheme};
 use anyhow::{bail, Context, Result};
 use base_hub::cache::{self, HubSidecar};
 use base_hub::fetch::{self, Fetcher, HfFetcher};
+use base_hub::parts::{self, Artifact, Grouped};
 use base_hub::registry::{MergedRegistry, ModelEntry, ModelRef, Registry, SourceKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,7 +62,10 @@ fn want_source_file(name: &str) -> bool {
 /// `default-q4` → `q4`, `base_q8` → `q8`, `Llama-3.2-1B-Instruct-Q4` → `q4`,
 /// `bf16` → `bf16`.
 fn quant_tag(s: &str) -> String {
-    s.rsplit(['-', '_']).next().unwrap_or(s).to_ascii_lowercase()
+    s.rsplit(['-', '_'])
+        .next()
+        .unwrap_or(s)
+        .to_ascii_lowercase()
 }
 
 /// True when `tag` names a quant scheme we know how to label on disk.
@@ -89,25 +93,54 @@ fn base_file_stem(f: &str) -> String {
     b.strip_suffix(".base").unwrap_or(b).to_string()
 }
 
-/// List the `.base` artifacts a repo hosts (empty when it ships none).
-fn list_base_files(fetcher: &dyn Fetcher, repo: &str, revision: &str) -> Result<Vec<String>> {
+/// List the `.base` artifacts a repo hosts (empty when it ships none). A
+/// bundle the Hub's 50 GB file cap forced into `.base.part-NNN` pieces shows
+/// up once, under its logical `.base` name.
+fn list_base_files(fetcher: &dyn Fetcher, repo: &str, revision: &str) -> Result<Grouped> {
     let files = fetcher
         .list_files(repo, revision)
         .with_context(|| format!("listing files in {repo}@{revision}"))?;
-    Ok(files.into_iter().filter(|f| f.ends_with(".base")).collect())
+    let grouped = parts::group(files);
+    for (name, why) in &grouped.malformed {
+        eprintln!("  skipping {name}: {why}");
+    }
+    Ok(grouped)
 }
 
-/// Pick the `.base` whose quant tag matches `want`. Falls back to the sole
-/// artifact when the repo has exactly one; errors when several are present and
+/// Pick the `.base` whose quant tag matches `want`. A malformed part set
+/// carrying that quant is an error saying why, never a fall-through to a
+/// different quant. Falls back to the sole artifact when the repo has
+/// exactly one and nothing malformed; errors when several are present and
 /// none match.
-fn select_base_file<'a>(files: &'a [String], want: &str) -> Result<&'a String> {
-    if let Some(f) = files.iter().find(|f| quant_tag(&base_file_stem(f)) == want) {
+fn select_base_file<'a>(files: &'a Grouped, want: &str) -> Result<&'a Artifact> {
+    if let Some(f) = files
+        .artifacts
+        .iter()
+        .find(|f| quant_tag(&base_file_stem(&f.name)) == want)
+    {
         return Ok(f);
     }
-    if let [only] = files {
+    if let Some((name, why)) = files
+        .malformed
+        .iter()
+        .find(|(n, _)| quant_tag(&base_file_stem(n)) == want)
+    {
+        bail!("{name}: the {want} publication is incomplete ({why})");
+    }
+    if let ([only], []) = (files.artifacts.as_slice(), files.malformed.as_slice()) {
         return Ok(only);
     }
-    let avail: Vec<String> = files.iter().map(|f| quant_tag(&base_file_stem(f))).collect();
+    let avail: Vec<String> = files
+        .artifacts
+        .iter()
+        .map(|f| quant_tag(&base_file_stem(&f.name)))
+        .chain(
+            files
+                .malformed
+                .iter()
+                .map(|(n, _)| format!("{} (incomplete)", quant_tag(&base_file_stem(n)))),
+        )
+        .collect();
     bail!(
         "no pre-converted .base for quant {want:?} in this repo; it offers: {}",
         avail.join(", ")
@@ -169,11 +202,9 @@ fn installed_single_path(reg: &MergedRegistry, id: &str) -> Result<Option<PathBu
     let hits: Vec<&ModelEntry> = installed.iter().filter(|r| r.id == id).collect();
     match hits.as_slice() {
         [] => Ok(None),
-        [one] => Ok(Some(
-            one.path
-                .clone()
-                .with_context(|| format!("installed model `{id}` has no artifact path"))?,
-        )),
+        [one] => Ok(Some(one.path.clone().with_context(|| {
+            format!("installed model `{id}` has no artifact path")
+        })?)),
         many => {
             // Multiple variants installed — e.g. a universal `default-q4` cached
             // before the backend-qualified catalog entries existed, plus a native
@@ -185,25 +216,33 @@ fn installed_single_path(reg: &MergedRegistry, id: &str) -> Result<Option<PathBu
             // foreign-native bundle it simply won't be present.
             let backend = base_hub::registry::CatalogRegistry::client_backend();
             let native_prefix = format!("{backend}-");
-            let native: Vec<&ModelEntry> =
-                many.iter().copied().filter(|r| r.variant.starts_with(&native_prefix)).collect();
+            let native: Vec<&ModelEntry> = many
+                .iter()
+                .copied()
+                .filter(|r| r.variant.starts_with(&native_prefix))
+                .collect();
             let pick = if native.len() == 1 {
                 Some(native[0])
             } else if native.is_empty() {
-                let uni: Vec<&ModelEntry> =
-                    many.iter().copied().filter(|r| r.variant.starts_with("default-")).collect();
+                let uni: Vec<&ModelEntry> = many
+                    .iter()
+                    .copied()
+                    .filter(|r| r.variant.starts_with("default-"))
+                    .collect();
                 (uni.len() == 1).then(|| uni[0])
             } else {
                 None
             };
             if let Some(one) = pick {
-                return Ok(Some(
-                    one.path
-                        .clone()
-                        .with_context(|| format!("installed model `{id}` has no artifact path"))?,
-                ));
+                return Ok(Some(one.path.clone().with_context(|| {
+                    format!("installed model `{id}` has no artifact path")
+                })?));
             }
-            let variants = many.iter().map(|r| r.variant.as_str()).collect::<Vec<_>>().join(", ");
+            let variants = many
+                .iter()
+                .map(|r| r.variant.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             bail!("model `{id}` has multiple installed variants ({variants}) — specify one as `{id}:<variant>`")
         }
     }
@@ -232,7 +271,7 @@ fn installed_best_variant(reg: &MergedRegistry, id: &str, want: &str) -> Option<
     let runnable = |v: &str| -> bool {
         match v.split_once('-') {
             Some((slot, _)) if KNOWN_BACKENDS.contains(&slot) => slot == backend, // native only
-            _ => true,                                                            // default-*, bare bits, etc.
+            _ => true, // default-*, bare bits, etc.
         }
     };
     let installed = reg.local.list().ok()?;
@@ -241,7 +280,8 @@ fn installed_best_variant(reg: &MergedRegistry, id: &str, want: &str) -> Option<
         .filter(|r| {
             r.id == id
                 && runnable(&r.variant)
-                && base_hub::registry::quant_bits(&r.variant).unwrap_or(r.variant.as_str()) == want_bits
+                && base_hub::registry::quant_bits(&r.variant).unwrap_or(r.variant.as_str())
+                    == want_bits
         })
         .collect();
     if matches.is_empty() {
@@ -255,7 +295,11 @@ fn installed_best_variant(reg: &MergedRegistry, id: &str, want: &str) -> Option<
 /// Fetch a not-yet-installed model on demand, then return its artifact path.
 /// Prefers the pre-converted basecompute mirror; otherwise converts the source
 /// repo on pull. Progress (download + quantization) is shown by `cmd_pull`.
-fn auto_pull_and_resolve(reg: &MergedRegistry, id: &str, want_variant: Option<&str>) -> Result<PathBuf> {
+fn auto_pull_and_resolve(
+    reg: &MergedRegistry,
+    id: &str,
+    want_variant: Option<&str>,
+) -> Result<PathBuf> {
     let pull_id = preconverted_id(reg, id);
     let target = want_variant
         .map(|v| target_from_quant(&quant_tag(v)))
@@ -299,7 +343,9 @@ fn auto_pull_and_resolve(reg: &MergedRegistry, id: &str, want_variant: Option<&s
 /// on demand — preferring the pre-converted basecompute mirror, else converting
 /// the source repo — so `basert chat`/`serve <id>` Just Works.
 fn resolve_hub_model(token: &str, default_variant: Option<&str>) -> Result<PathBuf> {
-    let (id, inline) = token.split_once(':').map_or((token, None), |(i, v)| (i, Some(v)));
+    let (id, inline) = token
+        .split_once(':')
+        .map_or((token, None), |(i, v)| (i, Some(v)));
 
     // A trailing/empty `:` is a typo, not "default variant" — fail loudly so it
     // doesn't silently resolve to q4.
@@ -337,7 +383,9 @@ fn resolve_model_args(rest: &[String], default_variant: Option<&str>) -> Result<
     rest.iter()
         .map(|arg| {
             if looks_like_hub_id(arg) {
-                Ok(resolve_hub_model(arg, default_variant)?.to_string_lossy().into_owned())
+                Ok(resolve_hub_model(arg, default_variant)?
+                    .to_string_lossy()
+                    .into_owned())
             } else {
                 Ok(arg.clone())
             }
@@ -380,6 +428,36 @@ fn extract_variant_flag(rest: &[String]) -> Result<(Option<String>, Vec<String>)
     Ok((variant, out))
 }
 
+const COMPUTEARENA_HARNESS_ENV: &str = "COMPUTEARENA_BASERT_HARNESS";
+const LEGACY_COMPUTEARENA_HARNESS_ENV: &str = "BASERT_COMPUTEARENA_HARNESS";
+const BENCHMARK_HARNESS_BINARY: &str = "basert-benchmark-harness";
+
+fn bundled_computearena_harness(
+    exe_dir: Option<&Path>,
+    environment_override: bool,
+) -> Option<PathBuf> {
+    if environment_override {
+        return None;
+    }
+    let exe_dir = exe_dir?;
+
+    // Published BaseRT packages keep the launcher and harness together.
+    let sibling = exe_dir.join(BENCHMARK_HARNESS_BINARY);
+    if sibling.is_file() {
+        return Some(sibling);
+    }
+
+    // A source build places the Rust launcher under
+    // tools/base-convert/target/{debug,release}, while CMake publishes the
+    // native harness under build/. Recognize that layout so the documented
+    // developer build works exactly like an installed release.
+    exe_dir.ancestors().find_map(|directory| {
+        let workspace_manifest = directory.join("tools/base-convert/Cargo.toml");
+        let harness = directory.join("build").join(BENCHMARK_HARNESS_BINARY);
+        (workspace_manifest.is_file() && harness.is_file()).then_some(harness)
+    })
+}
+
 /// Forward `basert <cmd> [args…]` to the matching runtime binary. Searches for
 /// `basert-<cmd>` (release layout) then `baseRT_<cmd>` (local dev build),
 /// looking next to this executable first and then on `PATH`. On success the
@@ -388,18 +466,35 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let (cmd, rest) = argv.split_first().context("no command given")?;
-    // `--variant <v>` is a launcher-level model selector; strip it before
-    // forwarding (the runtime binary doesn't know it) and apply it during
-    // hub-id resolution.
-    let (variant_flag, rest) = extract_variant_flag(rest)?;
-    let rest = resolve_model_args(&rest, variant_flag.as_deref())?;
-    let candidates = [format!("basert-{cmd}"), format!("baseRT_{cmd}")];
+    let is_computearena = cmd == "computearena";
+    let (candidates, rest) = if is_computearena {
+        // ComputeArena is independently distributed and owns runtime
+        // selection. Preserve its arguments and select the BaseRT adapter.
+        let mut forwarded = Vec::with_capacity(rest.len() + 1);
+        forwarded.push("basert".to_string());
+        forwarded.extend_from_slice(rest);
+        (vec!["computearena".to_string()], forwarded)
+    } else {
+        // `--variant <v>` is a launcher-level model selector; strip it before
+        // forwarding (the runtime binary doesn't know it) and apply it during
+        // hub-id resolution.
+        let (variant_flag, rest) = extract_variant_flag(rest)?;
+        let rest = resolve_model_args(&rest, variant_flag.as_deref())?;
+        (vec![format!("basert-{cmd}"), format!("baseRT_{cmd}")], rest)
+    };
 
     // Prefer a binary sitting next to `basert` (how the release ships); fall
     // back to a bare name, which `Command` resolves against `PATH`.
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf));
+    let harness_environment_override = std::env::var_os(COMPUTEARENA_HARNESS_ENV).is_some()
+        || std::env::var_os(LEGACY_COMPUTEARENA_HARNESS_ENV).is_some();
+    let bundled_harness = if is_computearena {
+        bundled_computearena_harness(exe_dir.as_deref(), harness_environment_override)
+    } else {
+        None
+    };
     let mut targets: Vec<PathBuf> = Vec::new();
     if let Some(dir) = &exe_dir {
         for name in &candidates {
@@ -413,10 +508,22 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
 
     for target in &targets {
         // exec() returns only on failure; ENOENT means try the next candidate.
-        let err = Command::new(target).args(&rest).exec();
+        let mut command = Command::new(target);
+        command.args(&rest);
+        if let Some(harness) = &bundled_harness {
+            command.env(COMPUTEARENA_HARNESS_ENV, harness);
+        }
+        let err = command.exec();
         if err.kind() != std::io::ErrorKind::NotFound {
             return Err(err).with_context(|| format!("launching {}", target.display()));
         }
+    }
+    if is_computearena {
+        bail!(
+            "ComputeArena is not installed.\n\
+             Install it from https://computearena.ai/quickstart, then run \
+             `basert computearena` again."
+        )
     }
     if RUNTIME_COMMANDS.contains(&cmd.as_str()) {
         bail!(
@@ -431,8 +538,14 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
 /// Commands served by the BaseRT runtime rather than this binary. Used only
 /// to shape the not-found error above; dispatch itself is name-driven, so
 /// commands absent from this list (or from `basert --help`) still dispatch.
-const RUNTIME_COMMANDS: [&str; 6] =
-    ["serve", "chat", "complete", "bench", "transcribe", "profile"];
+const RUNTIME_COMMANDS: [&str; 6] = [
+    "serve",
+    "chat",
+    "complete",
+    "bench",
+    "transcribe",
+    "profile",
+];
 
 pub fn cmd_pull(args: PullArgs) -> Result<()> {
     let reg = MergedRegistry::load()?;
@@ -457,7 +570,13 @@ pub fn cmd_pull(args: PullArgs) -> Result<()> {
         // Serve it directly when it's what the user wants; otherwise grab the
         // requested quant straight from the same repo rather than silently
         // handing back the cataloged one.
-        ModelRef::Catalog { id, hf_repo, revision, variant, .. } => {
+        ModelRef::Catalog {
+            id,
+            hf_repo,
+            revision,
+            variant,
+            ..
+        } => {
             // Match on the QUANT BITS, not the raw variant string: the resolver
             // may hand back a backend-native variant (e.g. `cuda-q4mix`) that
             // satisfies a `q4` request but whose `quant_tag` ("q4mix") isn't the
@@ -480,7 +599,10 @@ pub fn cmd_pull(args: PullArgs) -> Result<()> {
         ModelRef::HuggingFace { id, repo, revision } => {
             let fetcher = HfFetcher::new(cache::hf_staging_dir(&root))?;
             let base_files = list_base_files(&fetcher, repo, revision)?;
-            if base_files.is_empty() {
+            // A repo holding only a half-uploaded split bundle is still a
+            // `.base` repo: it gets the incomplete-publication error, not a
+            // conversion attempt.
+            if base_files.artifacts.is_empty() && base_files.malformed.is_empty() {
                 pull_and_convert(&root, &args, id, repo, revision)
             } else {
                 pull_base_direct(&root, &args, id, repo, revision, &fetcher, &base_files)
@@ -492,9 +614,19 @@ pub fn cmd_pull(args: PullArgs) -> Result<()> {
 fn print_plan(r: &ModelRef, want: &str) {
     match r {
         ModelRef::Local { id, variant, path } => {
-            println!("plan: {id} [{variant}] already installed at {}", path.display())
+            println!(
+                "plan: {id} [{variant}] already installed at {}",
+                path.display()
+            )
         }
-        ModelRef::Catalog { id, hf_repo, file, revision, variant, .. } => {
+        ModelRef::Catalog {
+            id,
+            hf_repo,
+            file,
+            revision,
+            variant,
+            ..
+        } => {
             let want_bits = base_hub::registry::quant_bits(want).unwrap_or(want);
             if base_hub::registry::quant_bits(variant).unwrap_or(variant) == want_bits {
                 println!(
@@ -523,6 +655,7 @@ fn pull_catalog(root: &Path, r: &ModelRef) -> Result<()> {
         revision,
         variant,
         sha256,
+        parts_sha256,
         ..
     } = r
     else {
@@ -532,14 +665,23 @@ fn pull_catalog(root: &Path, r: &ModelRef) -> Result<()> {
     eprintln!("  catalog: {hf_repo}/{file}@{revision} (pre-converted)");
 
     let fetcher = HfFetcher::new(cache::hf_staging_dir(root))?;
-    let src = fetcher.get_file(hf_repo, revision, file)?;
+    // The catalog names the logical `.base`; the repo may hold it as parts.
+    let artifact = parts::find(&fetcher, hf_repo, revision, file)?;
 
     let vdir = cache::variant_dir(root, id, variant)?;
     std::fs::create_dir_all(&vdir)?;
     let out = cache::base_artifact_path(&vdir);
+    announce_parts(&artifact, &out);
     // Moves the staged download into place (same filesystem), so the pulled
     // artifact exists exactly once on disk.
-    fetch::install_file(&fetcher, hf_repo, &src, &out)?;
+    parts::install(
+        &fetcher,
+        hf_repo,
+        revision,
+        &artifact,
+        &out,
+        parts_sha256.as_deref(),
+    )?;
 
     let got_sha = crate::compute_sha256_streaming(&out)?;
     if let Some(expected) = sha256 {
@@ -582,18 +724,23 @@ fn pull_base_direct(
     repo: &str,
     revision: &str,
     fetcher: &dyn Fetcher,
-    base_files: &[String],
+    base_files: &Grouped,
 ) -> Result<()> {
     eprintln!("basert pull v{}", env!("CARGO_PKG_VERSION"));
     eprintln!("  source:  {repo}@{revision} (HuggingFace, pre-converted .base)");
 
     let want = quant_token(args);
-    let file = select_base_file(base_files, &want)?;
+    let artifact = select_base_file(base_files, &want)?;
+    let file = &artifact.name;
     // Label the on-disk variant by the artifact's own quant when it carries
     // one (so a `-Q8.base` never lands in a `default-q4` dir); otherwise fall
     // back to what was requested.
     let file_tag = quant_tag(&base_file_stem(file));
-    let variant_tag = if is_quant_tag(&file_tag) { file_tag } else { want };
+    let variant_tag = if is_quant_tag(&file_tag) {
+        file_tag
+    } else {
+        want
+    };
     let variant = format!("default-{variant_tag}");
     eprintln!("  variant: {variant}");
     eprintln!("  file:    {file}");
@@ -601,17 +748,47 @@ fn pull_base_direct(
     let vdir = cache::variant_dir(root, id, &variant)?;
     std::fs::create_dir_all(&vdir)?;
     let out = cache::base_artifact_path(&vdir);
+    announce_parts(artifact, &out);
 
-    let src = fetcher.get_file(repo, revision, file)?;
     // Moves the staged download into place (same filesystem), so the pulled
-    // artifact exists exactly once on disk.
-    fetch::install_file(fetcher, repo, &src, &out)?;
+    // artifact exists exactly once on disk. A part set is reassembled beside
+    // `out` and renamed into place once complete.
+    parts::install(fetcher, repo, revision, artifact, &out, None)?;
 
     let sha = crate::compute_sha256_streaming(&out).ok();
-    write_sidecar_for(&vdir, id, "huggingface", repo, None, revision, &variant, None, sha)?;
+    write_sidecar_for(
+        &vdir,
+        id,
+        "huggingface",
+        repo,
+        None,
+        revision,
+        &variant,
+        None,
+        sha,
+    )?;
     fetch::cleanup_staging(fetcher, repo);
     eprintln!("installed {id} [{variant}] → {}", out.display());
     Ok(())
+}
+
+/// One line about a split bundle, so the user knows why the install step
+/// runs on after the download bar finishes and what the disk needs.
+fn announce_parts(artifact: &Artifact, out: &Path) {
+    if !artifact.is_split() {
+        return;
+    }
+    // A re-pull keeps the installed bundle until the new one is complete,
+    // so the honest figure for that path is one bundle more.
+    let replacing = if out.exists() {
+        " plus the installed bundle it replaces, kept until the new one is complete"
+    } else {
+        ""
+    };
+    eprintln!(
+        "  parts:   {} (Hub-split; reassembled on install, needs bundle + one part of free disk{replacing})",
+        artifact.parts.len()
+    );
 }
 
 /// Convert-on-pull: download an HF repo's source safetensors and run the
@@ -648,6 +825,7 @@ fn pull_and_convert(
         profile: profile_path,
         awq_profile: None,
         allow_quant_from_quant: false,
+        no_mlx_passthrough: false,
         // Convert-on-pull always produces a canonical-quant bundle;
         // k-quant passthrough stays an explicit `convert` opt-in.
         kquant_passthrough: false,
@@ -656,6 +834,10 @@ fn pull_and_convert(
         // apply to GGUF sources, which ship the tower separately.
         mmproj: None,
         mmproj_config: None,
+        mlx_passthrough: false,
+        validate: false,
+        direct_write: false,
+        imatrix: false,
     };
     crate::cmd_convert(conv).with_context(|| format!("converting {repo}"))?;
 
@@ -733,18 +915,19 @@ fn choose_profile(
 /// are downloaded. `text_config.model_type` is consulted as a fallback for
 /// multimodal configs that nest the language-model arch there.
 fn check_supported_arch(config_path: &Path, repo: &str, revision: &str) -> Result<()> {
-    let bytes = std::fs::read(config_path)
-        .with_context(|| format!("reading {}", config_path.display()))?;
+    let bytes =
+        std::fs::read(config_path).with_context(|| format!("reading {}", config_path.display()))?;
     let cfg: serde_json::Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing {} as JSON", config_path.display()))?;
 
     let model_type = cfg
         .get("model_type")
         .and_then(|v| v.as_str())
-        .or_else(|| cfg.pointer("/text_config/model_type").and_then(|v| v.as_str()))
-        .ok_or_else(|| {
-            anyhow::anyhow!("{repo}@{revision}: config.json has no model_type field")
-        })?;
+        .or_else(|| {
+            cfg.pointer("/text_config/model_type")
+                .and_then(|v| v.as_str())
+        })
+        .ok_or_else(|| anyhow::anyhow!("{repo}@{revision}: config.json has no model_type field"))?;
 
     if base_arch::hf_mapper_for_model_type(model_type).is_some() {
         return Ok(());
@@ -961,10 +1144,102 @@ pub fn cmd_catalog_scan(org: String, out: Option<PathBuf>, dry_run: bool) -> Res
     Ok(())
 }
 
+/// Write the manifest a split bundle needs beside its parts.
+///
+/// `bundle` is the logical `.base` path the parts are named after
+/// (`parts/GLM-5.2-Q4.base`, which need not exist); its `.part-NNN` siblings
+/// are hashed in order, each and as one whole, and the result lands at
+/// `<bundle>.manifest.json` ready to upload with the parts.
+pub fn cmd_catalog_manifest(bundle: PathBuf) -> Result<()> {
+    let dir = bundle
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = bundle
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("bundle path has no file name")?
+        .to_string();
+    // Every entry is read or the command fails: an entry lost to an I/O
+    // error could be the terminal part, and a manifest written without it
+    // would describe a truncated bundle as complete.
+    let mut parts: Vec<(u32, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("listing {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("reading an entry of {}", dir.display()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if let Some((logical, idx)) = base_hub::parts::split_part_name(&name) {
+            if logical == stem {
+                parts.push((idx, entry.path()));
+            }
+        }
+    }
+    parts.sort();
+    if parts.is_empty() {
+        bail!("no {stem}.part-NNN files in {}", dir.display());
+    }
+    for (want, (have, path)) in (0u32..).zip(&parts) {
+        if *have != want {
+            bail!(
+                "part set is missing part {want:03} (next is {})",
+                path.display()
+            );
+        }
+    }
+    let paths: Vec<PathBuf> = parts.into_iter().map(|(_, p)| p).collect();
+    eprintln!("hashing {} parts of {stem} …", paths.len());
+    let manifest = base_hub::parts::build_manifest(&paths)?;
+    let out = dir.join(base_hub::parts::manifest_name(&stem));
+    std::fs::write(&out, serde_json::to_string_pretty(&manifest)? + "\n")
+        .with_context(|| format!("writing {}", out.display()))?;
+    eprintln!(
+        "  size:   {} bytes\n  sha256: {}\nwrote {}",
+        manifest.size,
+        manifest.sha256,
+        out.display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use base_hub::fetch::MockFetcher;
+
+    #[test]
+    fn bundled_computearena_harness_requires_a_sibling_and_respects_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(bundled_computearena_harness(Some(tmp.path()), false), None);
+
+        let harness = tmp.path().join(BENCHMARK_HARNESS_BINARY);
+        std::fs::write(&harness, b"fixture").unwrap();
+        assert_eq!(
+            bundled_computearena_harness(Some(tmp.path()), false),
+            Some(harness)
+        );
+        assert_eq!(bundled_computearena_harness(Some(tmp.path()), true), None);
+        assert_eq!(bundled_computearena_harness(None, false), None);
+    }
+
+    #[test]
+    fn bundled_computearena_harness_supports_the_source_build_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("baseRT");
+        let exe_dir = repo.join("tools/base-convert/target/release");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(repo.join("tools/base-convert/Cargo.toml"), b"[workspace]\n").unwrap();
+
+        let harness = repo.join("build").join(BENCHMARK_HARNESS_BINARY);
+        std::fs::create_dir_all(harness.parent().unwrap()).unwrap();
+        std::fs::write(&harness, b"fixture").unwrap();
+
+        assert_eq!(
+            bundled_computearena_harness(Some(&exe_dir), false),
+            Some(harness)
+        );
+    }
 
     #[test]
     fn quant_tag_extracts_last_segment() {
@@ -985,17 +1260,48 @@ mod tests {
     #[test]
     fn select_base_file_matches_quant_then_falls_back() {
         let files = vec![
-            "Llama-3.2-1B-Instruct-Q4.base".to_string(),
-            "Llama-3.2-1B-Instruct-Q8.base".to_string(),
+            Artifact::whole("Llama-3.2-1B-Instruct-Q4.base"),
+            Artifact::whole("Llama-3.2-1B-Instruct-Q8.base"),
         ];
-        assert_eq!(select_base_file(&files, "q4").unwrap(), &files[0]);
-        assert_eq!(select_base_file(&files, "q8").unwrap(), &files[1]);
+        let files = Grouped {
+            artifacts: files,
+            malformed: vec![],
+        };
+        assert_eq!(select_base_file(&files, "q4").unwrap(), &files.artifacts[0]);
+        assert_eq!(select_base_file(&files, "q8").unwrap(), &files.artifacts[1]);
         // No match among several → error that lists what's available.
         let err = select_base_file(&files, "q2").unwrap_err().to_string();
         assert!(err.contains("q4") && err.contains("q8"), "{err}");
         // Sole artifact → used regardless of requested quant.
-        let one = vec!["model.base".to_string()];
-        assert_eq!(select_base_file(&one, "q4").unwrap(), &one[0]);
+        let one = Grouped {
+            artifacts: vec![Artifact::whole("model.base")],
+            malformed: vec![],
+        };
+        assert_eq!(select_base_file(&one, "q4").unwrap(), &one.artifacts[0]);
+    }
+
+    #[test]
+    fn select_base_file_reports_an_incomplete_requested_quant() {
+        // A gapped Q4 upload beside a complete Q8: asking for Q4 is told
+        // the Q4 publication is incomplete, not quietly handed Q8.
+        let files = Grouped {
+            artifacts: vec![Artifact::whole("m-Q8.base")],
+            malformed: vec![(
+                "m-Q4.base".to_string(),
+                "part set is missing part 001 (found 2 parts)".to_string(),
+            )],
+        };
+        let err = select_base_file(&files, "q4").unwrap_err().to_string();
+        assert!(err.contains("incomplete"), "{err}");
+        assert!(err.contains("missing part 001"), "{err}");
+        // Q8 is still there for whoever asks for it.
+        assert_eq!(select_base_file(&files, "q8").unwrap().name, "m-Q8.base");
+        // And a third quant sees both, the broken one marked.
+        let err = select_base_file(&files, "q2").unwrap_err().to_string();
+        assert!(
+            err.contains("q4 (incomplete)") && err.contains("q8"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1007,9 +1313,82 @@ mod tests {
             std::fs::write(repo_dir.join(f), b"x").unwrap();
         }
         let fetcher = MockFetcher::new(tmp.path());
-        let mut got = list_base_files(&fetcher, "basecompute/m", "main").unwrap();
+        let mut got: Vec<String> = list_base_files(&fetcher, "basecompute/m", "main")
+            .unwrap()
+            .artifacts
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
         got.sort();
         assert_eq!(got, vec!["m-Q4.base".to_string(), "m-Q8.base".to_string()]);
+    }
+
+    #[test]
+    fn list_base_files_groups_a_part_set_under_its_logical_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("basecompute").join("m");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        for f in ["m-Q4.base.part-000", "m-Q4.base.part-001", "README.md"] {
+            std::fs::write(repo_dir.join(f), b"x").unwrap();
+        }
+        let fetcher = MockFetcher::new(tmp.path());
+        let got = list_base_files(&fetcher, "basecompute/m", "main").unwrap();
+        assert_eq!(got.artifacts.len(), 1);
+        assert_eq!(got.artifacts[0].name, "m-Q4.base");
+        assert_eq!(got.artifacts[0].parts.len(), 2);
+        // The logical name carries the quant tag the selector matches on.
+        assert_eq!(select_base_file(&got, "q4").unwrap().name, "m-Q4.base");
+    }
+
+    #[test]
+    fn pull_base_direct_reassembles_a_split_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("basecompute").join("m");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        // A real tiny bundle, cut in two: the install checks the stitched
+        // file against its own header, so arbitrary bytes will not do.
+        let whole = base_hub::parts::synthetic_bundle(1000);
+        let (head, tail) = whole.split_at(whole.len() / 2);
+        std::fs::write(repo_dir.join("m-Q4.base.part-000"), head).unwrap();
+        std::fs::write(repo_dir.join("m-Q4.base.part-001"), tail).unwrap();
+        // The manifest the publisher ships beside the parts, made the way
+        // they would make it.
+        cmd_catalog_manifest(repo_dir.join("m-Q4.base")).unwrap();
+        assert!(repo_dir.join("m-Q4.base.manifest.json").exists());
+        let fetcher = MockFetcher::new(tmp.path());
+        let base_files = list_base_files(&fetcher, "basecompute/m", "main").unwrap();
+
+        let root = tmp.path().join("cache");
+        let args = PullArgs {
+            id: "basecompute/m".into(),
+            profile: None,
+            target: TargetScheme::BaseQ4,
+            revision: "main".into(),
+            force: false,
+            dry_run: false,
+        };
+        pull_base_direct(
+            &root,
+            &args,
+            "basecompute/m",
+            "basecompute/m",
+            "main",
+            &fetcher,
+            &base_files,
+        )
+        .unwrap();
+
+        let vdir = root.join("basecompute/m/default-q4");
+        assert_eq!(std::fs::read(vdir.join("model.base")).unwrap(), whole);
+        assert!(vdir.join("hub.json").exists());
+        // No reassembly leftovers beside the installed artifact.
+        let stray: Vec<_> = std::fs::read_dir(&vdir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("partial"))
+            .collect();
+        assert!(stray.is_empty(), "leftovers: {stray:?}");
     }
 
     #[test]
@@ -1032,8 +1411,16 @@ mod tests {
             force: false,
             dry_run: false,
         };
-        pull_base_direct(&root, &args, "basecompute/m", "basecompute/m", "main", &fetcher, &base_files)
-            .unwrap();
+        pull_base_direct(
+            &root,
+            &args,
+            "basecompute/m",
+            "basecompute/m",
+            "main",
+            &fetcher,
+            &base_files,
+        )
+        .unwrap();
 
         // The Q8 artifact landed under the default-q8 variant dir.
         let out = root.join("basecompute/m/default-q8/model.base");
@@ -1053,7 +1440,8 @@ mod tests {
 
     impl StagedFetcher {
         fn repo_dir(&self, repo: &str) -> PathBuf {
-            self.staging.join(format!("models--{}", repo.replace('/', "--")))
+            self.staging
+                .join(format!("models--{}", repo.replace('/', "--")))
         }
 
         fn stage(&self, repo: &str, revision: &str, filename: &str, bytes: &[u8]) {
@@ -1070,7 +1458,11 @@ mod tests {
 
     impl Fetcher for StagedFetcher {
         fn get_file(&self, repo: &str, revision: &str, filename: &str) -> anyhow::Result<PathBuf> {
-            let p = self.repo_dir(repo).join("snapshots").join(revision).join(filename);
+            let p = self
+                .repo_dir(repo)
+                .join("snapshots")
+                .join(revision)
+                .join(filename);
             anyhow::ensure!(p.exists(), "not staged: {}", p.display());
             Ok(p)
         }
@@ -1107,8 +1499,16 @@ mod tests {
             force: false,
             dry_run: false,
         };
-        pull_base_direct(&root, &args, "basecompute/m", "basecompute/m", "main", &fetcher, &base_files)
-            .unwrap();
+        pull_base_direct(
+            &root,
+            &args,
+            "basecompute/m",
+            "basecompute/m",
+            "main",
+            &fetcher,
+            &base_files,
+        )
+        .unwrap();
 
         let out = root.join("basecompute/m/default-q4/model.base");
         assert_eq!(std::fs::read(&out).unwrap(), b"q4-bytes");

@@ -118,6 +118,7 @@ pub fn entry_from_header(
         quant,
         size: Some(size),
         sha256: Some(sha256),
+        parts_sha256: None,
         backend,
     })
 }

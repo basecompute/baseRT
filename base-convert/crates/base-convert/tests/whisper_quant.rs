@@ -122,13 +122,25 @@ fn write_synthetic_whisper_dir(dir: &Path) {
     let mut t: Vec<(String, Vec<u64>)> = vec![
         ("model.encoder.conv1.weight".into(), vec![D_MODEL, MELS, 3]),
         ("model.encoder.conv1.bias".into(), vec![D_MODEL]),
-        ("model.encoder.conv2.weight".into(), vec![D_MODEL, D_MODEL, 3]),
+        (
+            "model.encoder.conv2.weight".into(),
+            vec![D_MODEL, D_MODEL, 3],
+        ),
         ("model.encoder.conv2.bias".into(), vec![D_MODEL]),
-        ("model.encoder.embed_positions.weight".into(), vec![SRC_POS, D_MODEL]),
+        (
+            "model.encoder.embed_positions.weight".into(),
+            vec![SRC_POS, D_MODEL],
+        ),
         ("model.encoder.layer_norm.weight".into(), vec![D_MODEL]),
         ("model.encoder.layer_norm.bias".into(), vec![D_MODEL]),
-        ("model.decoder.embed_tokens.weight".into(), vec![VOCAB, D_MODEL]),
-        ("model.decoder.embed_positions.weight".into(), vec![TGT_POS, D_MODEL]),
+        (
+            "model.decoder.embed_tokens.weight".into(),
+            vec![VOCAB, D_MODEL],
+        ),
+        (
+            "model.decoder.embed_positions.weight".into(),
+            vec![TGT_POS, D_MODEL],
+        ),
         ("model.decoder.layer_norm.weight".into(), vec![D_MODEL]),
         ("model.decoder.layer_norm.bias".into(), vec![D_MODEL]),
     ];
@@ -214,8 +226,16 @@ fn assert_quant_bundle(
     assert_eq!(h.arch, "whisper");
     assert_eq!(h.quant_scheme, scheme);
     assert_eq!(h.quant_profile, profile_name);
-    assert!(h.flags.contains(HeaderFlags::QUANTIZED), "flags: {:?}", h.flags);
-    assert!(h.flags.contains(HeaderFlags::TIED_EMBEDDINGS), "flags: {:?}", h.flags);
+    assert!(
+        h.flags.contains(HeaderFlags::QUANTIZED),
+        "flags: {:?}",
+        h.flags
+    );
+    assert!(
+        h.flags.contains(HeaderFlags::TIED_EMBEDDINGS),
+        "flags: {:?}",
+        h.flags
+    );
 
     let quant_names = expected_quant_linears();
     let mut seen_quant = 0usize;
@@ -306,7 +326,11 @@ fn whisper_default_stays_all_f16() {
     assert_eq!(h.arch, "whisper");
     assert_eq!(h.quant_scheme, QuantScheme::F16);
     assert_eq!(h.quant_profile, "");
-    assert!(!h.flags.contains(HeaderFlags::QUANTIZED), "flags: {:?}", h.flags);
+    assert!(
+        !h.flags.contains(HeaderFlags::QUANTIZED),
+        "flags: {:?}",
+        h.flags
+    );
     assert!(h.flags.contains(HeaderFlags::TIED_EMBEDDINGS));
     for t in h.tensors.iter() {
         let numel: u64 = t.shape.iter().product();

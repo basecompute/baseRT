@@ -5,7 +5,9 @@
 use base_readers::gguf::{ggml_type_name, GgufFile};
 
 fn main() -> anyhow::Result<()> {
-    let path = std::env::args().nth(1).expect("usage: gguf_inspect <path.gguf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: gguf_inspect <path.gguf>");
     let f = GgufFile::open(&path)?;
     println!("gguf v{}", f.version);
     println!("arch:        {:?}", f.arch());
@@ -17,7 +19,11 @@ fn main() -> anyhow::Result<()> {
                 base_readers::gguf::KvValue::Array(a) => format!("Array[{}]", a.len()),
                 other => format!("{:?}", other),
             };
-            let short = if short.len() > 80 { format!("{}...", &short[..80]) } else { short };
+            let short = if short.len() > 80 {
+                format!("{}...", &short[..80])
+            } else {
+                short
+            };
             println!("  {:60} {}", k, short);
         }
         return Ok(());

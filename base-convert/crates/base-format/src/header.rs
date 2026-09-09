@@ -273,7 +273,6 @@ pub enum ComputeRegion {
     Cpu,
 }
 
-
 /// Per-region alignment in log2 bytes. Stored in the header so the runtime
 /// knows the packed layout without hardcoding assumptions, and so the
 /// converter can target different hardware page sizes.
@@ -505,6 +504,71 @@ pub struct Signature {
     pub signature: String,
 }
 
+/// Conversion provenance: where every bundle tensor came from and what
+/// was done to it, written by the converter at conversion time. The
+/// runtime ignores this block entirely; it exists so verification
+/// tooling can check a bundle against its source checkpoint without a
+/// hand-maintained per-arch name table, and can prove coverage in both
+/// directions (every bundle tensor accounted for, every source tensor
+/// consumed).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Provenance {
+    pub schema: u32,
+    /// True when the converter ran the mirror policy on a quantized
+    /// source: tensors the source stores quantized are transplanted,
+    /// tensors it keeps unquantized are carried unquantized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mirror: bool,
+    /// Source tensors intentionally not represented in the bundle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<String>,
+    /// Source tensors routed into the mmproj sub-bundle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mmproj: Vec<String>,
+    /// Bundle tensor name -> provenance record.
+    pub tensors: BTreeMap<String, TensorProvenance>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TensorProvenance {
+    /// Source tensor name(s) this bundle tensor was built from. Empty
+    /// only when `stack` describes the sources instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub src: Vec<String>,
+    /// Packed bytes copied verbatim from the source's identical scheme.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transplanted: bool,
+    /// Stored unquantized because the source stores it unquantized
+    /// (mirror policy).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub carried: bool,
+    /// Reparameterization baked into the stored values (e.g. "neg_exp"
+    /// for Mamba-2 `A = -exp(A_log)`). Verifiers re-derive the expected
+    /// values from this label independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<String>,
+    /// Additive shift baked into 1-D norm gains (Gemma-style +1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub norm_shift: Option<f32>,
+    /// Rows were reordered (HF split-half rotary -> interleaved).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub permuted: bool,
+    /// `[row_offset, row_count]` slice of the source tensor (fused
+    /// qkv_proj / gate_up_proj splits).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<[u64; 2]>,
+    /// Stacked from `count` per-expert source tensors; `pattern`
+    /// contains `{e}` where the expert index goes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<StackRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackRef {
+    pub pattern: String,
+    pub count: u32,
+}
+
 /// Top-level header. Serialized as JSON with sorted keys for
 /// reproducible signing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -565,6 +629,24 @@ pub struct Header {
     pub calibration: Option<CalibrationInfo>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sig: Option<Signature>,
+
+    /// Conversion provenance: how every bundle tensor relates to the
+    /// source checkpoint's tensors. Written by the converter so a
+    /// fidelity gate can verify the bundle against the checkpoint without
+    /// a hand-maintained name table. Shape:
+    ///
+    /// ```json
+    /// {"tensors": {"<canonical name>": {"src": ["<source name>", ...],
+    ///                                    "transplanted": true,   // packed codes copied verbatim
+    ///                                    "transform": "neg_exp", // declared reparameterization
+    ///                                    "stack": {"pattern": "...{e}...", "count": N},
+    ///                                    "permuted": true, "rows": [off, cnt]}},
+    ///  "dropped": ["<source tensors deliberately not converted>"]}
+    /// ```
+    ///
+    /// Absent on bundles from converter paths that do not record it yet.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provenance: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,7 +666,7 @@ pub struct MmprojBundle {
 /// Per-layer kind. Drives runtime dispatch: which forward path to run
 /// (attention vs SSM), which KV / SSM buffers to allocate, and whether
 /// the layer feeds into an MoE FFN.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayerKind {
     /// Standard dense multi-head attention (no GQA).
@@ -604,6 +686,37 @@ pub enum LayerKind {
     DenseMoe,
     /// Standard transformer block (attention + dense MLP).
     DenseMlp,
+    /// FFN-only MoE block: no attention/SSM mixer in the layer.
+    /// Nemotron-H MoE interleaves pure-Mamba, pure-attention and
+    /// pure-MoE-FFN blocks — each block has exactly one of the three.
+    MoeFfn,
+    /// Forward-compat fallback: a layer kind this build does not know.
+    /// Older tools must not hard-fail on a newer bundle's header just to
+    /// print an inventory (the C++ runtime never validated this enum,
+    /// and an old `basert inspect` once refused a Nemotron bundle over
+    /// exactly this). Never written by a converter.
+    Unknown,
+}
+
+// Deserialize by hand so unknown strings land on `Unknown` instead of a
+// serde hard error (`#[serde(other)]` is not available on externally
+// tagged unit enums).
+impl<'de> serde::Deserialize<'de> for LayerKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "attention_dense" => Self::AttentionDense,
+            "attention_gqa" => Self::AttentionGqa,
+            "attention_sliding" => Self::AttentionSliding,
+            "ssm" => Self::Ssm,
+            "ssm_moe" => Self::SsmMoe,
+            "attention_moe" => Self::AttentionMoe,
+            "dense_moe" => Self::DenseMoe,
+            "dense_mlp" => Self::DenseMlp,
+            "moe_ffn" => Self::MoeFfn,
+            _ => Self::Unknown,
+        })
+    }
 }
 
 /// Per-layer precision overrides. Absent = inherit bundle default.

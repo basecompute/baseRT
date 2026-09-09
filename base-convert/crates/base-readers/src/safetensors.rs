@@ -44,6 +44,10 @@ pub enum StDtype {
     U32,
     U64,
     Bool,
+    /// fp8 e4m3 (NVFP4 checkpoints store per-block scales in this dtype).
+    /// Carried as raw bytes; there is no f32 decode path.
+    F8E4m3,
+    F8E5m2,
 }
 
 impl StDtype {
@@ -66,6 +70,8 @@ impl StDtype {
             "U32" => StDtype::U32,
             "U64" => StDtype::U64,
             "BOOL" => StDtype::Bool,
+            "F8_E4M3" => StDtype::F8E4m3,
+            "F8_E5M2" => StDtype::F8E5m2,
             other => bail!("unknown safetensors dtype: {other}"),
         })
     }
@@ -75,7 +81,7 @@ impl StDtype {
             StDtype::F32 | StDtype::I32 | StDtype::U32 => 4,
             StDtype::F16 | StDtype::Bf16 | StDtype::I16 | StDtype::U16 => 2,
             StDtype::F64 | StDtype::I64 | StDtype::U64 => 8,
-            StDtype::I8 | StDtype::U8 | StDtype::Bool => 1,
+            StDtype::I8 | StDtype::U8 | StDtype::Bool | StDtype::F8E4m3 | StDtype::F8E5m2 => 1,
         }
     }
 }
@@ -106,8 +112,8 @@ pub struct SafetensorsFile {
 
 impl SafetensorsFile {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let file = File::open(path.as_ref())
-            .with_context(|| format!("opening {:?}", path.as_ref()))?;
+        let file =
+            File::open(path.as_ref()).with_context(|| format!("opening {:?}", path.as_ref()))?;
         let mmap = unsafe { Mmap::map(&file)? };
         Self::from_mmap(mmap)
     }

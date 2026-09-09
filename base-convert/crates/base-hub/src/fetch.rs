@@ -10,7 +10,6 @@
 
 use anyhow::{Context, Result};
 use hf_hub::progress::{DownloadEvent, FileStatus, Progress, ProgressEvent, ProgressHandler};
-use hf_hub::repository::RepoTreeEntry;
 use hf_hub::{HFClient, HFClientSync, HFRepositorySync, RepoTypeModel};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
@@ -80,6 +79,24 @@ pub trait Fetcher {
     fn staging_dir(&self, repo: &str) -> Option<PathBuf> {
         let _ = repo;
         None
+    }
+
+    /// Pin `revision` to something immutable — the commit it names on the
+    /// Hub — so that a sequence of requests against a moving branch all
+    /// observe one publication. Sources with no such notion return the
+    /// revision unchanged.
+    fn resolve_revision(&self, repo: &str, revision: &str) -> Result<String> {
+        let _ = repo;
+        Ok(revision.to_string())
+    }
+
+    /// A stable identifier for the *content* of `filename` at `revision` —
+    /// the LFS sha256 on the Hub — or `None` when the source has no such
+    /// notion (fixtures). Lets a multi-file install notice that a file it
+    /// already consumed has since been replaced under the same name.
+    fn content_id(&self, repo: &str, revision: &str, filename: &str) -> Result<Option<String>> {
+        let _ = (repo, revision, filename);
+        Ok(None)
     }
 
     /// Read `range` of `filename` without downloading the rest.
@@ -200,6 +217,200 @@ impl ProgressHandler for BarProgress {
     }
 }
 
+/// The Hub token, if any: `$HF_TOKEN`, the legacy `$HUGGING_FACE_HUB_TOKEN`,
+/// the file `$HF_TOKEN_PATH` names, then the cached login under `$HF_HOME`
+/// (default `~/.cache/huggingface`). The same order hf-hub uses, spelled
+/// out here because the raw tree listing below is not an hf-hub call.
+pub(crate) fn resolve_token() -> Option<String> {
+    let from_env = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+    if let Some(t) = from_env("HF_TOKEN").or_else(|| from_env("HUGGING_FACE_HUB_TOKEN")) {
+        return Some(t.trim().to_string());
+    }
+    let path = std::env::var_os("HF_TOKEN_PATH")
+        .map(PathBuf::from)
+        .or_else(|| hf_home().map(|h| h.join("token")))?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+/// Where the cached login lives, in hf-hub's own order: `$HF_HOME`, then
+/// `$XDG_CACHE_HOME/huggingface`, then `~/.cache/huggingface`.
+fn hf_home() -> Option<PathBuf> {
+    hf_home_from(
+        std::env::var_os("HF_HOME").map(PathBuf::from),
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        dirs::home_dir(),
+    )
+}
+
+fn hf_home_from(
+    hf_home: Option<PathBuf>,
+    xdg_cache: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let nonempty = |p: PathBuf| (!p.as_os_str().is_empty()).then_some(p);
+    hf_home
+        .and_then(nonempty)
+        .or_else(|| xdg_cache.and_then(nonempty).map(|x| x.join("huggingface")))
+        .or_else(|| home.map(|h| h.join(".cache").join("huggingface")))
+}
+
+/// Hub API base. `$HF_ENDPOINT` redirects everything at a mirror, the same
+/// variable hf-hub honors for downloads.
+pub(crate) fn endpoint() -> String {
+    std::env::var("HF_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://huggingface.co".to_string())
+}
+
+/// One file in a repo tree, as the Hub's own JSON describes it.
+///
+/// Read raw rather than through hf-hub's typed listing: that type expects
+/// `sha256`/`pointer_size` under `lfs` while the Hub sends `oid`/`pointerSize`,
+/// so the LFS hash — the one number that identifies a part's bytes — always
+/// came back `None` and routing fell back to the git object id, which is
+/// not a hash anything can check a download against.
+#[derive(Debug, Clone)]
+pub(crate) struct TreeEntry {
+    pub path: String,
+    /// Size of the content (the LFS payload where there is one).
+    pub size: u64,
+    /// The git object id — a sha1 over the pointer, not the content.
+    pub git_oid: String,
+    /// sha256 of the content, for LFS-backed files.
+    pub lfs_sha256: Option<String>,
+    /// Served through Xet.
+    pub xet: bool,
+}
+
+/// Parse one page of `/api/models/<repo>/tree/<rev>` into file entries.
+pub(crate) fn parse_tree(body: &str) -> Result<Vec<TreeEntry>> {
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(body).context("parsing the tree listing")?;
+    Ok(entries
+        .iter()
+        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("file"))
+        .filter_map(|e| {
+            let path = e.get("path")?.as_str()?.to_string();
+            let git_oid = e.get("oid")?.as_str()?.to_string();
+            let lfs = e.get("lfs").filter(|l| !l.is_null());
+            Some(TreeEntry {
+                size: lfs
+                    .and_then(|l| l.get("size"))
+                    .or_else(|| e.get("size"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                lfs_sha256: lfs
+                    .and_then(|l| l.get("oid"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                xet: e.get("xetHash").is_some_and(|x| !x.is_null()),
+                git_oid,
+                path,
+            })
+        })
+        .collect())
+}
+
+/// What a pinned revision may be: the commit the Hub reports for the
+/// requested one, or the requested one itself when it is already a commit
+/// id. A branch that resolves to nothing usable is refused rather than
+/// handed on as if it were immutable — everything after the pin assumes it
+/// cannot move.
+pub(crate) fn pinned_revision(requested: &str, sha: Option<String>) -> Result<String> {
+    let is_commit = |s: &str| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    match sha {
+        Some(sha) if is_commit(&sha) => Ok(sha),
+        _ if is_commit(requested) => Ok(requested.to_string()),
+        other => anyhow::bail!(
+            "the Hub did not resolve {requested:?} to a commit (got {other:?}); pass a commit id as the revision"
+        ),
+    }
+}
+
+/// `revision` as one URL path segment: a ref like `feature/foo` or
+/// `release#1` must not become a sub-path or a fragment.
+pub(crate) fn encode_segment(s: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+    const KEEP: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~');
+    utf8_percent_encode(s, KEEP).to_string()
+}
+
+/// The whole tree of `repo` at `revision`, following the Hub's `Link`
+/// pagination.
+pub(crate) fn fetch_tree(repo: &str, revision: &str) -> Result<Vec<TreeEntry>> {
+    let url = Some(format!(
+        "{}/api/models/{repo}/tree/{}?recursive=true",
+        endpoint(),
+        encode_segment(revision)
+    ));
+    let token = resolve_token();
+    // The same bounded reads the download client gets: a mirror that sends
+    // headers and then goes quiet must fail, not hang the pull before it
+    // starts.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(crate::download::read_timeout()))
+        .timeout_recv_body(Some(crate::download::read_timeout()))
+        .build()
+        .into();
+    collect_pages(url, |u| {
+        let mut req = agent.get(u);
+        if let Some(t) = &token {
+            req = req.header("Authorization", &format!("Bearer {t}"));
+        }
+        let resp = req
+            .call()
+            .with_context(|| format!("listing files in {repo}@{revision}"))?;
+        let next = resp
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::scan::parse_next_link);
+        let body = resp
+            .into_body()
+            .read_to_string()
+            .with_context(|| format!("reading the file listing for {repo}@{revision}"))?;
+        Ok((parse_tree(&body)?, next))
+    })
+}
+
+/// Pages a listing may run to before it is treated as a misbehaving
+/// mirror rather than a big repo (a page is up to 1000 entries).
+const MAX_TREE_PAGES: usize = 100;
+
+/// Follow `next` links from `first`, `fetch` returning one page's entries
+/// and the link after it. A listing still pointing onward at the cap is an
+/// error: a truncated tree would be memoized and make files vanish.
+fn collect_pages<T>(
+    first: Option<String>,
+    mut fetch: impl FnMut(&str) -> Result<(Vec<T>, Option<String>)>,
+) -> Result<Vec<T>> {
+    let mut url = first;
+    let mut out = Vec::new();
+    for _ in 0..MAX_TREE_PAGES {
+        let Some(u) = url.take() else {
+            return Ok(out);
+        };
+        let (page, next) = fetch(&u)?;
+        out.extend(page);
+        url = next;
+    }
+    match url {
+        None => Ok(out),
+        Some(more) => anyhow::bail!(
+            "the file listing did not end after {MAX_TREE_PAGES} pages (next: {more}); refusing a truncated tree"
+        ),
+    }
+}
+
 /// Build one hf-hub client pointed at `staging_root`.
 ///
 /// The reqwest client is ours rather than hf-hub's default so it can carry
@@ -220,13 +431,9 @@ fn build_client(staging_root: &Path) -> Result<HFClientSync> {
         .retry_max_attempts(resolve_max_retries())
         .client(http);
     // hf-hub resolves `$HF_TOKEN` itself but not the legacy
-    // `$HUGGING_FACE_HUB_TOKEN`, so both are read here and passed explicitly;
-    // an unset pair leaves hf-hub's own resolution in place.
-    if let Some(tok) = std::env::var("HF_TOKEN")
-        .ok()
-        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
-        .filter(|s| !s.is_empty())
-    {
+    // `$HUGGING_FACE_HUB_TOKEN`; resolve once here (see `resolve_token`) and
+    // pass it explicitly so every request agrees on who is asking.
+    if let Some(tok) = resolve_token() {
         builder = builder.token(tok);
     }
     builder
@@ -252,7 +459,7 @@ pub struct HfFetcher {
     /// several files in the same repo — the artifact, then its sidecars — and
     /// the listing that answers "how big, and is it Xet?" is the same one
     /// `list_files` needs.
-    trees: Mutex<HashMap<(String, String), Vec<RepoTreeEntry>>>,
+    trees: Mutex<HashMap<(String, String), Vec<TreeEntry>>>,
 }
 
 /// What routing needs to know about one remote file.
@@ -276,18 +483,12 @@ impl HfFetcher {
     }
 
     /// The repo's file tree at `revision`, fetched once and remembered.
-    fn tree(&self, repo: &str, revision: &str) -> Result<Vec<RepoTreeEntry>> {
+    fn tree(&self, repo: &str, revision: &str) -> Result<Vec<TreeEntry>> {
         let key = (repo.to_string(), revision.to_string());
         if let Some(hit) = self.trees.lock().unwrap().get(&key) {
             return Ok(hit.clone());
         }
-        let entries = self
-            .repo(repo)
-            .list_tree()
-            .revision(revision)
-            .recursive(true)
-            .send()
-            .with_context(|| format!("listing files in {repo}@{revision}"))?;
+        let entries = fetch_tree(repo, revision)?;
         self.trees.lock().unwrap().insert(key, entries.clone());
         Ok(entries)
     }
@@ -305,20 +506,11 @@ impl HfFetcher {
         Ok(self
             .tree(repo, revision)?
             .into_iter()
-            .find_map(|e| match e {
-                RepoTreeEntry::File {
-                    path,
-                    size,
-                    oid,
-                    lfs,
-                    xet_hash,
-                    ..
-                } if path == filename => Some(FileFacts {
-                    size: lfs.as_ref().and_then(|l| l.size).unwrap_or(size),
-                    xet: xet_hash.is_some(),
-                    key: lfs.and_then(|l| l.sha256).unwrap_or(oid),
-                }),
-                _ => None,
+            .find(|e| e.path == filename)
+            .map(|e| FileFacts {
+                size: e.size,
+                xet: e.xet,
+                key: e.lfs_sha256.unwrap_or(e.git_oid),
             }))
     }
 
@@ -398,10 +590,7 @@ impl Fetcher for HfFetcher {
         Ok(self
             .tree(repo, revision)?
             .into_iter()
-            .filter_map(|e| match e {
-                RepoTreeEntry::File { path, .. } => Some(path),
-                _ => None,
-            })
+            .map(|e| e.path)
             .collect())
     }
 
@@ -413,6 +602,27 @@ impl Fetcher for HfFetcher {
             self.staging_root
                 .join(format!("models--{}", repo.replace('/', "--"))),
         )
+    }
+
+    fn resolve_revision(&self, repo: &str, revision: &str) -> Result<String> {
+        let info = self
+            .repo(repo)
+            .info()
+            .revision(revision.to_string())
+            .send()
+            .with_context(|| format!("looking up {repo}@{revision}"))?;
+        pinned_revision(revision, info.sha)
+    }
+
+    fn content_id(&self, repo: &str, revision: &str, filename: &str) -> Result<Option<String>> {
+        // Only the LFS hash is a hash of the bytes. A file git stores inline
+        // has a sha1 over its header and content, which nothing downstream
+        // can compare a download against, so it reports no id at all.
+        Ok(self
+            .tree(repo, revision)?
+            .into_iter()
+            .find(|e| e.path == filename)
+            .and_then(|e| e.lfs_sha256))
     }
 
     fn read_range(
@@ -529,6 +739,102 @@ impl Fetcher for MockFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cached_login_is_looked_for_where_hf_hub_puts_it() {
+        let p = |s: &str| Some(PathBuf::from(s));
+        assert_eq!(hf_home_from(p("/hf"), p("/xdg"), p("/home/u")), p("/hf"));
+        assert_eq!(
+            hf_home_from(None, p("/xdg"), p("/home/u")),
+            p("/xdg/huggingface")
+        );
+        assert_eq!(
+            hf_home_from(p(""), p("/xdg"), p("/home/u")),
+            p("/xdg/huggingface")
+        );
+        assert_eq!(
+            hf_home_from(None, None, p("/home/u")),
+            p("/home/u/.cache/huggingface")
+        );
+        assert_eq!(hf_home_from(None, None, None), None);
+    }
+
+    #[test]
+    fn a_listing_that_never_ends_is_refused_not_truncated() {
+        // Every page points onward: exhausting the cap is an error, and
+        // nothing partial is returned.
+        let mut pages = 0;
+        let err = collect_pages(Some("p0".to_string()), |_| {
+            pages += 1;
+            Ok((vec![pages], Some(format!("p{pages}"))))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("truncated tree"), "{err}");
+        assert_eq!(pages, MAX_TREE_PAGES);
+
+        // A listing that ends is returned whole, however many pages.
+        let got = collect_pages(Some("p0".to_string()), |u| {
+            let n: usize = u[1..].parse().unwrap();
+            Ok((vec![n], (n < 3).then(|| format!("p{}", n + 1))))
+        })
+        .unwrap();
+        assert_eq!(got, vec![0, 1, 2, 3]);
+        let none: Vec<u8> = collect_pages(None, |_| -> Result<(Vec<u8>, Option<String>)> {
+            unreachable!()
+        })
+        .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn a_pin_is_a_commit_or_nothing() {
+        let sha = "7c73ace2115ad5a838277152d555ec1229281c46".to_string();
+        assert_eq!(pinned_revision("main", Some(sha.clone())).unwrap(), sha);
+        // Asked for a commit already: it stands on its own.
+        assert_eq!(pinned_revision(&sha, None).unwrap(), sha);
+        // A branch the Hub cannot resolve is not quietly kept mutable.
+        let err = pinned_revision("main", None).unwrap_err().to_string();
+        assert!(err.contains("did not resolve"), "{err}");
+        let err = pinned_revision("main", Some("not-a-sha".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not resolve"), "{err}");
+    }
+
+    #[test]
+    fn a_revision_is_one_path_segment() {
+        assert_eq!(encode_segment("main"), "main");
+        assert_eq!(encode_segment("feature/foo"), "feature%2Ffoo");
+        assert_eq!(encode_segment("release#1"), "release%231");
+        assert_eq!(encode_segment("v1.2-rc_3~x"), "v1.2-rc_3~x");
+    }
+
+    #[test]
+    fn tree_listing_keeps_the_lfs_hash_the_typed_client_drops() {
+        // Verbatim shape of the Hub's answer: `lfs.oid` is the sha256 of the
+        // content, top-level `oid` the git object id, and small files have
+        // no `lfs` block at all.
+        let body = r#"[
+          {"type":"file","oid":"7bc52451a2e2576b266715c7898b9d79dbe0bb25","size":134,
+           "lfs":{"oid":"cc36eece6e94329331b5c4abe4f0d31c06d56658c4360ebb1c4b8a974ed20bfe","size":48318382080,"pointerSize":134},
+           "path":"parts/GLM-5.2-Q4.base.part-000"},
+          {"type":"file","oid":"abc","size":12,"path":"README.md"},
+          {"type":"directory","oid":"def","path":"parts"}
+        ]"#;
+        let got = parse_tree(body).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].path, "parts/GLM-5.2-Q4.base.part-000");
+        assert_eq!(got[0].size, 48318382080);
+        assert_eq!(
+            got[0].lfs_sha256.as_deref(),
+            Some("cc36eece6e94329331b5c4abe4f0d31c06d56658c4360ebb1c4b8a974ed20bfe")
+        );
+        assert_eq!(got[0].git_oid, "7bc52451a2e2576b266715c7898b9d79dbe0bb25");
+        assert!(!got[0].xet);
+        assert_eq!(got[1].size, 12);
+        assert_eq!(got[1].lfs_sha256, None);
+    }
 
     /// Fetcher that owns an hf-hub-style staging tree:
     /// `<staging>/models--<org>--<repo>/blobs/<etag>` with

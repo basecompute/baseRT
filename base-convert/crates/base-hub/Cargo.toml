@@ -21,6 +21,10 @@ ureq = "3"
 # The HTTP client handed to hf-hub, so downloads carry our own timeouts.
 # Version must track hf-hub's reqwest, or the `Client` types do not unify.
 reqwest = { version = "0.13", default-features = false }
+# flock for the per-destination reassembly lock.
+libc = "0.2"
+# A revision is one path segment of the tree URL, whatever characters it has.
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile.workspace = true

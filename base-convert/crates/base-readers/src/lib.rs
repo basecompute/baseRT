@@ -30,8 +30,15 @@ pub fn detect_format(path: &std::path::Path) -> anyhow::Result<SourceFormat> {
             anyhow::bail!("{:?} is a directory without config.json", path);
         }
         let bytes = std::fs::read(&cfg_path)?;
+        // Python's `json.dump` writes bare Infinity/NaN, which strict JSON
+        // has no syntax for; published checkpoints do carry them.
+        let (bytes, _) = crate::hf::sanitize_python_json(&bytes);
         let cfg: serde_json::Value = serde_json::from_slice(&bytes)?;
-        if cfg.get("quantization").and_then(|v| v.get("bits")).is_some() {
+        if cfg
+            .get("quantization")
+            .and_then(|v| v.get("bits"))
+            .is_some()
+        {
             Ok(SourceFormat::MlxSafetensors)
         } else {
             Ok(SourceFormat::HfSafetensors)

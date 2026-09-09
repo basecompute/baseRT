@@ -57,8 +57,7 @@ pub(crate) fn hf_generic_config(c: &serde_json::Value) -> Result<crate::ArchConf
     let hidden_size = u32_key("hidden_size")?;
     let num_hidden_layers = u32_key("num_hidden_layers")?;
     let num_attention_heads = u32_key("num_attention_heads")?;
-    let num_kv_heads =
-        u32_key("num_key_value_heads").unwrap_or(num_attention_heads);
+    let num_kv_heads = u32_key("num_key_value_heads").unwrap_or(num_attention_heads);
     // Gemma 3n stores `intermediate_size` as a per-layer array; other archs
     // store a single u32. Accept both and fall back to the first array entry
     // (the runtime then mirrors the array via per_layer_ffn).
@@ -72,9 +71,9 @@ pub(crate) fn hf_generic_config(c: &serde_json::Value) -> Result<crate::ArchConf
             .and_then(|v| v.as_u64())
             .map(|x| x as u32)
             .with_context(|| "config.json `intermediate_size` array empty or non-numeric")?,
-        Some(other) => anyhow::bail!(
-            "config.json `intermediate_size` must be u32 or array, got {other:?}"
-        ),
+        Some(other) => {
+            anyhow::bail!("config.json `intermediate_size` must be u32 or array, got {other:?}")
+        }
         None => anyhow::bail!("config.json missing intermediate_size"),
     };
     let vocab_size = u32_key("vocab_size")?;
@@ -123,14 +122,22 @@ pub(crate) fn hf_generic_config(c: &serde_json::Value) -> Result<crate::ArchConf
             return vec![n as u32];
         }
         v.as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as u32))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let bos_ids = token_id_all("bos_token_id");
     let eos_ids = token_id_all("eos_token_id");
     let bos_token_id = bos_ids.first().copied().unwrap_or(0);
     let eos_token_id = eos_ids.first().copied().unwrap_or(0);
-    let eos_token_ids: Vec<u32> = if eos_ids.len() > 1 { eos_ids[1..].to_vec() } else { Vec::new() };
+    let eos_token_ids: Vec<u32> = if eos_ids.len() > 1 {
+        eos_ids[1..].to_vec()
+    } else {
+        Vec::new()
+    };
 
     Ok(crate::ArchConfig {
         hidden_size,
@@ -175,18 +182,17 @@ impl GgufMapper for LlamaMapper {
         let num_attention_heads = u32_key("llama.attention.head_count")?;
         let num_kv_heads = u32_key("llama.attention.head_count_kv").unwrap_or(num_attention_heads);
         let intermediate_size = u32_key("llama.feed_forward_length")?;
-        let vocab_size = u32_key("llama.vocab_size")
-            .or_else(|_| {
-                // Some GGUFs don't store it explicitly; derive from tokenizer.
-                m.get("tokenizer.ggml.tokens")
-                    .and_then(|v| match v {
-                        KvValue::Array(a) => Some(a.len() as u32),
-                        _ => None,
-                    })
-                    .context("no vocab_size and no tokenizer.ggml.tokens")
-            })?;
-        let head_dim = u32_key("llama.attention.key_length")
-            .unwrap_or(hidden_size / num_attention_heads);
+        let vocab_size = u32_key("llama.vocab_size").or_else(|_| {
+            // Some GGUFs don't store it explicitly; derive from tokenizer.
+            m.get("tokenizer.ggml.tokens")
+                .and_then(|v| match v {
+                    KvValue::Array(a) => Some(a.len() as u32),
+                    _ => None,
+                })
+                .context("no vocab_size and no tokenizer.ggml.tokens")
+        })?;
+        let head_dim =
+            u32_key("llama.attention.key_length").unwrap_or(hidden_size / num_attention_heads);
 
         let rope_theta = f32_key("llama.rope.freq_base").unwrap_or(10_000.0);
         let rope_scale = f32_key("llama.rope.scaling.factor").unwrap_or(1.0);
@@ -346,7 +352,11 @@ mod tests {
         let c = hf_generic_config(&cfg).unwrap();
         assert_eq!(c.bos_token_id, 2, "bos_token_id scalar form still works");
         assert_eq!(c.eos_token_id, 1, "eos_token_id array → first element");
-        assert_eq!(c.eos_token_ids, vec![106u32], "trailing eos ids land in eos_token_ids");
+        assert_eq!(
+            c.eos_token_ids,
+            vec![106u32],
+            "trailing eos ids land in eos_token_ids"
+        );
     }
 
     /// Llama-3 instruct: `eos_token_id: [128001, 128008, 128009]`. Primary

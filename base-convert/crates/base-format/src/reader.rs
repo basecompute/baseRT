@@ -103,10 +103,11 @@ impl BaseReader {
         let header_len = u64::from_le_bytes(prefix[8..16].try_into().unwrap());
 
         let mut header_bytes = vec![0u8; header_len as usize];
-        file.read_exact(&mut header_bytes).map_err(|e| match e.kind() {
-            std::io::ErrorKind::UnexpectedEof => Error::HeaderOverflow(header_len),
-            _ => Error::Io(e),
-        })?;
+        file.read_exact(&mut header_bytes)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => Error::HeaderOverflow(header_len),
+                _ => Error::Io(e),
+            })?;
         Ok(Header::from_json_bytes(&header_bytes)?)
     }
 
@@ -216,10 +217,7 @@ impl BaseReader {
             .iter()
             .flat_map(|m| m.tensors.iter())
             .map(|t| self.blob_offset + t.offset + t.length);
-        let blob_end = main_end
-            .chain(mmproj_end)
-            .max()
-            .unwrap_or(self.blob_offset);
+        let blob_end = main_end.chain(mmproj_end).max().unwrap_or(self.blob_offset);
         (blob_end + 7) & !7u64
     }
 

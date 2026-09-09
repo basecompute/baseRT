@@ -48,6 +48,21 @@ pub struct MlxDir {
     pub quant: MlxQuant,
 }
 
+/// Borrowed view of an MLX-quantized tensor's raw storage, for
+/// passthrough conversion (see [`MlxDir::tensor_packed`]).
+pub struct MlxPackedTensor<'a> {
+    /// Packed weight bytes (nibble stream, low-nibble first).
+    pub packed: &'a [u8],
+    /// Per-group scales, stored as `scale_dtype` (BF16 on current
+    /// checkpoints, F16 on pre-0.20 ones).
+    pub scales: &'a [u8],
+    /// Per-group biases, same dtype as scales.
+    pub biases: &'a [u8],
+    pub group_size: u32,
+    pub bits: u32,
+    pub scale_dtype: StDtype,
+}
+
 impl MlxDir {
     pub fn open<P: AsRef<std::path::Path>>(dir: P) -> Result<Self> {
         let hf = HfDir::open(dir)?;
@@ -183,10 +198,9 @@ impl MlxDir {
             .tensor_bytes(&scales_name)
             .with_context(|| format!("tensor_bytes({scales_name}) missing after tensor_info()"))?;
         let biases_bytes = match biases_dtype {
-            Some(_) => self
-                .hf
-                .tensor_bytes(&biases_name)
-                .with_context(|| format!("tensor_bytes({biases_name}) missing after tensor_info()"))?,
+            Some(_) => self.hf.tensor_bytes(&biases_name).with_context(|| {
+                format!("tensor_bytes({biases_name}) missing after tensor_info()")
+            })?,
             None => &[],
         };
 
@@ -228,13 +242,76 @@ impl MlxDir {
                             word |= (packed_bytes[byte0 + 1] as u32) << 8;
                         }
                         let q = (word >> sh) & mask;
-                        out[o_base + i * in_features + j] =
-                            (q as f32) * scale + bias;
+                        out[o_base + i * in_features + j] = (q as f32) * scale + bias;
                     }
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Raw packed payload of an MLX-quantized tensor, verbatim.
+    ///
+    /// MLX's `U32 [.., in/(32/bits)]` little-endian nibble packing is
+    /// byte-identical to `base_q4`'s two-per-byte low-nibble-first
+    /// stream (verified against `mx.dequantize` at 0.0 difference), so
+    /// a passthrough conversion can reuse these bytes without the
+    /// dequant→requant round trip that costs ~4.4% of weight RMS.
+    ///
+    /// Returns `Ok(None)` for unquantized tensors (no `.scales`
+    /// sibling). Errors if the tensor's (bits, group_size) differ from
+    /// `expect_bits`/`expect_group_size` — a passthrough caller must
+    /// fail loudly rather than silently requantize, or the "weights
+    /// are bit-identical to the source" contract breaks.
+    pub fn tensor_packed(
+        &self,
+        name: &str,
+        expect_bits: u32,
+        expect_group_size: u32,
+    ) -> Result<Option<MlxPackedTensor<'_>>> {
+        let Some(scales_name) = quant_sibling(name, "scales") else {
+            return Ok(None);
+        };
+        if self.hf.tensor_info(&scales_name).is_none() {
+            return Ok(None);
+        }
+        let q = self.quant_for_tensor(name);
+        if q.bits != expect_bits || q.group_size != expect_group_size {
+            bail!(
+                "MLX tensor {name:?} is {}-bit gs={} — passthrough expects {}-bit gs={}",
+                q.bits,
+                q.group_size,
+                expect_bits,
+                expect_group_size
+            );
+        }
+        let scales_info = self
+            .hf
+            .tensor_info(&scales_name)
+            .with_context(|| format!("scales {scales_name} missing"))?;
+        let scale_dtype = scales_info.dtype;
+        let biases_name = quant_sibling(name, "biases")
+            .with_context(|| format!("expected `.weight`-suffixed name, got {name}"))?;
+        let packed = self
+            .hf
+            .tensor_bytes(name)
+            .with_context(|| format!("tensor_bytes({name}) missing"))?;
+        let scales = self
+            .hf
+            .tensor_bytes(&scales_name)
+            .with_context(|| format!("tensor_bytes({scales_name}) missing"))?;
+        let biases = self
+            .hf
+            .tensor_bytes(&biases_name)
+            .with_context(|| format!("MLX affine tensor {name:?} has scales but no biases"))?;
+        Ok(Some(MlxPackedTensor {
+            packed,
+            scales,
+            biases,
+            group_size: q.group_size,
+            bits: q.bits,
+            scale_dtype,
+        }))
     }
 
     /// Logical shape of an MLX-packed tensor (unpacking the last dim).
@@ -246,8 +323,7 @@ impl MlxDir {
     /// logical in_features the runtime expects.
     pub fn unpacked_shape(&self, name: &str) -> Option<Vec<u64>> {
         let info = self.hf.tensor_info(name)?;
-        quant_sibling(name, "scales")
-            .and_then(|sn| self.hf.tensor_info(&sn))?;
+        quant_sibling(name, "scales").and_then(|sn| self.hf.tensor_info(&sn))?;
         if info.shape.len() < 2 {
             return None;
         }
@@ -264,6 +340,169 @@ impl MlxDir {
         Some(shape)
     }
 
+    /// Zero-loss transplant of an MLX affine-quantized tensor into
+    /// `base_q4`'s on-disk layout.
+    ///
+    /// `base_q4` and MLX-affine 4-bit are the *same* scheme: INT4
+    /// asymmetric, `value = q * scale + bias`, one f16 scale and f16
+    /// bias per group of 64. At 4 bits MLX's little-endian bitstream is
+    /// byte-for-byte `base_q4`'s low-nibble-first packing
+    /// (`byte = (q[2i+1] << 4) | q[2i]`), so the weight bytes transplant
+    /// verbatim and only the scale/bias regions need re-laying-out.
+    ///
+    /// Taking this path instead of dequant → requant matters for more
+    /// than speed: re-deriving `scale = (max - min) / 15` from already
+    /// quantized values lands on a *different* grid whenever a group's
+    /// codes don't span the full 0..15 range, so the round trip is not
+    /// the identity. Transplanting reproduces the reference engine's
+    /// weights exactly, which is what makes an MLX-vs-baseRT numerical
+    /// comparison attributable to engine math.
+    ///
+    /// Returns `None` (rather than an error) whenever the tensor is not
+    /// an exact match for the target scheme — different bits, a
+    /// different group size, a symmetric tensor with no `.biases`, or a
+    /// plain unquantized tensor. Callers fall back to dequant → requant.
+    pub fn packed_base_q4(&self, name: &str, group_size: u32) -> Result<Option<MlxPackedQ4>> {
+        let Some(scales_name) = quant_sibling(name, "scales") else {
+            return Ok(None);
+        };
+        let Some(scales_info) = self.hf.tensor_info(&scales_name) else {
+            return Ok(None); // not MLX-packed
+        };
+        let q = self.quant_for_tensor(name);
+        if q.bits != 4 || q.group_size != group_size {
+            return Ok(None); // 8-bit override, or a group size base_q4 can't express
+        }
+        let Some(biases_name) = quant_sibling(name, "biases") else {
+            return Ok(None);
+        };
+        let Some(biases_info) = self.hf.tensor_info(&biases_name) else {
+            return Ok(None); // symmetric tensor — base_q4 is asymmetric
+        };
+        let packed = self
+            .hf
+            .tensor_info(name)
+            .with_context(|| format!("packed tensor {name} missing"))?;
+        if packed.shape.len() < 2 {
+            return Ok(None);
+        }
+
+        let group_size_usize = group_size as usize;
+        let (batch_dims, packed_last) = packed.shape.split_at(packed.shape.len() - 1);
+        let packed_in = packed_last[0] as usize;
+        let (batch_dims_split, out_dim_slice) = batch_dims.split_at(batch_dims.len() - 1);
+        let out_features = out_dim_slice[0] as usize;
+        // 4-bit: 8 codes per u32.
+        let in_features = packed_in * 8;
+        if in_features % group_size_usize != 0 {
+            return Ok(None);
+        }
+        let batch = (batch_dims_split.iter().product::<u64>() as usize).max(1);
+        let total_values = batch * out_features * in_features;
+        let n_groups = total_values / group_size_usize;
+
+        let packed_bytes = self
+            .hf
+            .tensor_bytes(name)
+            .with_context(|| format!("tensor_bytes({name}) missing after tensor_info()"))?;
+        // The transplant is only sound if the source is exactly as large
+        // as the layout implies — a short/long buffer means our shape
+        // arithmetic disagrees with the file, and copying it verbatim
+        // would silently produce a corrupt bundle.
+        if packed_bytes.len() != total_values / 2 {
+            bail!(
+                "MLX packed tensor {:?}: {} weight bytes but shape {:?} implies {} \
+                 (4-bit codes, 2 per byte)",
+                name,
+                packed_bytes.len(),
+                packed.shape,
+                total_values / 2
+            );
+        }
+        let scales_bytes = self
+            .hf
+            .tensor_bytes(&scales_name)
+            .with_context(|| format!("tensor_bytes({scales_name}) missing after tensor_info()"))?;
+        let biases_bytes = self
+            .hf
+            .tensor_bytes(&biases_name)
+            .with_context(|| format!("tensor_bytes({biases_name}) missing after tensor_info()"))?;
+        if scales_bytes.len() != n_groups * 2 || biases_bytes.len() != n_groups * 2 {
+            bail!(
+                "MLX packed tensor {:?}: scales/biases are {}/{} bytes but shape {:?} implies \
+                 {} groups of {} (2 bytes each)",
+                name,
+                scales_bytes.len(),
+                biases_bytes.len(),
+                packed.shape,
+                n_groups,
+                group_size
+            );
+        }
+
+        // base_q4 stores f16 scales and biases. F16 sources copy
+        // verbatim; bf16 sources (mlx-lm ≳ 0.20) are widened to f32 and
+        // renarrowed — exact in the mantissa (bf16 has 8 bits, f16 has
+        // 11) but bf16's wider exponent range can overflow to inf or
+        // flush to zero, so report how many did.
+        let (scales, scales_narrowed) = narrow_to_f16_le(scales_bytes, scales_info.dtype)?;
+        let (biases, biases_narrowed) = narrow_to_f16_le(biases_bytes, biases_info.dtype)?;
+
+        let out_of_f16_range = count_non_finite(&scales) + count_non_finite(&biases);
+
+        Ok(Some(MlxPackedQ4 {
+            packed_weights: packed_bytes.to_vec(),
+            scales,
+            biases,
+            group_size,
+            narrowed_from_bf16: scales_narrowed || biases_narrowed,
+            out_of_f16_range,
+        }))
+    }
+}
+
+/// An MLX affine-q4 tensor in `base_q4`'s on-disk layout, ready to write
+/// without a dequant → requant round trip. Field names mirror
+/// `base_quant::Packed` so the caller's conversion is a plain move.
+pub struct MlxPackedQ4 {
+    /// 4-bit codes, two per byte, low nibble first — MLX's bytes verbatim.
+    pub packed_weights: Vec<u8>,
+    /// One f16 scale per group, little-endian.
+    pub scales: Vec<u8>,
+    /// One f16 bias per group, little-endian.
+    pub biases: Vec<u8>,
+    pub group_size: u32,
+    /// Source scales/biases were bf16 and had to be renarrowed to f16.
+    pub narrowed_from_bf16: bool,
+    /// Scales/biases that left f16's representable range in the process.
+    pub out_of_f16_range: usize,
+}
+
+/// Re-encode a buffer of f16-or-bf16 halves as little-endian f16.
+/// Returns `(bytes, narrowed)` where `narrowed` marks a bf16 source.
+/// Public so `--validate` can compare against the bytes the WRITE path
+/// actually emitted: a bf16-scaled checkpoint is narrowed on the way in, so a
+/// byte-compare against the raw source scales would fail on every tensor.
+pub fn narrow_to_f16_le(bytes: &[u8], dtype: StDtype) -> Result<(Vec<u8>, bool)> {
+    match dtype {
+        StDtype::F16 => Ok((bytes.to_vec(), false)),
+        StDtype::Bf16 => {
+            let mut out = Vec::with_capacity(bytes.len());
+            for c in bytes.chunks_exact(2) {
+                let v = bf16::from_le_bytes([c[0], c[1]]).to_f32();
+                out.extend_from_slice(&f16::from_f32(v).to_le_bytes());
+            }
+            Ok((out, true))
+        }
+        other => bail!("MLX scales/biases have unsupported dtype {other:?} (expected f16 or bf16)"),
+    }
+}
+
+fn count_non_finite(f16_le: &[u8]) -> usize {
+    f16_le
+        .chunks_exact(2)
+        .filter(|c| !f16::from_le_bytes([c[0], c[1]]).to_f32().is_finite())
+        .count()
 }
 
 fn quant_sibling(name: &str, suffix: &str) -> Option<String> {
