@@ -33,6 +33,7 @@ fn make_header() -> Header {
         tensors: vec![],
         mmproj: None,
         calibration: None,
+        provenance: None,
         sig: None,
     }
 }
@@ -241,7 +242,9 @@ fn writer_fills_xxhash64_and_reader_verifies() {
     let reader = BaseReader::open(tmp.path()).unwrap();
     let t = &reader.header().tensors[0];
     assert_eq!(t.checksum_xxh64, Some(expected));
-    reader.verify_tensor("checked").expect("checksum should match");
+    reader
+        .verify_tensor("checked")
+        .expect("checksum should match");
 }
 
 #[test]
@@ -455,7 +458,10 @@ fn rejects_unknown_version() {
     bytes.extend_from_slice(&0u64.to_le_bytes());
     std::fs::write(tmp.path(), &bytes).unwrap();
     let err = expect_err(BaseReader::open(tmp.path()));
-    assert!(matches!(err, base_format::Error::UnsupportedVersion(999, _)));
+    assert!(matches!(
+        err,
+        base_format::Error::UnsupportedVersion(999, _)
+    ));
 }
 
 #[test]

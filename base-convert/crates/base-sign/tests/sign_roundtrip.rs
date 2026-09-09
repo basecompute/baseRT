@@ -35,6 +35,7 @@ fn make_header() -> Header {
         tensors: vec![],
         mmproj: None,
         calibration: None,
+        provenance: None,
         sig: None,
     }
 }

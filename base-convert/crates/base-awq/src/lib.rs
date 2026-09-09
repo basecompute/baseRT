@@ -230,8 +230,8 @@ fn rtn_reconstruction_mse(
     group_size: u32,
     symmetric: bool,
 ) -> f32 {
-    use base_quant::{pack_rtn, unpack_rtn, RtnConfig};
     use base_format::ScaleDtype;
+    use base_quant::{pack_rtn, unpack_rtn, RtnConfig};
 
     let cfg = RtnConfig {
         bits,
@@ -281,9 +281,8 @@ mod tests {
 
         let plan = AwqConfig::default().search(&weights, n_in, &absmax, 4, 64, false);
         let identity: Vec<f32> = vec![1.0; n_in];
-        let plain_mse = rtn_reconstruction_mse(
-            &weights, &weights, n_in, n_out, &identity, 4, 64, false,
-        );
+        let plain_mse =
+            rtn_reconstruction_mse(&weights, &weights, n_in, n_out, &identity, 4, 64, false);
         // Tiny tolerance for floating-point order-of-ops.
         assert!(
             plan.mse <= plain_mse * 1.0001,
@@ -314,9 +313,8 @@ mod tests {
         let plan = AwqConfig::default().search(&weights, n_in, &absmax, 2, 32, false);
 
         let identity: Vec<f32> = vec![1.0; n_in];
-        let plain_mse = rtn_reconstruction_mse(
-            &weights, &weights, n_in, n_out, &identity, 2, 32, false,
-        );
+        let plain_mse =
+            rtn_reconstruction_mse(&weights, &weights, n_in, n_out, &identity, 2, 32, false);
         assert!(
             plan.mse < plain_mse,
             "AWQ should help: awq={} plain={}",

@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+mod gpt_oss;
 mod hub;
 
 /// Hand-written top-level help: the runtime commands are dispatched via
@@ -17,6 +18,7 @@ Run models:
   chat        Chat with a model interactively
   complete    Generate a one-shot completion
   bench       Measure throughput
+  computearena Run and manage ComputeArena benchmarks
 
 Manage models:
   pull        Download a model from the BaseRT catalog or Hugging Face
@@ -67,6 +69,8 @@ enum Cmd {
     List(ListArgs),
     /// Regenerate the model catalog by scanning a published HF organization.
     CatalogScan(CatalogScanArgs),
+    /// Write the manifest a Hub-split `.base` needs beside its parts.
+    CatalogManifest(CatalogManifestArgs),
     /// Runtime commands — `serve`, `chat`, `complete`, `bench`, … — handled
     /// by the BaseRT runtime (dispatched in `hub::dispatch_external`).
     #[command(external_subcommand)]
@@ -132,6 +136,18 @@ struct ConvertArgs {
     #[arg(long)]
     allow_quant_from_quant: bool,
 
+    /// Requantize MLX affine-q4 sources through f32 instead of
+    /// transplanting their packed bytes into `base_q4`.
+    ///
+    /// The two schemes are identical (INT4 asymmetric, group 64, f16
+    /// scale + bias), so `--target base-q4` from an MLX 4-bit source
+    /// normally copies the codes verbatim and reproduces the source
+    /// weights bit-for-bit. Requantizing instead re-derives each group's
+    /// scale from already-quantized values, which lands on a different
+    /// grid — use this only to reproduce a bundle built before the
+    /// transplant path existed.
+    #[arg(long)]
+    no_mlx_passthrough: bool,
     /// GGUF sources only: copy Q4_K / Q5_K / Q6_K super-blocks into the
     /// bundle VERBATIM instead of dequantizing and re-packing them.
     ///
@@ -180,6 +196,44 @@ struct ConvertArgs {
     /// Overrides the built-in per-projector-type defaults.
     #[arg(long, value_name = "PATH", requires = "mmproj")]
     mmproj_config: Option<PathBuf>,
+
+    /// Reuse an MLX checkpoint's already-quantized payloads verbatim
+    /// (packed nibbles + bf16 scales/biases) instead of the lossy
+    /// dequant→requant round trip. The written weights are
+    /// bit-identical to the MLX source. Requires an MLX 4-bit
+    /// group-size-64 source, `--target base-q4`, and no `--profile`.
+    /// Tensors the runtime needs at f16 (MLA k_b/v_b, the MoE router)
+    /// still dequantize exactly and store as f16.
+    #[arg(long)]
+    mlx_passthrough: bool,
+
+    /// After a `--mlx-passthrough` conversion, re-open the written
+    /// `.base` and byte-compare every tensor against the MLX source
+    /// (packed/scales/biases verbatim for passthrough tensors; the
+    /// recomputed f16 bytes for dequantized ones). Exact equality or
+    /// error — this is the "oracle" gate for downstream DSA
+    /// validation.
+    #[arg(long)]
+    validate: bool,
+
+    /// Stream the blob straight into the output file behind a reserved
+    /// header region instead of via a `.blobtmp` sibling — peak disk
+    /// usage becomes the bundle size instead of 2×. The header is
+    /// space-padded to the 64 MiB reserve (negligible on the huge
+    /// bundles this exists for; don't use it on small models).
+    #[arg(long)]
+    direct_write: bool,
+
+    /// Importance-weighted RTN ("imatrix"): use the `--awq-profile`
+    /// sidecar's per-input-channel activation absmax as weights for the
+    /// per-group affine fit, instead of AWQ's weight rotation. Unlike
+    /// AWQ, the packed tensors still approximate the ORIGINAL weights —
+    /// no runtime activation scaling exists or is needed; only where
+    /// the quantization error lands changes (away from salient
+    /// channels). Requires --awq-profile; mutually exclusive with the
+    /// AWQ rotation path (this flag takes precedence).
+    #[arg(long)]
+    imatrix: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -226,7 +280,7 @@ struct InspectArgs {
     verify_checksums: bool,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum TargetScheme {
     BaseQ2,
     BaseQ3,
@@ -236,6 +290,9 @@ enum TargetScheme {
     BaseQ8,
     Bf16,
     Mxfp4,
+    /// NVIDIA fp4: e2m1 codes + e4m3 per-block-16 scales. Accepts the
+    /// `base-nvfp4` spelling used by conversion harnesses.
+    #[value(alias = "base-nvfp4")]
     Nvfp4,
 }
 
@@ -279,6 +336,13 @@ struct CatalogScanArgs {
     /// Report what would change without writing anything.
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Parser, Debug)]
+struct CatalogManifestArgs {
+    /// The logical `.base` path the parts are named after, e.g.
+    /// `parts/GLM-5.2-Q4.base` (its `.part-NNN` siblings are described).
+    bundle: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -342,7 +406,12 @@ fn main() -> Result<()> {
     // subcommands (convert/pull/list/...) stay quiet, and the runtime tools
     // print their own banner (tools/basert_banner.h).
     let raw_arg1 = std::env::args().nth(1);
-    if raw_arg1.is_none() || matches!(raw_arg1.as_deref(), Some("-h") | Some("--help") | Some("help")) {
+    if raw_arg1.is_none()
+        || matches!(
+            raw_arg1.as_deref(),
+            Some("-h") | Some("--help") | Some("help")
+        )
+    {
         print_banner();
     }
     let args = Args::parse();
@@ -355,6 +424,7 @@ fn main() -> Result<()> {
         Cmd::Pull(a) => hub::cmd_pull(a),
         Cmd::List(a) => hub::cmd_list(a),
         Cmd::CatalogScan(a) => hub::cmd_catalog_scan(a.org, a.out, a.dry_run),
+        Cmd::CatalogManifest(a) => hub::cmd_catalog_manifest(a.bundle),
         Cmd::External(argv) => hub::dispatch_external(argv),
     }
 }
@@ -362,8 +432,7 @@ fn main() -> Result<()> {
 fn cmd_keygen(args: KeygenArgs) -> Result<()> {
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
-    std::fs::create_dir_all(&args.out)
-        .with_context(|| format!("creating {:?}", args.out))?;
+    std::fs::create_dir_all(&args.out).with_context(|| format!("creating {:?}", args.out))?;
     let mut rng = OsRng;
     let sk = SigningKey::generate(&mut rng);
     let vk = sk.verifying_key();
@@ -400,6 +469,21 @@ fn cmd_convert(args: ConvertArgs) -> Result<()> {
         return convert_synthetic_with_ctx(&output, &ctx);
     }
 
+    // gpt-oss (OpenAI, MXFP4 MoE): a safetensors checkpoint whose expert
+    // stacks are pre-quantized in a layout the generic paths cannot read.
+    // Routed before format detection (its config.json has
+    // `quantization_config`, not the MLX `quantization` block, so detect_format
+    // would send it down the dequantize-and-requantize HF path).
+    if args.input.is_dir() {
+        if let Ok(bytes) = std::fs::read(args.input.join("config.json")) {
+            if let Ok(cfg) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if gpt_oss::is_gpt_oss(&cfg) {
+                    return gpt_oss::convert_gpt_oss(&args.input, &output, &ctx);
+                }
+            }
+        }
+    }
+
     // Detect source format: GGUF / HF-safetensors / MLX-safetensors.
     use base_readers::SourceFormat;
     let fmt = base_readers::detect_format(&args.input)
@@ -418,6 +502,52 @@ fn cmd_convert(args: ConvertArgs) -> Result<()> {
     }
 }
 
+/// Build the typed per-layer descriptors for the header. Homogeneous
+/// transformers (empty `layer_types`) keep the historical all-GQA
+/// layout; hybrid configs get their real schedule so the header states
+/// which layers are SSM vs attention vs MoE-FFN and how many experts
+/// they carry.
+fn layer_descriptors_from_config(
+    config: &base_arch::ArchConfig,
+) -> Vec<base_format::LayerDescriptor> {
+    use base_format::{ComputeRegion, LayerDescriptor, LayerKind, LayerPrecision};
+    (0..config.num_hidden_layers as usize)
+        .map(|i| {
+            let kind = match config.layer_types.get(i).map(String::as_str) {
+                // Nemotron-H vocabulary.
+                Some("mamba") => LayerKind::Ssm,
+                Some("moe") => LayerKind::MoeFfn,
+                Some("mlp") => LayerKind::DenseMlp,
+                // Qwen3.5 hybrid vocabulary: Gated-DeltaNet layers are
+                // recurrent-state layers, closest to Ssm.
+                Some("linear_attention") => LayerKind::Ssm,
+                // "attention" / "full_attention" / unknown / homogeneous.
+                _ => LayerKind::AttentionGqa,
+            };
+            let is_moe_layer = kind == LayerKind::MoeFfn;
+            LayerDescriptor {
+                kind,
+                moe_n_experts: if is_moe_layer {
+                    config.num_experts as u16
+                } else {
+                    0
+                },
+                moe_n_active: if is_moe_layer {
+                    config.num_experts_per_tok as u16
+                } else {
+                    0
+                },
+                shared_attn_layer: None,
+                compute_hint: Some(ComputeRegion::Accelerator),
+                precision: LayerPrecision {
+                    force_fp32_ssm: kind == LayerKind::Ssm,
+                    ..LayerPrecision::default()
+                },
+            }
+        })
+        .collect()
+}
+
 /// Real-model conversion: read a GGUF, dequant per-tensor to f32,
 /// remap tensor names to canonical .base convention, re-quantize to the
 /// target scheme, write the .base file.
@@ -432,15 +562,14 @@ fn convert_gguf(
 ) -> Result<()> {
     use base_arch::source_mapper_for_gguf;
     use base_format::{
-        AlignmentConfig, BaseReader, BaseWriter, ComputeRegion, Header, HeaderFlags, LayerKind,
-        LayerDescriptor, LayerPrecision, ModelConfig, QuantScheme, SourceInfo, TargetBackend, TensorDtype,
-        TensorFlags, TensorPayload, TokenizerBlob,
+        AlignmentConfig, BaseReader, BaseWriter, ComputeRegion, Header, HeaderFlags, ModelConfig,
+        QuantScheme, SourceInfo, TargetBackend, TensorDtype, TensorFlags, TensorPayload,
+        TokenizerBlob,
     };
     use base_readers::gguf::{dequant_to_f32, ggml_type_name, GgmlType, GgufFile};
     let target = ctx.target;
 
-    let gguf = GgufFile::open(input)
-        .with_context(|| format!("opening GGUF {:?}", input))?;
+    let gguf = GgufFile::open(input).with_context(|| format!("opening GGUF {:?}", input))?;
     let arch = gguf
         .arch()
         .ok_or_else(|| anyhow::anyhow!("GGUF missing general.architecture"))?;
@@ -552,21 +681,23 @@ fn convert_gguf(
         metadata: Default::default(),
         target_backend: TargetBackend::Metal,
         quant_profile: ctx.profile_name().unwrap_or("").to_string(),
-        alignment: AlignmentConfig::default(),
+        // Accel tensors align to the 16 KiB Apple page (default is 64 B):
+        // the runtime's BaseWeightStore can then always split its chunked
+        // no-copy mmap at a tensor start. Mixed-dtype bundles with 64 B
+        // alignment can run a whole max_buffer_size window without a
+        // page-aligned start (seen on the GLM 5.2 q4/q5/q6 production
+        // bundle), forcing overlap-mapped splits or per-tensor copies.
+        // Padding cost: < tensor_count × 16 KiB — noise on any real model.
+        alignment: AlignmentConfig {
+            accel_align_log2: 14,
+            ..Default::default()
+        },
         flags: HeaderFlags::QUANTIZED,
-        layers: (0..config.num_hidden_layers)
-            .map(|_| LayerDescriptor {
-                kind: LayerKind::AttentionGqa,
-                moe_n_experts: 0,
-                moe_n_active: 0,
-                shared_attn_layer: None,
-                compute_hint: Some(ComputeRegion::Accelerator),
-                precision: LayerPrecision::default(),
-            })
-            .collect(),
+        layers: layer_descriptors_from_config(&config),
         tensors: vec![],
         mmproj: None,
         calibration: None,
+        provenance: None,
         sig: None,
     };
 
@@ -624,9 +755,8 @@ fn convert_gguf(
         // permutation only ever moves whole rows).
         let unpermuted_bytes = match mapper.rope_unpermute_heads(&canonical, &config) {
             Some(n_heads) => {
-                let out = unpermute_rope_rows(info, raw, n_heads).with_context(|| {
-                    format!("rope row un-permute for {:?}", info.name)
-                })?;
+                let out = unpermute_rope_rows(info, raw, n_heads)
+                    .with_context(|| format!("rope row un-permute for {:?}", info.name))?;
                 unpermuted += 1;
                 Some(out)
             }
@@ -668,7 +798,14 @@ fn convert_gguf(
             || info.name.ends_with(".ssm_a");
         let is_ssm_sensitive = is_ssm_a
             || canonical.ends_with(".ssm.dt_bias")
-            || canonical.ends_with(".ssm.d");
+            || canonical.ends_with(".ssm.d")
+            // Grouped RMS-norm gains ([groups, d] — 2-D, so the 1-D
+            // norm check misses them) and the short depthwise conv:
+            // tiny tensors on the recurrent path; group-quantizing
+            // them wrecks the state update. Keep f32 on CPU.
+            || canonical.ends_with(".ssm.norm.weight")
+            || canonical.ends_with(".ssm.conv1d.weight")
+            || canonical.ends_with(".ssm.conv1d.bias");
         // SSM A-matrix (and adjacent SSM scalars) MUST stay f32 in CPU
         // region — quantizing them produces NaN after ~100 recurrent
         // steps. Regular 1-D norm weights and the embed/lm_head pair
@@ -678,6 +815,20 @@ fn convert_gguf(
         // memory bloat).
         let is_norm_like = info.shape.len() == 1;
         let is_embedding = canonical == "embed_tokens.weight" || canonical == "lm_head.weight";
+        // Emit at f16 (not the target quant) for two precision-sensitive
+        // GLM 5.2 cases:
+        //   * MLA k_b/v_b up-projections — consumed by dedicated absorb
+        //     kernels that read the weights as RAW f16 (not the quant GEMM
+        //     path) and encode the exact GGUF ne0-fastest 3-D layout;
+        //     quantizing would corrupt those raw-half reads outright.
+        //   * The MoE router (ffn_gate_inp → mlp.router) — llama.cpp keeps
+        //     it F32; base_qN routing of this tiny [dim, n_experts] tensor
+        //     can flip borderline sigmoid+bias top-k selections and diverge
+        //     the whole expert mixture from the reference.
+        let is_mla_absorb =
+            canonical.ends_with(".k_b_proj.weight") || canonical.ends_with(".v_b_proj.weight");
+        let is_moe_router = canonical.ends_with(".router.weight");
+        let force_f16 = is_mla_absorb || is_moe_router;
 
         let (entry, data) = if is_ssm_sensitive {
             let mut flags = TensorFlags::empty();
@@ -704,12 +855,12 @@ fn convert_gguf(
                 symmetric: false,
                 flags,
                 checksum_xxh64: None,
-            source_ggml_type: None,
-};
+                source_ggml_type: None,
+            };
             let data: Vec<u8> = f32s.iter().flat_map(|f| f.to_le_bytes()).collect();
             entry.length = data.len() as u64;
             (entry, data)
-        } else if is_norm_like {
+        } else if is_norm_like || force_f16 {
             // 1-D norms (and biases caught by the same shape check) are
             // always emitted at f16. A profile's catch-all `**.weight`
             // rule typically targets a quant bit-width; quantizing a
@@ -742,8 +893,8 @@ fn convert_gguf(
                 symmetric: false,
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
-            source_ggml_type: None,
-};
+                source_ggml_type: None,
+            };
             (entry, bytes)
         } else if is_embedding {
             // Embed/lm_head: pack at the target quant scheme. Earlier
@@ -752,11 +903,11 @@ fn convert_gguf(
             // (Llama-3.2-1B at MLX-direct ships embed at 4-bit ≈ 131 MB —
             // cache-friendly). Quantizing embed matches the source format
             // and is what the embedding_lookup_q4 kernel expects.
+            let in_features = info.shape.last().copied().map(|d| d as usize);
             let (packed, dtype) = if ctx.profile.is_some() {
-                let in_features = info.shape.last().copied().map(|d| d as usize);
                 ctx.pack_tensor(&canonical, &f32s, in_features)?
             } else {
-                pack_for_target(&f32s, target)?
+                pack_for_target_rows(&f32s, target, in_features, &canonical)?
             };
             let mut data = Vec::with_capacity(
                 packed.packed_weights.len() + packed.scales.len() + packed.biases.len(),
@@ -806,17 +957,17 @@ fn convert_gguf(
                 symmetric: false,
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
-            source_ggml_type: None,
-};
+                source_ggml_type: None,
+            };
             entry.length = data.len() as u64;
             (entry, data)
         } else {
             // Quantize to target scheme, Accelerator region.
+            let in_features = info.shape.last().copied().map(|d| d as usize);
             let (packed, dtype) = if ctx.profile.is_some() {
-                let in_features = info.shape.last().copied().map(|d| d as usize);
                 ctx.pack_tensor(&canonical, &f32s, in_features)?
             } else {
-                pack_for_target(&f32s, target)?
+                pack_for_target_rows(&f32s, target, in_features, &canonical)?
             };
             let mut data = Vec::with_capacity(
                 packed.packed_weights.len() + packed.scales.len() + packed.biases.len(),
@@ -867,8 +1018,8 @@ fn convert_gguf(
                 symmetric: false,
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
-            source_ggml_type: None,
-};
+                source_ggml_type: None,
+            };
             let _ = entry.length; // length will be overwritten by writer
             entry.length = data.len() as u64;
             (entry, data)
@@ -916,8 +1067,8 @@ fn convert_gguf(
 
         let hf_cfg = match mmproj_config {
             Some(p) => {
-                let bytes = std::fs::read(p)
-                    .with_context(|| format!("reading --mmproj-config {:?}", p))?;
+                let bytes =
+                    std::fs::read(p).with_context(|| format!("reading --mmproj-config {:?}", p))?;
                 let v: serde_json::Value = serde_json::from_slice(&bytes)
                     .with_context(|| format!("parsing --mmproj-config {:?}", p))?;
                 // Tower geometry still comes from the GGUF; this only
@@ -937,8 +1088,8 @@ fn convert_gguf(
         for info in mm.tensors.iter() {
             // Unknown names are fatal, not skipped: a silently dropped tower
             // weight produces plausible-looking output, not an error.
-            let canonical = base_arch::muse_glimmer::map_mmproj_gguf_name(&info.name)
-                .ok_or_else(|| {
+            let canonical =
+                base_arch::muse_glimmer::map_mmproj_gguf_name(&info.name).ok_or_else(|| {
                     anyhow::anyhow!(
                         "unmapped mmproj tensor {:?} — refusing to drop a tower weight",
                         info.name
@@ -1070,11 +1221,9 @@ fn convert_gguf(
                     offset: 0,
                     length: 0,
                     scale_offset: (!packed.scales.is_empty()).then_some(scale_off),
-                    scale_length: (!packed.scales.is_empty())
-                        .then_some(packed.scales.len() as u64),
+                    scale_length: (!packed.scales.is_empty()).then_some(packed.scales.len() as u64),
                     bias_offset: (!packed.biases.is_empty()).then_some(bias_off),
-                    bias_length: (!packed.biases.is_empty())
-                        .then_some(packed.biases.len() as u64),
+                    bias_length: (!packed.biases.is_empty()).then_some(packed.biases.len() as u64),
                     awq_scale_offset: None,
                     awq_scale_length: None,
                     group_size: (packed.group_size > 0).then_some(packed.group_size),
@@ -1190,7 +1339,11 @@ fn unpermute_rope_rows(
     }
 
     if n_rows % n_heads != 0 {
-        bail!("row count {} not divisible by head count {}", n_rows, n_heads);
+        bail!(
+            "row count {} not divisible by head count {}",
+            n_rows,
+            n_heads
+        );
     }
     let hd = n_rows / n_heads;
     if hd % 2 != 0 {
@@ -1275,11 +1428,7 @@ fn kquant_passthrough_entry(
 }
 
 /// Convert from an HF safetensors directory.
-fn convert_hf(
-    input: &std::path::Path,
-    output: &std::path::Path,
-    ctx: &QuantContext,
-) -> Result<()> {
+fn convert_hf(input: &std::path::Path, output: &std::path::Path, ctx: &QuantContext) -> Result<()> {
     use base_arch::hf_mapper_for_model_type;
     use base_readers::hf::HfDir;
     let hf = HfDir::open(input)?;
@@ -1350,7 +1499,10 @@ fn convert_hf(
                     }
                 }
                 if ids.len() > config.eos_token_ids.len() + 1 {
-                    eprintln!("  eos:     stop ids {:?} (merged generation_config.json)", ids);
+                    eprintln!(
+                        "  eos:     stop ids {:?} (merged generation_config.json)",
+                        ids
+                    );
                 }
                 config.eos_token_id = ids[0];
                 config.eos_token_ids = ids[1..].to_vec();
@@ -1361,12 +1513,28 @@ fn convert_hf(
     let provider = HfTensorProvider { hf: &hf };
     let mmproj_cfg = mmproj_config_from_hf(&hf);
     let config_for_permute = config.clone();
+    // A modelopt NVFP4 checkpoint (hf_quant_config.json, quant_algo NVFP4)
+    // is a *quantized* source: its own quantization decisions are the
+    // bundle's (mirror policy). Quantized tensors are transplanted
+    // verbatim; tensors it keeps unquantized are carried losslessly.
+    let nvfp4_source = std::fs::read_to_string(input.join("hf_quant_config.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .map(|v| v["quantization"]["quant_algo"].as_str() == Some("NVFP4"))
+        .unwrap_or(false);
+    if nvfp4_source {
+        eprintln!("  source:  NVFP4-quantized checkpoint (mirror policy: transplant + carry)");
+    }
     convert_generic(
         input,
         output,
         ctx,
         mapper.canonical_arch(),
-        "hf_safetensors",
+        if nvfp4_source {
+            "nvfp4_safetensors"
+        } else {
+            "hf_safetensors"
+        },
         config,
         &provider,
         hf.tensor_names().map(|s| s.to_string()).collect(),
@@ -1374,6 +1542,12 @@ fn convert_hf(
         mmproj_cfg,
         &|n| mapper.norm_shift(n),
         &|n| mapper.rope_permute_heads(n, &config_for_permute),
+        &|n| mapper.value_transform(n),
+        mapper.shape_fastest_first(),
+        // An unquantized HF source has nothing to mirror — every tensor
+        // is the target scheme's business. A quantized NVFP4 source
+        // mirrors.
+        nvfp4_source,
         &|n| mapper.row_rms_normalize(n, &config_for_permute),
     )
 }
@@ -1441,11 +1615,11 @@ fn convert_whisper(
     // Special-token metadata — hard requirement. A whisper bundle
     // without exact token ids mis-transcribes silently (the historic
     // vocab-size-table bug), so no tokenizer.json = no conversion.
-    let tokenizer_json = hf
-        .tokenizer_json
-        .as_ref()
-        .context("whisper: model dir has no tokenizer.json (required for whisper.* token metadata)")?;
-    let mut metadata = whisper::token_metadata_from_tokenizer(tokenizer_json, config.vocab_size as i64)?;
+    let tokenizer_json = hf.tokenizer_json.as_ref().context(
+        "whisper: model dir has no tokenizer.json (required for whisper.* token metadata)",
+    )?;
+    let mut metadata =
+        whisper::token_metadata_from_tokenizer(tokenizer_json, config.vocab_size as i64)?;
     // large-v3-turbo distillation dropped the translation task; record it so
     // the runtime rejects task=translate instead of silently emitting
     // source-language text (see whisper::supports_translate for the config
@@ -1492,11 +1666,14 @@ fn convert_whisper(
             }
         }
     }
-    eprintln!("  mapped:  {} tensors kept, {} dropped", mapped.len(), dropped);
+    eprintln!(
+        "  mapped:  {} tensors kept, {} dropped",
+        mapped.len(),
+        dropped
+    );
 
     // Sanity guard: every contract-required tensor must be present.
-    let have: std::collections::BTreeSet<&str> =
-        mapped.iter().map(|(_, c)| c.as_str()).collect();
+    let have: std::collections::BTreeSet<&str> = mapped.iter().map(|(_, c)| c.as_str()).collect();
     let missing: Vec<String> = whisper::required_tensor_names(&config)
         .into_iter()
         .filter(|t| !have.contains(t.as_str()))
@@ -1601,6 +1778,7 @@ fn convert_whisper(
         mmproj: None,
         calibration: None,
         sig: None,
+        provenance: None,
     };
 
     let mut writer = BaseWriter::create(output, header).context("create writer")?;
@@ -1638,102 +1816,100 @@ fn convert_whisper(
             (ComputeRegion::Accelerator, ResidencyHint::Warm)
         };
 
-        let (entry, data) = if quantizing
-            && shape.len() == 2
-            && whisper::is_quantizable_linear(canonical)
-        {
-            // Profile-routed block linear: pack at the canonical scheme,
-            // [W | scales | biases] in one blob — exactly the layout the
-            // LLM quant tensors use. A profile may still route these to
-            // f16 (whisper-f16.json); pack_tensor then returns raw f16
-            // bytes with empty scale/bias streams and the entry
-            // degenerates to the plain case.
-            let in_features = shape.last().copied().map(|d| d as usize);
-            let (packed, dtype) = ctx
-                .pack_tensor(canonical, &f32s, in_features)
-                .with_context(|| format!("packing {canonical}"))?;
-            let mut data = Vec::with_capacity(
-                packed.packed_weights.len() + packed.scales.len() + packed.biases.len(),
-            );
-            data.extend_from_slice(&packed.packed_weights);
-            let scale_off = data.len() as u64;
-            data.extend_from_slice(&packed.scales);
-            let bias_off = data.len() as u64;
-            data.extend_from_slice(&packed.biases);
-            let entry = base_format::TensorEntry {
-                name: canonical.clone(),
-                dtype,
-                shape,
-                offset: 0,
-                length: data.len() as u64,
-                scale_offset: if !packed.scales.is_empty() {
-                    Some(scale_off)
-                } else {
-                    None
-                },
-                scale_length: if !packed.scales.is_empty() {
-                    Some(packed.scales.len() as u64)
-                } else {
-                    None
-                },
-                bias_offset: if !packed.biases.is_empty() {
-                    Some(bias_off)
-                } else {
-                    None
-                },
-                bias_length: if !packed.biases.is_empty() {
-                    Some(packed.biases.len() as u64)
-                } else {
-                    None
-                },
-                awq_scale_offset: None,
-                awq_scale_length: None,
-                group_size: if packed.group_size > 0 {
-                    Some(packed.group_size)
-                } else {
-                    None
-                },
-                layout: None,
-                residency: Some(residency),
-                compute_region: region,
-                scale_dtype: packed.scale_dtype,
-                symmetric: false,
-                flags: TensorFlags::empty(),
-                checksum_xxh64: None,
-                source_ggml_type: None,
+        let (entry, data) =
+            if quantizing && shape.len() == 2 && whisper::is_quantizable_linear(canonical) {
+                // Profile-routed block linear: pack at the canonical scheme,
+                // [W | scales | biases] in one blob — exactly the layout the
+                // LLM quant tensors use. A profile may still route these to
+                // f16 (whisper-f16.json); pack_tensor then returns raw f16
+                // bytes with empty scale/bias streams and the entry
+                // degenerates to the plain case.
+                let in_features = shape.last().copied().map(|d| d as usize);
+                let (packed, dtype) = ctx
+                    .pack_tensor(canonical, &f32s, in_features)
+                    .with_context(|| format!("packing {canonical}"))?;
+                let mut data = Vec::with_capacity(
+                    packed.packed_weights.len() + packed.scales.len() + packed.biases.len(),
+                );
+                data.extend_from_slice(&packed.packed_weights);
+                let scale_off = data.len() as u64;
+                data.extend_from_slice(&packed.scales);
+                let bias_off = data.len() as u64;
+                data.extend_from_slice(&packed.biases);
+                let entry = base_format::TensorEntry {
+                    name: canonical.clone(),
+                    dtype,
+                    shape,
+                    offset: 0,
+                    length: data.len() as u64,
+                    scale_offset: if !packed.scales.is_empty() {
+                        Some(scale_off)
+                    } else {
+                        None
+                    },
+                    scale_length: if !packed.scales.is_empty() {
+                        Some(packed.scales.len() as u64)
+                    } else {
+                        None
+                    },
+                    bias_offset: if !packed.biases.is_empty() {
+                        Some(bias_off)
+                    } else {
+                        None
+                    },
+                    bias_length: if !packed.biases.is_empty() {
+                        Some(packed.biases.len() as u64)
+                    } else {
+                        None
+                    },
+                    awq_scale_offset: None,
+                    awq_scale_length: None,
+                    group_size: if packed.group_size > 0 {
+                        Some(packed.group_size)
+                    } else {
+                        None
+                    },
+                    layout: None,
+                    residency: Some(residency),
+                    compute_region: region,
+                    scale_dtype: packed.scale_dtype,
+                    symmetric: false,
+                    flags: TensorFlags::empty(),
+                    checksum_xxh64: None,
+                    source_ggml_type: None,
+                };
+                (entry, data)
+            } else {
+                // Everything else — and every tensor on the default path —
+                // is raw f16.
+                let bytes: Vec<u8> = f32s
+                    .iter()
+                    .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
+                    .collect();
+                let entry = base_format::TensorEntry {
+                    name: canonical.clone(),
+                    dtype: TensorDtype::F16,
+                    shape,
+                    offset: 0,
+                    length: bytes.len() as u64,
+                    scale_offset: None,
+                    scale_length: None,
+                    bias_offset: None,
+                    bias_length: None,
+                    awq_scale_offset: None,
+                    awq_scale_length: None,
+                    group_size: None,
+                    layout: None,
+                    residency: Some(residency),
+                    compute_region: region,
+                    scale_dtype: None,
+                    symmetric: false,
+                    flags: TensorFlags::empty(),
+                    checksum_xxh64: None,
+                    source_ggml_type: None,
+                };
+                (entry, bytes)
             };
-            (entry, data)
-        } else {
-            // Everything else — and every tensor on the default path —
-            // is raw f16.
-            let bytes: Vec<u8> = f32s
-                .iter()
-                .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
-                .collect();
-            let entry = base_format::TensorEntry {
-                name: canonical.clone(),
-                dtype: TensorDtype::F16,
-                shape,
-                offset: 0,
-                length: bytes.len() as u64,
-                scale_offset: None,
-                scale_length: None,
-                bias_offset: None,
-                bias_length: None,
-                awq_scale_offset: None,
-                awq_scale_length: None,
-                group_size: None,
-                layout: None,
-                residency: Some(residency),
-                compute_region: region,
-                scale_dtype: None,
-                symmetric: false,
-                flags: TensorFlags::empty(),
-                checksum_xxh64: None,
-                source_ggml_type: None,
-            };
-            (entry, bytes)
-        };
         writer.add_tensor(TensorPayload { entry, data });
         pb.inc(1);
     }
@@ -1786,7 +1962,8 @@ fn convert_mlx(
              CANONICAL_QUANT_SPEC.md, canonical-quant requires fp16/bf16/fp32 source). \
              Re-fetch the fp16/bf16 HF checkpoint, or pass --allow-quant-from-quant to \
              accept the compounded quant error.",
-            mlx.quant.bits, mlx.quant.group_size
+            mlx.quant.bits,
+            mlx.quant.group_size
         );
     }
     let mapper = hf_mapper_for_model_type(model_type)
@@ -1801,6 +1978,17 @@ fn convert_mlx(
         config.intermediate_size,
         config.vocab_size
     );
+    if ctx.mlx_passthrough {
+        if mlx.quant.bits != 4 || mlx.quant.group_size != 64 {
+            bail!(
+                "--mlx-passthrough requires a 4-bit group-size-64 MLX source (this one is \
+                 {}-bit gs={})",
+                mlx.quant.bits,
+                mlx.quant.group_size
+            );
+        }
+        eprintln!("  passthrough: reusing MLX q4 payloads verbatim (bit-identical weights)");
+    }
     let names: Vec<String> = mlx
         .hf
         .tensor_names()
@@ -1818,16 +2006,170 @@ fn convert_mlx(
         "mlx_safetensors",
         config,
         &provider,
-        names,
+        names.clone(),
         &tokenizer_from_hf(&mlx.hf),
         mmproj_cfg,
         &|n| mapper.norm_shift(n),
         &|n| mapper.rope_permute_heads(n, &config_for_permute),
+        &|n| mapper.value_transform(n),
+        mapper.shape_fastest_first(),
+        // Quantized MLX source: mirror its per-tensor quantization
+        // decisions (transplant what it quantized, carry what it kept
+        // unquantized).
+        true,
         &|n| mapper.row_rms_normalize(n, &config_for_permute),
-    )
+    )?;
+    if ctx.validate {
+        validate_mlx_bundle(output, &mlx, &names, mapper.canonical_arch(), &|n| {
+            mapper.norm_shift(n)
+        })?;
+    }
+    Ok(())
 }
 
-fn tokenizer_from_hf(hf: &base_readers::hf::HfDir) -> std::collections::BTreeMap<String, serde_json::Value> {
+/// `--validate` gate for `--mlx-passthrough` conversions: re-open the
+/// written `.base` and byte-compare every main-bundle tensor against
+/// the MLX source. Acceptance is exact equality, not "close" — this is
+/// what makes the bundle a trustworthy oracle for index-level DSA
+/// validation later.
+///
+/// Coverage by stored dtype:
+///   * `BaseQ4`/`BaseQ8` with a quantized MLX source — packed nibbles,
+///     scales and biases must match the source verbatim.
+///   * `BaseQ4`/`BaseQ8` from an unquantized source — recomputed via
+///     the same deterministic pack path and compared.
+///   * `F16` — recomputed dequant→f16 (norm shift applied on 1-D) and
+///     compared.
+///   * anything else (F32 SSM tensors etc.) is counted as skipped.
+///
+/// Note: assumes source names map 1:1 to written tensors (true for MLX
+/// sources — the stacking/splitting providers are no-ops there).
+fn validate_mlx_bundle(
+    output: &std::path::Path,
+    mlx: &base_readers::mlx::MlxDir,
+    source_names: &[String],
+    canonical_arch: &str,
+    norm_shift: &dyn Fn(&str) -> f32,
+) -> Result<()> {
+    use base_format::{BaseReader, TensorDtype};
+    let reader = BaseReader::open(output).context("re-opening written .base for --validate")?;
+    let (mut n_pass, mut n_f16, mut n_repack, mut n_skip) = (0usize, 0usize, 0usize, 0usize);
+    for n in source_names {
+        let Some(Canonical::Main(canonical)) = to_canonical_name(n, canonical_arch) else {
+            continue;
+        };
+        let entry = reader
+            .header()
+            .tensors
+            .iter()
+            .find(|t| t.name == canonical)
+            .with_context(|| format!("--validate: {canonical} missing from written .base"))?
+            .clone();
+        let data = reader.tensor_bytes(&canonical)?;
+        match entry.dtype {
+            TensorDtype::BaseQ4 | TensorDtype::BaseQ8 => {
+                let bits = if entry.dtype == TensorDtype::BaseQ4 {
+                    4
+                } else {
+                    8
+                };
+                let gs = entry.group_size.unwrap_or(64);
+                let scale_off = entry.scale_offset.unwrap_or(data.len() as u64) as usize;
+                let bias_off = entry.bias_offset.unwrap_or(data.len() as u64) as usize;
+                let (got_packed, got_scales, got_biases) = (
+                    &data[..scale_off],
+                    &data[scale_off..bias_off],
+                    &data[bias_off..],
+                );
+                match mlx.tensor_packed(n, bits, gs)? {
+                    Some(p) => {
+                        // Scales/biases are compared against what the WRITE
+                        // path emits, not the raw source bytes: base_q4 stores
+                        // f16, so a bf16-scaled checkpoint (mlx-lm >= 0.20) is
+                        // narrowed on the way in. Comparing raw bf16 here
+                        // failed every such tensor deterministically, which
+                        // made --validate unusable on current checkpoints. The
+                        // packed weights themselves are still byte-verbatim.
+                        let (want_scales, _) =
+                            base_readers::mlx::narrow_to_f16_le(p.scales, p.scale_dtype)?;
+                        let (want_biases, _) =
+                            base_readers::mlx::narrow_to_f16_le(p.biases, p.scale_dtype)?;
+                        ensure_bytes_eq(&canonical, "packed weights", got_packed, p.packed)?;
+                        ensure_bytes_eq(&canonical, "scales", got_scales, &want_scales)?;
+                        ensure_bytes_eq(&canonical, "biases", got_biases, &want_biases)?;
+                        n_pass += 1;
+                    }
+                    None => {
+                        let f32s = mlx.tensor_to_f32(n)?;
+                        let target = if bits == 4 {
+                            TargetScheme::BaseQ4
+                        } else {
+                            TargetScheme::BaseQ8
+                        };
+                        let (packed, _) = pack_for_target(&f32s, target)?;
+                        ensure_bytes_eq(
+                            &canonical,
+                            "packed weights",
+                            got_packed,
+                            &packed.packed_weights,
+                        )?;
+                        ensure_bytes_eq(&canonical, "scales", got_scales, &packed.scales)?;
+                        ensure_bytes_eq(&canonical, "biases", got_biases, &packed.biases)?;
+                        n_repack += 1;
+                    }
+                }
+            }
+            TensorDtype::F16 => {
+                let mut f32s = mlx.tensor_to_f32(n)?;
+                if entry.shape.len() == 1 {
+                    let s = norm_shift(&canonical);
+                    if s != 0.0 {
+                        for v in f32s.iter_mut() {
+                            *v += s;
+                        }
+                    }
+                }
+                let expect: Vec<u8> = f32s
+                    .iter()
+                    .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
+                    .collect();
+                ensure_bytes_eq(&canonical, "f16 payload", data, &expect)?;
+                n_f16 += 1;
+            }
+            _ => {
+                n_skip += 1;
+            }
+        }
+    }
+    eprintln!(
+        "  validate: OK — byte-identical to source ({n_pass} passthrough, {n_f16} f16, \
+         {n_repack} repacked, {n_skip} skipped)"
+    );
+    Ok(())
+}
+
+fn ensure_bytes_eq(canonical: &str, what: &str, got: &[u8], want: &[u8]) -> Result<()> {
+    if got.len() != want.len() {
+        bail!(
+            "--validate: {canonical} {what}: written length {} != source {}",
+            got.len(),
+            want.len()
+        );
+    }
+    if got != want {
+        let idx = got
+            .iter()
+            .zip(want.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        bail!("--validate: {canonical} {what}: byte mismatch at offset {idx}");
+    }
+    Ok(())
+}
+
+fn tokenizer_from_hf(
+    hf: &base_readers::hf::HfDir,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
     use serde_json::json;
     let mut m = std::collections::BTreeMap::new();
     m.insert("tokenizer_type".into(), json!("hf"));
@@ -2074,7 +2416,10 @@ fn mmproj_config_from_gguf(
     m.insert("out_hidden_size".into(), json!(out_hidden));
     m.insert("projector_hidden_size".into(), json!(projector_hidden));
 
-    if let Some(v) = resolve_u64("image_token_id", defaults.as_ref().map(|d| d.image_token_id)) {
+    if let Some(v) = resolve_u64(
+        "image_token_id",
+        defaults.as_ref().map(|d| d.image_token_id),
+    ) {
         m.insert("image_token_id".into(), v);
     }
     if let Some(v) = resolve_u64(
@@ -2085,9 +2430,7 @@ fn mmproj_config_from_gguf(
     }
     if let Some(v) = resolve_u64(
         "vision_soft_tokens_per_image",
-        defaults
-            .as_ref()
-            .map(|d| d.vision_soft_tokens_per_image),
+        defaults.as_ref().map(|d| d.vision_soft_tokens_per_image),
     ) {
         m.insert("vision_soft_tokens_per_image".into(), v);
     }
@@ -2114,16 +2457,15 @@ fn mmproj_config_from_gguf(
 /// text-only models. Captures the bits the runtime needs to drive the
 /// vision / audio prefill paths: tower configs, multimodal token IDs,
 /// soft-token counts, and image-pooling parameters.
-fn mmproj_config_from_hf(hf: &base_readers::hf::HfDir) -> std::collections::BTreeMap<String, serde_json::Value> {
+fn mmproj_config_from_hf(
+    hf: &base_readers::hf::HfDir,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
     let mut m = std::collections::BTreeMap::new();
     let cfg = &hf.config;
 
     // Multimodal sub-configs — passed through verbatim. Runtime parses
     // hidden_size / num_hidden_layers / patch_size / etc. from these.
-    for key in [
-        "vision_config",
-        "audio_config",
-    ] {
+    for key in ["vision_config", "audio_config"] {
         if let Some(v) = cfg.get(key) {
             m.insert(key.into(), v.clone());
         }
@@ -2180,25 +2522,180 @@ fn mmproj_config_from_hf(hf: &base_readers::hf::HfDir) -> std::collections::BTre
 }
 
 /// Abstraction over GGUF vs HF vs MLX so the shared convert logic
-/// doesn't care where bytes come from. All sources are dequantized to
-/// f32 and re-packed via the profile-driven canonical path.
+/// doesn't care where bytes come from. Sources are dequantized to f32
+/// and re-packed via the profile-driven canonical path — except where
+/// `packed_base_q4` can transplant an identically-schemed tensor whole.
+/// True when every value survives an f32 -> f16 -> f32 round trip
+/// bit-exactly (the "carry unquantized" dtype choice must be lossless —
+/// in-range bf16 always passes because bf16's 7 mantissa bits fit in
+/// f16's 10; an f32 source generally does not).
+fn f16_lossless(vals: &[f32]) -> bool {
+    vals.iter()
+        .all(|&v| half::f16::from_f32(v).to_f32().to_bits() == v.to_bits())
+}
+
+/// True when every value survives an f32 -> bf16 -> f32 round trip
+/// bit-exactly (covers bf16 sources whose values left f16's range).
+fn bf16_lossless(vals: &[f32]) -> bool {
+    vals.iter()
+        .all(|&v| half::bf16::from_f32(v).to_f32().to_bits() == v.to_bits())
+}
+
+/// Stable label for a value transform, recorded in provenance so
+/// verification tooling can re-derive the expectation independently.
+fn vt_label(vt: base_arch::ValueTransform) -> &'static str {
+    match vt {
+        base_arch::ValueTransform::NegExp => "neg_exp",
+    }
+}
+
 trait TensorProvider {
     fn source_shape(&self, name: &str) -> Result<Vec<u64>>;
     fn to_f32(&self, name: &str) -> Result<Vec<f32>>;
+
+    /// Hand back this tensor already in `base_q4`'s layout, when the
+    /// source stores the identical scheme so the bytes can be
+    /// transplanted rather than dequantized and requantized.
+    ///
+    /// Only MLX affine-q4 sources answer this; every other provider
+    /// takes the default `None` and goes through the f32 path. See
+    /// `base_readers::mlx::MlxDir::packed_base_q4` for why the round
+    /// trip is not the identity, and therefore worth avoiding.
+    fn packed_base_q4(&self, _name: &str, _group_size: u32) -> Result<Option<base_quant::Packed>> {
+        Ok(None)
+    }
+
+    /// Whether the *source checkpoint* stores this tensor quantized.
+    /// Drives the mirror policy: a tensor the source keeps unquantized
+    /// must be carried unquantized, whatever the target scheme would
+    /// otherwise do to a 2-D weight (a requantized MoE router — 0.03%
+    /// of the parameters — once set a whole correctness run's accuracy
+    /// floor). Only MLX sources answer `true`; unquantized sources are
+    /// wholly the target scheme's business.
+    fn source_is_quantized(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// Hand back this tensor already in the bundle's `nvfp4` layout when
+    /// the source stores NVFP4 (packed e2m1 code bytes + e4m3 per-block-16
+    /// scale bytes, both copied verbatim — a transplant, never a
+    /// requantization). HF NVFP4 safetensors sources answer this; every
+    /// other provider takes the default `None`.
+    fn packed_nvfp4(&self, _name: &str) -> Result<Option<base_quant::Packed>> {
+        Ok(None)
+    }
 }
 
 struct HfTensorProvider<'a> {
     hf: &'a base_readers::hf::HfDir,
 }
+impl<'a> HfTensorProvider<'a> {
+    /// The e4m3 block-scale sibling of an NVFP4-quantized `.weight`, when
+    /// the checkpoint stores one (modelopt convention: `<stem>.weight` U8
+    /// packed codes + `<stem>.weight_scale` F8_E4M3 per-block-16 scales).
+    fn nvfp4_scale_sibling(&self, name: &str) -> Option<String> {
+        use base_readers::safetensors::StDtype;
+        let stem = name.strip_suffix(".weight")?;
+        let info = self.hf.tensor_info(name)?;
+        if info.dtype != StDtype::U8 {
+            return None;
+        }
+        let scale = format!("{stem}.weight_scale");
+        self.hf.tensor_info(&scale)?;
+        Some(scale)
+    }
+}
 impl<'a> TensorProvider for HfTensorProvider<'a> {
     fn source_shape(&self, name: &str) -> Result<Vec<u64>> {
-        self.hf
+        let info = self
+            .hf
             .tensor_info(name)
-            .map(|t| t.shape.clone())
-            .ok_or_else(|| anyhow::anyhow!("tensor {name} missing"))
+            .ok_or_else(|| anyhow::anyhow!("tensor {name} missing"))?;
+        let mut shape = info.shape.clone();
+        // NVFP4-quantized weights store two e2m1 codes per byte; report
+        // the logical (unpacked) shape like the MLX provider does.
+        if self.nvfp4_scale_sibling(name).is_some() {
+            if let Some(last) = shape.last_mut() {
+                *last *= 2;
+            }
+        }
+        Ok(shape)
     }
     fn to_f32(&self, name: &str) -> Result<Vec<f32>> {
         self.hf.tensor_to_f32(name)
+    }
+    fn source_is_quantized(&self, name: &str) -> bool {
+        self.nvfp4_scale_sibling(name).is_some()
+    }
+    fn packed_nvfp4(&self, name: &str) -> Result<Option<base_quant::Packed>> {
+        let Some(scale_name) = self.nvfp4_scale_sibling(name) else {
+            return Ok(None);
+        };
+        let info = self
+            .hf
+            .tensor_info(name)
+            .expect("checked by sibling lookup");
+        let codes = self
+            .hf
+            .tensor_bytes(name)
+            .ok_or_else(|| anyhow::anyhow!("tensor bytes for {name} missing"))?;
+        let scales = self
+            .hf
+            .tensor_bytes(&scale_name)
+            .ok_or_else(|| anyhow::anyhow!("tensor bytes for {scale_name} missing"))?;
+        let total_values: u64 = info.shape.iter().product::<u64>() * 2;
+        if codes.len() as u64 * 2 != total_values {
+            bail!(
+                "{name}: {} packed bytes for {} logical values (expected 2 codes/byte)",
+                codes.len(),
+                total_values
+            );
+        }
+        if scales.len() as u64 * 16 != total_values {
+            bail!(
+                "{name}: {} e4m3 scale bytes for {} values (expected one per block of 16)",
+                scales.len(),
+                total_values
+            );
+        }
+        // The global f32 scale (`dequant = code × block_scale × scale_2`)
+        // and the calibrated activation scale (`input_scale`, needed for
+        // vLLM-recipe static activation quantization) ride as an f32 pair
+        // in the tensor's bias region so runtime kernels find them in the
+        // same slab as the codes and block scales. Both are *also* carried
+        // as their own f32 sidecar tensors for verification.
+        let stem = name
+            .strip_suffix(".weight")
+            .expect("checked by sibling lookup");
+        let scale2 = self
+            .hf
+            .tensor_bytes(&format!("{stem}.weight_scale_2"))
+            .ok_or_else(|| anyhow::anyhow!("{stem}.weight_scale_2 missing"))?;
+        if scale2.len() != 4 {
+            bail!(
+                "{stem}.weight_scale_2 is not a single f32 ({} bytes)",
+                scale2.len()
+            );
+        }
+        let in_scale = self
+            .hf
+            .tensor_bytes(&format!("{stem}.input_scale"))
+            .ok_or_else(|| anyhow::anyhow!("{stem}.input_scale missing"))?;
+        if in_scale.len() != 4 {
+            bail!(
+                "{stem}.input_scale is not a single f32 ({} bytes)",
+                in_scale.len()
+            );
+        }
+        let mut biases = scale2.to_vec();
+        biases.extend_from_slice(in_scale);
+        Ok(Some(base_quant::Packed {
+            packed_weights: codes.to_vec(),
+            scales: scales.to_vec(),
+            biases,
+            group_size: base_quant::nvfp4::GROUP_SIZE as u32,
+            scale_dtype: Some(base_format::ScaleDtype::E4m3),
+        }))
     }
 }
 
@@ -2218,6 +2715,33 @@ impl<'a> TensorProvider for MlxTensorProvider<'a> {
     }
     fn to_f32(&self, name: &str) -> Result<Vec<f32>> {
         self.mlx.tensor_to_f32(name)
+    }
+    fn packed_base_q4(&self, name: &str, group_size: u32) -> Result<Option<base_quant::Packed>> {
+        let Some(p) = self.mlx.packed_base_q4(name, group_size)? else {
+            return Ok(None);
+        };
+        if p.out_of_f16_range > 0 {
+            // bf16 scales carry a wider exponent than f16. If any left
+            // f16's range the transplanted tensor would decode to
+            // inf/NaN — worse than requantizing, so refuse this tensor
+            // and let the caller fall back.
+            eprintln!(
+                "  note: {name}: {} bf16 scale/bias value(s) outside f16 range — \
+                 requantizing this tensor instead of transplanting",
+                p.out_of_f16_range
+            );
+            return Ok(None);
+        }
+        Ok(Some(base_quant::Packed {
+            packed_weights: p.packed_weights,
+            scales: p.scales,
+            biases: p.biases,
+            group_size: p.group_size,
+            scale_dtype: Some(base_format::ScaleDtype::F16),
+        }))
+    }
+    fn source_is_quantized(&self, name: &str) -> bool {
+        self.mlx.unpacked_shape(name).is_some()
     }
 }
 
@@ -2239,7 +2763,10 @@ struct StackingProvider<'a> {
 impl<'a> StackingProvider<'a> {
     fn build(inner: &'a dyn TensorProvider, source_names: &[String]) -> Self {
         use std::collections::{BTreeMap, HashSet};
-        const MARK: &str = ".mlp.experts.";
+        // `.experts.` rather than `.mlp.experts.`: Nemotron-H NVFP4
+        // checkpoints hold per-expert tensors under `…mixer.experts.{e}.…`.
+        // `shared_experts.` cannot match (no dot before "experts").
+        const MARK: &str = ".experts.";
         let mut groups: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
         let mut consumed: HashSet<String> = HashSet::new();
         for n in source_names {
@@ -2251,7 +2778,19 @@ impl<'a> StackingProvider<'a> {
             if e_str.is_empty() || !e_str.bytes().all(|b| b.is_ascii_digit()) {
                 continue; // already-fused (`experts.gate_proj.weight`) — leave to canon
             }
-            if !matches!(tail, ".gate_proj.weight" | ".up_proj.weight" | ".down_proj.weight") {
+            // `.weight_scale` (the e4m3 block scales) is deliberately NOT
+            // stacked: it is consumed byte-verbatim by the nvfp4 weight
+            // transplant. The f32 scalar sidecars stack into small arrays.
+            if !matches!(
+                tail,
+                ".gate_proj.weight"
+                    | ".up_proj.weight"
+                    | ".down_proj.weight"
+                    | ".up_proj.weight_scale_2"
+                    | ".down_proj.weight_scale_2"
+                    | ".up_proj.input_scale"
+                    | ".down_proj.input_scale"
+            ) {
                 continue;
             }
             let e: usize = e_str.parse().unwrap_or(usize::MAX);
@@ -2264,10 +2803,17 @@ impl<'a> StackingProvider<'a> {
             es.sort_by_key(|(e, _)| *e);
             stacks.insert(v, es.into_iter().map(|(_, n)| n).collect());
         }
-        let mut rewritten: Vec<String> =
-            source_names.iter().filter(|n| !consumed.contains(*n)).cloned().collect();
+        let mut rewritten: Vec<String> = source_names
+            .iter()
+            .filter(|n| !consumed.contains(*n))
+            .cloned()
+            .collect();
         rewritten.extend(stacks.keys().cloned());
-        StackingProvider { inner, stacks, rewritten }
+        StackingProvider {
+            inner,
+            stacks,
+            rewritten,
+        }
     }
     fn rewritten_names(&self) -> Vec<String> {
         self.rewritten.clone()
@@ -2296,6 +2842,53 @@ impl TensorProvider for StackingProvider<'_> {
                 Ok(out)
             }
             None => self.inner.to_f32(name),
+        }
+    }
+    fn packed_base_q4(&self, name: &str, group_size: u32) -> Result<Option<base_quant::Packed>> {
+        // A stacked tensor is assembled from several source tensors with
+        // independent scales — there are no contiguous bytes to hand
+        // over. Only pass through for names we don't stack.
+        match self.stacks.get(name) {
+            Some(_) => Ok(None),
+            None => self.inner.packed_base_q4(name, group_size),
+        }
+    }
+    fn packed_nvfp4(&self, name: &str) -> Result<Option<base_quant::Packed>> {
+        // Unlike base_q4 above, an nvfp4 stack CAN be transplanted: the
+        // bundle's stacked layout is per-expert sections concatenated in
+        // expert order — codes `[E][out][in/2]`, then block scales
+        // `[E][out][in/16]`, then the per-expert f32 global scales `[E]`
+        // in the bias region.
+        let Some(parts) = self.stacks.get(name) else {
+            return self.inner.packed_nvfp4(name);
+        };
+        let mut codes: Vec<u8> = Vec::new();
+        let mut scales: Vec<u8> = Vec::new();
+        let mut biases: Vec<u8> = Vec::new();
+        for p in parts {
+            let Some(packed) = self.inner.packed_nvfp4(p)? else {
+                return Ok(None); // mixed stack — let the f32 path decide
+            };
+            codes.extend_from_slice(&packed.packed_weights);
+            scales.extend_from_slice(&packed.scales);
+            biases.extend_from_slice(&packed.biases);
+        }
+        Ok(Some(base_quant::Packed {
+            packed_weights: codes,
+            scales,
+            biases,
+            group_size: base_quant::nvfp4::GROUP_SIZE as u32,
+            scale_dtype: Some(base_format::ScaleDtype::E4m3),
+        }))
+    }
+    fn source_is_quantized(&self, name: &str) -> bool {
+        match self.stacks.get(name) {
+            // Report the constituents' storage so the mirror policy sees
+            // through the virtual name (all experts share one scheme).
+            Some(parts) => parts
+                .first()
+                .is_some_and(|p| self.inner.source_is_quantized(p)),
+            None => self.inner.source_is_quantized(name),
         }
     }
 }
@@ -2355,20 +2948,34 @@ impl<'a> SplittingProvider<'a> {
                 }
                 splits.insert(
                     format!("{before}.self_attn.q_proj.weight"),
-                    SplitSpec { src: n.clone(), row_off: 0, row_cnt: q },
+                    SplitSpec {
+                        src: n.clone(),
+                        row_off: 0,
+                        row_cnt: q,
+                    },
                 );
                 splits.insert(
                     format!("{before}.self_attn.k_proj.weight"),
-                    SplitSpec { src: n.clone(), row_off: q, row_cnt: k },
+                    SplitSpec {
+                        src: n.clone(),
+                        row_off: q,
+                        row_cnt: k,
+                    },
                 );
                 splits.insert(
                     format!("{before}.self_attn.v_proj.weight"),
-                    SplitSpec { src: n.clone(), row_off: q + k, row_cnt: v },
+                    SplitSpec {
+                        src: n.clone(),
+                        row_off: q + k,
+                        row_cnt: v,
+                    },
                 );
                 consumed.insert(n.clone());
             } else if let Some(before) = n.strip_suffix(".mlp.gate_up_proj.weight") {
                 if ffn == 0 {
-                    bail!("fused {n}: intermediate_size must be set in config to split gate_up_proj");
+                    bail!(
+                        "fused {n}: intermediate_size must be set in config to split gate_up_proj"
+                    );
                 }
                 let shape = inner.source_shape(n)?;
                 let rows = shape.first().copied().unwrap_or(0);
@@ -2381,20 +2988,35 @@ impl<'a> SplittingProvider<'a> {
                 }
                 splits.insert(
                     format!("{before}.mlp.gate_proj.weight"),
-                    SplitSpec { src: n.clone(), row_off: 0, row_cnt: ffn },
+                    SplitSpec {
+                        src: n.clone(),
+                        row_off: 0,
+                        row_cnt: ffn,
+                    },
                 );
                 splits.insert(
                     format!("{before}.mlp.up_proj.weight"),
-                    SplitSpec { src: n.clone(), row_off: ffn, row_cnt: ffn },
+                    SplitSpec {
+                        src: n.clone(),
+                        row_off: ffn,
+                        row_cnt: ffn,
+                    },
                 );
                 consumed.insert(n.clone());
             }
         }
 
-        let mut rewritten: Vec<String> =
-            source_names.iter().filter(|n| !consumed.contains(*n)).cloned().collect();
+        let mut rewritten: Vec<String> = source_names
+            .iter()
+            .filter(|n| !consumed.contains(*n))
+            .cloned()
+            .collect();
         rewritten.extend(splits.keys().cloned());
-        Ok(SplittingProvider { inner, splits, rewritten })
+        Ok(SplittingProvider {
+            inner,
+            splits,
+            rewritten,
+        })
     }
     fn rewritten_names(&self) -> Vec<String> {
         self.rewritten.clone()
@@ -2429,6 +3051,159 @@ impl TensorProvider for SplittingProvider<'_> {
             None => self.inner.to_f32(name),
         }
     }
+    fn packed_base_q4(&self, name: &str, group_size: u32) -> Result<Option<base_quant::Packed>> {
+        match self.splits.get(name) {
+            Some(_) => Ok(None),
+            None => self.inner.packed_base_q4(name, group_size),
+        }
+    }
+    fn packed_nvfp4(&self, name: &str) -> Result<Option<base_quant::Packed>> {
+        match self.splits.get(name) {
+            Some(_) => Ok(None),
+            None => self.inner.packed_nvfp4(name),
+        }
+    }
+    fn source_is_quantized(&self, name: &str) -> bool {
+        match self.splits.get(name) {
+            Some(spec) => self.inner.source_is_quantized(&spec.src),
+            None => self.inner.source_is_quantized(name),
+        }
+    }
+}
+
+/// GLM 5.2 (glm_dsa) HF checkpoints ship the MLA up-projection FUSED as
+/// `self_attn.kv_b_proj.weight` `[n_heads·(qk_nope+v_head), kv_lora]`, but
+/// the runtime's absorb kernels read the SPLIT per-head forms (k_b with the
+/// per-head block transposed). Expose MLX-sanitize-equivalent virtual
+/// tensors (mlx-lm `deepseek_v32.sanitize`:
+/// `embed_q = kv_b[:, :nope, :].swapaxes(-1,-2)`,
+/// `unembed_out = kv_b[:, nope:, :]`) and drop the fused source;
+/// `glm_hf_canonical` renames them to `k_b_proj`/`v_b_proj` and the
+/// force-f16 rule stores them raw f16 — the same layout an MLX-sourced
+/// bundle carries (GLM5.2_DSA.md §3a). Pure pass-through for every other
+/// arch and for sources that already ship them split.
+struct GlmKvbSplitProvider<'a> {
+    inner: &'a dyn TensorProvider,
+    /// virtual name -> (fused source name, is_k_b)
+    splits: std::collections::BTreeMap<String, (String, bool)>,
+    rewritten: Vec<String>,
+    n_heads: usize,
+    qk_nope: usize,
+    v_head: usize,
+    kv_lora: usize,
+}
+impl<'a> GlmKvbSplitProvider<'a> {
+    fn build(
+        inner: &'a dyn TensorProvider,
+        source_names: &[String],
+        config: &base_arch::ArchConfig,
+        canonical_arch: &str,
+    ) -> Self {
+        let mut splits = std::collections::BTreeMap::new();
+        let mut rewritten = Vec::with_capacity(source_names.len());
+        let applies = canonical_arch == "glm_dsa"
+            && config.kv_lora_rank > 0
+            && config.qk_nope_head_dim > 0
+            && config.v_head_dim > 0;
+        for n in source_names {
+            if applies && n.ends_with(".self_attn.kv_b_proj.weight") {
+                let kb = n.replace(".kv_b_proj.", ".embed_q.");
+                let vb = n.replace(".kv_b_proj.", ".unembed_out.");
+                splits.insert(kb.clone(), (n.clone(), true));
+                splits.insert(vb.clone(), (n.clone(), false));
+                rewritten.push(kb);
+                rewritten.push(vb);
+            } else {
+                rewritten.push(n.clone());
+            }
+        }
+        GlmKvbSplitProvider {
+            inner,
+            splits,
+            rewritten,
+            n_heads: config.num_attention_heads as usize,
+            qk_nope: config.qk_nope_head_dim as usize,
+            v_head: config.v_head_dim as usize,
+            kv_lora: config.kv_lora_rank as usize,
+        }
+    }
+    fn rewritten_names(&self) -> Vec<String> {
+        self.rewritten.clone()
+    }
+}
+impl TensorProvider for GlmKvbSplitProvider<'_> {
+    fn source_shape(&self, name: &str) -> Result<Vec<u64>> {
+        match self.splits.get(name) {
+            Some((_, true)) => Ok(vec![
+                self.n_heads as u64,
+                self.kv_lora as u64,
+                self.qk_nope as u64,
+            ]),
+            Some((_, false)) => Ok(vec![
+                self.n_heads as u64,
+                self.v_head as u64,
+                self.kv_lora as u64,
+            ]),
+            None => self.inner.source_shape(name),
+        }
+    }
+    fn to_f32(&self, name: &str) -> Result<Vec<f32>> {
+        let Some((src, is_kb)) = self.splits.get(name) else {
+            return self.inner.to_f32(name);
+        };
+        let (h, nope, v, lora) = (self.n_heads, self.qk_nope, self.v_head, self.kv_lora);
+        let head_dim = nope + v;
+        let data = self.inner.to_f32(src)?;
+        if data.len() != h * head_dim * lora {
+            bail!(
+                "kv_b_proj {} has {} elements, expected n_heads({h})*(qk_nope({nope})+v_head({v}))*kv_lora({lora})",
+                src,
+                data.len()
+            );
+        }
+        // Source is row-major [h*head_dim, lora]; row r of head hh is
+        // data[(hh*head_dim + r)*lora ..][..lora].
+        if *is_kb {
+            // k_b: [h, lora, nope] — per-head transpose of the first `nope` rows.
+            let mut out = vec![0f32; h * lora * nope];
+            for hh in 0..h {
+                let src_base = hh * head_dim * lora;
+                let dst_base = hh * lora * nope;
+                for r in 0..nope {
+                    for l in 0..lora {
+                        out[dst_base + l * nope + r] = data[src_base + r * lora + l];
+                    }
+                }
+            }
+            Ok(out)
+        } else {
+            // v_b: [h, v, lora] — the last `v` rows per head, layout kept.
+            let mut out = Vec::with_capacity(h * v * lora);
+            for hh in 0..h {
+                let start = (hh * head_dim + nope) * lora;
+                out.extend_from_slice(&data[start..start + v * lora]);
+            }
+            Ok(out)
+        }
+    }
+    fn packed_base_q4(&self, name: &str, group_size: u32) -> Result<Option<base_quant::Packed>> {
+        match self.splits.get(name) {
+            Some(_) => Ok(None),
+            None => self.inner.packed_base_q4(name, group_size),
+        }
+    }
+    fn packed_nvfp4(&self, name: &str) -> Result<Option<base_quant::Packed>> {
+        match self.splits.get(name) {
+            Some(_) => Ok(None),
+            None => self.inner.packed_nvfp4(name),
+        }
+    }
+    fn source_is_quantized(&self, name: &str) -> bool {
+        match self.splits.get(name) {
+            Some((src, _)) => self.inner.source_is_quantized(src),
+            None => self.inner.source_is_quantized(name),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2445,14 +3220,33 @@ fn convert_generic(
     mmproj_config: std::collections::BTreeMap<String, serde_json::Value>,
     norm_shift: &dyn Fn(&str) -> f32,
     rope_permute: &dyn Fn(&str) -> Option<u32>,
+    value_transform: &dyn Fn(&str) -> Option<base_arch::ValueTransform>,
+    shape_fastest_first: bool,
+    mirror_unquantized: bool,
     row_rms_normalize: &dyn Fn(&str) -> Option<f32>,
 ) -> Result<()> {
     use base_format::{
-        AlignmentConfig, BaseReader, BaseWriter, ComputeRegion, Header, HeaderFlags, LayerKind,
-        LayerDescriptor, LayerPrecision, ModelConfig, QuantScheme, SourceInfo, TargetBackend, TensorDtype,
-        TensorFlags, TensorPayload, TokenizerBlob,
+        AlignmentConfig, BaseReader, BaseWriter, ComputeRegion, Header, HeaderFlags, ModelConfig,
+        QuantScheme, SourceInfo, TargetBackend, TensorDtype, TensorFlags, TensorPayload,
+        TokenizerBlob,
     };
     let target = ctx.target;
+    // Transplanting only makes sense when the bundle's scheme *is* the
+    // source's scheme. A `--profile` run picks a scheme per tensor, so
+    // the packed source bytes may not be what that tensor should end up
+    // as — leave those to the f32 path.
+    let allow_q4_passthrough =
+        ctx.q4_passthrough && ctx.profile.is_none() && target == TargetScheme::BaseQ4;
+    // NVFP4 sources (modelopt HF checkpoints) transplant the same way:
+    // packed e2m1 codes + e4m3 block scales copied verbatim.
+    let allow_nvfp4_passthrough = ctx.profile.is_none() && target == TargetScheme::Nvfp4;
+    // Mirror policy (quantized sources only): the checkpoint's own
+    // quantization decisions are the bundle's. Tensors it quantized are
+    // transplanted (above); tensors it kept unquantized are carried
+    // unquantized below, never requantized. Only meaningful alongside the
+    // transplant — a profile / non-matching target already opted out of
+    // holding the source's exact weights.
+    let mirror = mirror_unquantized && (allow_q4_passthrough || allow_nvfp4_passthrough);
     let quant_scheme = match target {
         TargetScheme::BaseQ2 => QuantScheme::BaseQ2,
         TargetScheme::BaseQ3 => QuantScheme::BaseQ3,
@@ -2493,6 +3287,18 @@ fn convert_generic(
     let source_names = splitting.rewritten_names();
     let provider: &dyn TensorProvider = &splitting;
 
+    // GLM 5.2: derive the split MLA up-projections (k_b/v_b in absorb
+    // layout) from the fused kv_b_proj the HF bf16 checkpoint ships.
+    let kvb = GlmKvbSplitProvider::build(provider, &source_names, &config, canonical_arch);
+    if !kvb.splits.is_empty() {
+        eprintln!(
+            "  mla:     split {} fused kv_b_proj into k_b/v_b (absorb layout, f16)",
+            kvb.splits.len() / 2
+        );
+    }
+    let source_names = kvb.rewritten_names();
+    let provider: &dyn TensorProvider = &kvb;
+
     // Map source names → canonical. Use the same llama-style map that
     // GGUF uses for blk.N.* tensors, plus a HF-style pass-through for
     // `model.layers.N.*` already-canonical names. Multimodal towers
@@ -2500,19 +3306,19 @@ fn convert_generic(
     // whether to materialize them.
     let mut mapped: Vec<(String, String)> = Vec::new();
     let mut mmproj_mapped: Vec<(String, String)> = Vec::new();
-    let mut dropped = 0usize;
+    let mut dropped_names: Vec<String> = Vec::new();
     for n in &source_names {
         match to_canonical_name(n, canonical_arch) {
             Some(Canonical::Main(c)) => mapped.push((n.clone(), c)),
             Some(Canonical::Mmproj(c)) => mmproj_mapped.push((n.clone(), c)),
-            None => dropped += 1,
+            None => dropped_names.push(n.clone()),
         }
     }
     eprintln!(
         "  mapped:  {} tensors kept, {} mmproj, {} dropped",
         mapped.len(),
         mmproj_mapped.len(),
-        dropped
+        dropped_names.len()
     );
 
     let mut tok_fields = tokenizer_fields.clone();
@@ -2533,11 +3339,21 @@ fn convert_generic(
         let mut found_any = false;
         for (src_name, canonical) in &mapped {
             // canonical = "layers.{N}.mlp.down_proj.weight"
-            let Some(rest) = canonical.strip_prefix("layers.") else { continue };
-            let Some((idx_str, tail)) = rest.split_once('.') else { continue };
-            if tail != "mlp.down_proj.weight" { continue }
-            let Ok(layer) = idx_str.parse::<usize>() else { continue };
-            if layer >= per_layer_ffn.len() { continue }
+            let Some(rest) = canonical.strip_prefix("layers.") else {
+                continue;
+            };
+            let Some((idx_str, tail)) = rest.split_once('.') else {
+                continue;
+            };
+            if tail != "mlp.down_proj.weight" {
+                continue;
+            }
+            let Ok(layer) = idx_str.parse::<usize>() else {
+                continue;
+            };
+            if layer >= per_layer_ffn.len() {
+                continue;
+            }
             // down_proj shape (HF unpacked): [hidden_size, ffn_size]
             if let Ok(shape) = provider.source_shape(src_name) {
                 if shape.len() == 2 {
@@ -2551,7 +3367,9 @@ fn convert_generic(
             // so the runtime has a value for every layer.
             let fallback = config.intermediate_size;
             for v in per_layer_ffn.iter_mut() {
-                if *v == 0 { *v = fallback; }
+                if *v == 0 {
+                    *v = fallback;
+                }
             }
             // Only emit per_layer_ffn when FFN width actually varies
             // layer-to-layer (Gemma 4 E2B: 6144 for own-KV, 12288 for
@@ -2589,21 +3407,23 @@ fn convert_generic(
         metadata: Default::default(),
         target_backend: TargetBackend::Metal,
         quant_profile: ctx.profile_name().unwrap_or("").to_string(),
-        alignment: AlignmentConfig::default(),
+        // Accel tensors align to the 16 KiB Apple page (default is 64 B):
+        // the runtime's BaseWeightStore can then always split its chunked
+        // no-copy mmap at a tensor start. Mixed-dtype bundles with 64 B
+        // alignment can run a whole max_buffer_size window without a
+        // page-aligned start (seen on the GLM 5.2 q4/q5/q6 production
+        // bundle), forcing overlap-mapped splits or per-tensor copies.
+        // Padding cost: < tensor_count × 16 KiB — noise on any real model.
+        alignment: AlignmentConfig {
+            accel_align_log2: 14,
+            ..Default::default()
+        },
         flags: HeaderFlags::QUANTIZED,
-        layers: (0..config.num_hidden_layers)
-            .map(|_| LayerDescriptor {
-                kind: LayerKind::AttentionGqa,
-                moe_n_experts: 0,
-                moe_n_active: 0,
-                shared_attn_layer: None,
-                compute_hint: Some(ComputeRegion::Accelerator),
-                precision: LayerPrecision::default(),
-            })
-            .collect(),
+        layers: layer_descriptors_from_config(&config),
         tensors: vec![],
         mmproj: None,
         calibration: None,
+        provenance: None,
         sig: None,
     };
 
@@ -2613,8 +3433,12 @@ fn convert_generic(
     let has_moe = source_names
         .iter()
         .any(|n| n.contains("experts") || n.contains("_exps") || n.contains("_shexp"));
-    let has_ssm = source_names.iter().any(|n| n.contains(".ssm.") || n.contains("ssm_"));
-    let has_attn = source_names.iter().any(|n| n.contains("self_attn") || n.contains("attn_q"));
+    let has_ssm = source_names.iter().any(|n| n.contains(".ssm.") || n.contains("ssm_"))
+        // HF Nemotron-H names carry no ".ssm." — detect on the canonical side.
+        || mapped.iter().any(|(_, c)| c.contains(".ssm."));
+    let has_attn = source_names
+        .iter()
+        .any(|n| n.contains("self_attn") || n.contains("attn_q"));
     if has_moe {
         header.flags |= HeaderFlags::HAS_MOE;
     }
@@ -2625,7 +3449,15 @@ fn convert_generic(
         }
     }
 
-    let mut writer = BaseWriter::create(output, header).context("create writer")?;
+    // 64 MiB header reserve in direct-write mode: ~2k tensor entries at
+    // ~400 B JSON each is well under 8 MiB even for GLM 5.2's 79-layer MoE;
+    // the padding cost is invisible against a 400+ GB bundle.
+    let mut writer = if ctx.direct_write {
+        BaseWriter::create_direct(output, header, 64 * 1024 * 1024)
+            .context("create writer (direct)")?
+    } else {
+        BaseWriter::create(output, header).context("create writer")?
+    };
 
     let pb = indicatif::ProgressBar::new(mapped.len() as u64);
     pb.set_style(
@@ -2633,13 +3465,111 @@ fn convert_generic(
             .expect("valid progress template")
             .progress_chars("=>-"),
     );
+    let mut n_passthrough = 0usize;
+    let mut n_carried = 0usize;
+    let mut prov_tensors: std::collections::BTreeMap<String, base_format::TensorProvenance> =
+        Default::default();
     for (src_name, canonical) in &mapped {
         pb.set_message(canonical.clone());
-        let shape = provider.source_shape(src_name)?;
+        let src_shape = provider.source_shape(src_name)?;
+        // The reduction dim is the source's last (HF C-order [out, in]);
+        // read it before any reordering of the reported shape.
+        let in_features = src_shape.last().copied().map(|d| d as usize);
+        let mut shape = if shape_fastest_first {
+            src_shape.iter().rev().copied().collect::<Vec<u64>>()
+        } else {
+            src_shape
+        };
+        // Scalar sidecars (NVFP4 `weight_scale_2` / `input_scale`) are
+        // rank-0 in safetensors; the bundle stores them as [1].
+        if shape.is_empty() {
+            shape = vec![1];
+        }
+        // Nemotron HF conv1d weights arrive as [channels, 1, taps]; the
+        // canonical bundle shape is [1, taps, channels] (identical flat
+        // data — taps contiguous per channel — so this is metadata only,
+        // matching what MLX-sourced bundles record).
+        if canonical.ends_with(".ssm.conv1d.weight") && shape.len() == 3 && shape[1] == 1 {
+            shape = vec![1, shape[0], shape[2]];
+        }
+        let shape = shape;
+        let ndims = shape.len();
 
-        let mut f32s = provider
-            .to_f32(src_name)
-            .with_context(|| format!("reading {src_name}"))?;
+        let is_ssm_a = canonical == "ssm.a_log"
+            || canonical.ends_with(".ssm.a_log")
+            || src_name.ends_with(".ssm_a")
+            || is_gdn_a_log(canonical);
+        let is_ssm_sensitive = is_ssm_a
+            || canonical.ends_with(".ssm.dt_bias")
+            || canonical.ends_with(".ssm.d")
+            // Mamba-2 conv1d and the grouped gated norm. The scan runs
+            // its state in f32 and these feed it directly; the GGUF path
+            // keeps them f32 for the same reason, and a bundle that
+            // quantized them would not be interchangeable with one that
+            // did not.
+            || canonical.ends_with(".ssm.conv1d.weight")
+            || canonical.ends_with(".ssm.conv1d.bias")
+            || canonical.ends_with(".ssm.norm.weight")
+            || is_gdn_f32(canonical);
+        // NVFP4 sidecars: the per-tensor global scale and the calibrated
+        // activation scale. Always f32 — they parameterize the dequant
+        // itself, and the verify gate compares them value-exactly.
+        let is_sidecar =
+            canonical.ends_with(".weight_scale_2") || canonical.ends_with(".input_scale");
+        // See GGUF path above for rationale on the f16/GPU route. Qwen3.5 GDN
+        // conv1d + per-head gate projections also route here (f16 on GPU).
+        let is_norm_like = !is_sidecar && (shape.len() == 1 || is_gdn_f16(canonical));
+        let is_embedding = canonical == "embed_tokens.weight" || canonical == "lm_head.weight";
+        // GLM MLA k_b/v_b projections and router weights are raw-f16
+        // consumers and must never enter the quantized transplant path.
+        let force_f16 = canonical_arch == "glm_dsa"
+            && (canonical.ends_with(".k_b_proj.weight")
+                || canonical.ends_with(".v_b_proj.weight")
+                || canonical.ends_with(".mlp.router.weight"));
+        // Mirror policy: this tensor is unquantized in the (quantized)
+        // source checkpoint, so it must stay unquantized in the bundle.
+        let src_unquantized = mirror && !provider.source_is_quantized(src_name);
+
+        // Zero-loss path: when the source already stores exactly the
+        // target scheme, transplant the packed bytes instead of
+        // dequantizing and requantizing. Skipped for tensors that don't
+        // reach the quantized branches at all, and for any tensor whose
+        // rows get permuted on the way through (the permutation is
+        // defined on values, not on packed groups).
+        let passthrough = if (allow_q4_passthrough || allow_nvfp4_passthrough)
+            && !is_ssm_sensitive
+            && !is_norm_like
+            && !is_sidecar
+            && !force_f16
+            && rope_permute(canonical).is_none()
+        {
+            if allow_nvfp4_passthrough {
+                provider
+                    .packed_nvfp4(src_name)
+                    .with_context(|| format!("transplanting {src_name}"))?
+            } else {
+                provider
+                    .packed_base_q4(src_name, base_quant::base_q4::GROUP_SIZE as u32)
+                    .with_context(|| format!("transplanting {src_name}"))?
+            }
+        } else {
+            None
+        };
+        let transplant_dtype = if allow_nvfp4_passthrough {
+            TensorDtype::Nvfp4
+        } else {
+            TensorDtype::BaseQ4
+        };
+
+        // Reading to f32 is the expensive step (and for a 30B model, the
+        // memory-hungry one) — skip it entirely when transplanting.
+        let mut f32s = if passthrough.is_some() {
+            Vec::new()
+        } else {
+            provider
+                .to_f32(src_name)
+                .with_context(|| format!("reading {src_name}"))?
+        };
 
         // Per-arch hook: bake the +1 unit-offset into Gemma 3's
         // zero-centered RMSNorm gamma so the runtime can use the plain
@@ -2654,6 +3584,14 @@ fn convert_generic(
                     *v += s;
                 }
             }
+        }
+
+        // Per-arch hook: undo a stored reparameterization (Mamba-2 keeps
+        // the state-transition matrix as `A_log`; the scan wants
+        // `A = -exp(A_log)`). Applied before packing so the bundle holds
+        // the value the kernel consumes, matching the GGUF path.
+        if let Some(vt) = value_transform(canonical) {
+            vt.apply(&mut f32s);
         }
 
         // Per-arch hook: normalize HF "split-half" rotary q/k row layout to
@@ -2689,22 +3627,9 @@ fn convert_generic(
         }
 
         let f32s_for = || -> &[f32] { &f32s };
+        let transplanted = passthrough.is_some();
 
-        let is_ssm_a = canonical == "ssm.a_log"
-            || canonical.ends_with(".ssm.a_log")
-            || src_name.ends_with(".ssm_a")
-            || is_gdn_a_log(canonical);
-        let is_ssm_sensitive = is_ssm_a
-            || canonical.ends_with(".ssm.dt_bias")
-            || canonical.ends_with(".ssm.d")
-            || is_gdn_f32(canonical);
-        // See GGUF path above for rationale on the f16/GPU route. Qwen3.5 GDN
-        // conv1d + per-head gate projections also route here (f16 on GPU).
-        let is_norm_like = shape.len() == 1 || is_gdn_f16(canonical);
-        let is_embedding =
-            canonical == "embed_tokens.weight" || canonical == "lm_head.weight";
-
-        let (entry, data) = if is_ssm_sensitive {
+        let (entry, data) = if is_ssm_sensitive || is_sidecar {
             let mut flags = TensorFlags::empty();
             if is_ssm_a {
                 flags |= TensorFlags::SSM_A_MATRIX;
@@ -2729,25 +3654,41 @@ fn convert_generic(
                 symmetric: false,
                 flags,
                 checksum_xxh64: None,
-            source_ggml_type: None,
-};
+                source_ggml_type: None,
+            };
             let data: Vec<u8> = f32s_for().iter().flat_map(|f| f.to_le_bytes()).collect();
             entry.length = data.len() as u64;
             (entry, data)
-        } else if is_norm_like {
+        } else if is_norm_like || force_f16 {
             // 1-D norms (and biases caught by the same shape check) are
             // always emitted at f16. A profile's catch-all `**.weight`
             // rule typically targets a quant bit-width; quantizing a
             // per-channel norm-gain wrecks the model. Override the
             // profile here so a profile that omits explicit norm
-            // patterns still produces a working bundle.
-            let (bytes, dtype) = (
-                f32s_for()
-                    .iter()
-                    .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                TensorDtype::F16,
-            );
+            // patterns still produces a working bundle. GLM k_b/v_b and
+            // router tensors also route here via force_f16.
+            //
+            // Under the mirror policy, f16 must also represent the
+            // source's values losslessly — an f32 source (Nemotron's
+            // `e_score_correction_bias`) whose values don't round-trip
+            // is widened to f32 instead of silently rounded.
+            let (bytes, dtype) = if !force_f16 && src_unquantized && !f16_lossless(f32s_for()) {
+                (
+                    f32s_for()
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    TensorDtype::F32,
+                )
+            } else {
+                (
+                    f32s_for()
+                        .iter()
+                        .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    TensorDtype::F16,
+                )
+            };
             let entry = base_format::TensorEntry {
                 name: canonical.clone(),
                 dtype,
@@ -2768,16 +3709,85 @@ fn convert_generic(
                 symmetric: false,
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
-            source_ggml_type: None,
-};
+                source_ggml_type: None,
+            };
+            (entry, bytes)
+        } else if src_unquantized {
+            // Mirror policy, the 2-D case: the checkpoint keeps this
+            // tensor unquantized (Nemotron's bf16 MoE router is the
+            // canonical example), so requantizing it would make the
+            // bundle differ from the reference weights — carry it at the
+            // narrowest dtype that represents every value losslessly.
+            // The runtime serves f16/bf16/f32 2-D weights natively
+            // (f16 zero-copy; bf16/f32 converted to f16 at load).
+            n_carried += 1;
+            let (bytes, dtype) = if f16_lossless(f32s_for()) {
+                (
+                    f32s_for()
+                        .iter()
+                        .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    TensorDtype::F16,
+                )
+            } else if bf16_lossless(f32s_for()) {
+                (
+                    f32s_for()
+                        .iter()
+                        .flat_map(|&f| half::bf16::from_f32(f).to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    TensorDtype::Bf16,
+                )
+            } else {
+                (
+                    f32s_for()
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    TensorDtype::F32,
+                )
+            };
+            let entry = base_format::TensorEntry {
+                name: canonical.clone(),
+                dtype,
+                shape,
+                offset: 0,
+                length: bytes.len() as u64,
+                scale_offset: None,
+                scale_length: None,
+                bias_offset: None,
+                bias_length: None,
+                awq_scale_offset: None,
+                awq_scale_length: None,
+                group_size: None,
+                layout: None,
+                residency: Some(if is_embedding {
+                    base_format::ResidencyHint::Hot
+                } else {
+                    base_format::ResidencyHint::Warm
+                }),
+                compute_region: if is_embedding {
+                    ComputeRegion::Gpu
+                } else {
+                    ComputeRegion::Accelerator
+                },
+                scale_dtype: None,
+                symmetric: false,
+                flags: TensorFlags::empty(),
+                checksum_xxh64: None,
+                source_ggml_type: None,
+            };
             (entry, bytes)
         } else if is_embedding {
             // See GGUF path above for rationale on embed quantization.
-            let in_features = shape.last().copied().map(|d| d as usize);
-            let (packed, dtype) = if ctx.profile.is_some() {
-                ctx.pack_tensor(canonical, f32s_for(), in_features)?
-            } else {
-                pack_for_target(f32s_for(), target)?
+            let (packed, dtype) = match passthrough {
+                Some(p) => {
+                    n_passthrough += 1;
+                    (p, transplant_dtype)
+                }
+                None if ctx.profile.is_some() => {
+                    ctx.pack_tensor(canonical, f32s_for(), in_features)?
+                }
+                None => pack_for_target_rows(f32s_for(), target, in_features, canonical)?,
             };
             let mut data = Vec::with_capacity(
                 packed.packed_weights.len() + packed.scales.len() + packed.biases.len(),
@@ -2827,16 +3837,20 @@ fn convert_generic(
                 symmetric: false,
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
-            source_ggml_type: None,
-};
+                source_ggml_type: None,
+            };
             entry.length = data.len() as u64;
             (entry, data)
         } else {
-            let in_features = shape.last().copied().map(|d| d as usize);
-            let (packed, dtype) = if ctx.profile.is_some() {
-                ctx.pack_tensor(canonical, f32s_for(), in_features)?
-            } else {
-                pack_for_target(f32s_for(), target)?
+            let (packed, dtype) = match passthrough {
+                Some(p) => {
+                    n_passthrough += 1;
+                    (p, transplant_dtype)
+                }
+                None if ctx.profile.is_some() => {
+                    ctx.pack_tensor(canonical, f32s_for(), in_features)?
+                }
+                None => pack_for_target_rows(f32s_for(), target, in_features, canonical)?,
             };
             let mut data = Vec::with_capacity(
                 packed.packed_weights.len() + packed.scales.len() + packed.biases.len(),
@@ -2887,17 +3901,64 @@ fn convert_generic(
                 symmetric: false,
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
-            source_ggml_type: None,
-};
+                source_ggml_type: None,
+            };
             entry.length = data.len() as u64;
             (entry, data)
         };
 
         writer.add_tensor(TensorPayload { entry, data });
+
+        // Record where this tensor came from and what was done to it, so
+        // verification tooling can check the bundle against the source
+        // checkpoint without a hand-maintained name table.
+        let mut rec = base_format::TensorProvenance {
+            transplanted,
+            carried: src_unquantized,
+            transform: value_transform(canonical).map(|vt| vt_label(vt).to_string()),
+            permuted: ndims >= 2 && rope_permute(canonical).is_some(),
+            ..Default::default()
+        };
+        if ndims == 1 {
+            let s = norm_shift(canonical);
+            if s != 0.0 {
+                rec.norm_shift = Some(s);
+            }
+        }
+        if let Some(spec) = splitting.splits.get(src_name) {
+            rec.src = vec![spec.src.clone()];
+            rec.rows = Some([spec.row_off, spec.row_cnt]);
+        } else if let Some(parts) = stacking.stacks.get(src_name) {
+            rec.stack = Some(base_format::StackRef {
+                pattern: src_name.replace(".experts.", ".experts.{e}."),
+                count: parts.len() as u32,
+            });
+        } else {
+            rec.src = vec![src_name.clone()];
+        }
+        prov_tensors.insert(canonical.clone(), rec);
         pb.inc(1);
     }
     pb.finish_and_clear();
-    eprintln!("  quantized {} tensors", mapped.len());
+    if n_passthrough > 0 || n_carried > 0 {
+        eprintln!(
+            "  quantized {} tensors ({} transplanted from the source's identical \
+             base_q4 scheme — no requantization; {} carried unquantized per the \
+             source's own storage)",
+            mapped.len(),
+            n_passthrough,
+            n_carried
+        );
+    } else {
+        eprintln!("  quantized {} tensors", mapped.len());
+    }
+    writer.set_provenance(base_format::Provenance {
+        schema: 1,
+        mirror,
+        dropped: dropped_names,
+        mmproj: mmproj_mapped.iter().map(|(s, _)| s.clone()).collect(),
+        tensors: prov_tensors,
+    });
 
     // Multimodal towers — preserve their HF names verbatim and route
     // them into the mmproj sub-bundle. Tower weights stay on the same
@@ -2958,8 +4019,8 @@ fn convert_generic(
                 symmetric: false,
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
-            source_ggml_type: None,
-};
+                source_ggml_type: None,
+            };
             (entry, bytes)
         } else {
             // Pad if needed so pack's group-size invariant holds for
@@ -2976,14 +4037,12 @@ fn convert_generic(
             let pack_n: Result<_> = if ctx.profile.is_some() {
                 ctx.pack_tensor(canonical, f32s_for(), in_features)
             } else {
-                pack_for_target(f32s_for(), target)
+                pack_for_target_rows(f32s_for(), target, in_features, canonical)
             };
             match pack_n {
                 Ok((packed, dtype)) => {
                     let mut data = Vec::with_capacity(
-                        packed.packed_weights.len()
-                            + packed.scales.len()
-                            + packed.biases.len(),
+                        packed.packed_weights.len() + packed.scales.len() + packed.biases.len(),
                     );
                     data.extend_from_slice(&packed.packed_weights);
                     let scale_off = data.len() as u64;
@@ -3030,8 +4089,8 @@ fn convert_generic(
                         symmetric: false,
                         flags: TensorFlags::empty(),
                         checksum_xxh64: None,
-                    source_ggml_type: None,
-};
+                        source_ggml_type: None,
+                    };
                     entry.length = data.len() as u64;
                     (entry, data)
                 }
@@ -3064,8 +4123,8 @@ fn convert_generic(
                         symmetric: false,
                         flags: TensorFlags::empty(),
                         checksum_xxh64: None,
-                    source_ggml_type: None,
-};
+                        source_ggml_type: None,
+                    };
                     (entry, bytes)
                 }
             }
@@ -3238,6 +4297,15 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
         return nomic_bert_hf_rename(name).map(Canonical::Main);
     }
 
+    // Nemotron-H names everything `backbone.layers.N.mixer.*` regardless
+    // of whether the mixer is a Mamba-2 scan, an attention block or an
+    // MoE FFN, so the generic `model.layers.N.*` table below cannot tell
+    // them apart. Its own rename splits them back out.
+    if arch.starts_with("nemotron_h") && (name.starts_with("backbone.") || name == "lm_head.weight")
+    {
+        return base_arch::nemotron::nemotron_hf_rename(name).map(Canonical::Main);
+    }
+
     // Strip HF naming prefix. Accept multiple multimodal wrapper
     // orderings:
     //   - `model.language_model.*` (Gemma 4 26B-A4B, mainline HF)
@@ -3257,6 +4325,14 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
     // would canonicalize the dead MTP decoder/expert stacks into the bundle.
     if arch.starts_with("qwen35") && (stripped == "mtp" || stripped.starts_with("mtp.")) {
         return None;
+    }
+
+    // GLM 5.2 (glm_dsa) MLX/HF checkpoints — dedicated rename table so the
+    // bundle carries the same canonical names the GGUF mapper emits
+    // (header-equivalent across sources) without routing GLM through the
+    // generic MoE renames below (which would emit the ffn_*_exps forms).
+    if arch == "glm_dsa" {
+        return glm_hf_canonical(stripped).map(Canonical::Main);
     }
 
     // HF native names → canonical.
@@ -3326,7 +4402,10 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
         // the canonical name without going through the legacy
         // `mlp.experts.X_proj.weight ↔ ffn_X_exps.weight` rule.
         canon = canon
-            .replace(".mlp.experts.gate_up_proj.weight", ".ffn_gate_up_exps.weight")
+            .replace(
+                ".mlp.experts.gate_up_proj.weight",
+                ".ffn_gate_up_exps.weight",
+            )
             .replace(".mlp.experts.down_proj.weight", ".ffn_down_exps.weight")
             .replace(".mlp.experts.gate_proj.weight", ".ffn_gate_exps.weight")
             .replace(".mlp.experts.up_proj.weight", ".ffn_up_exps.weight")
@@ -3428,6 +4507,106 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
     base_arch::llama::map_llama_style(name).map(Canonical::Main)
 }
 
+/// Candidate calibration-sidecar keys for a canonical bundle tensor name,
+/// most-specific first. The baseRT collector records the RUNTIME dispatch
+/// names (`dispatch_gemm`'s tensor_name), which differ from bundle-canonical
+/// for several GLM tensors; routed experts additionally fall back to the
+/// shared expert's stats — the shared expert consumes the IDENTICAL
+/// activation vector (post ffn-norm), so its per-channel absmax is exactly
+/// the right importance for the routed gate/up projections (and the closest
+/// available proxy for down).
+fn imatrix_stats_keys(canonical: &str) -> Vec<String> {
+    let mut keys = vec![canonical.to_string()];
+    if let Some(rest) = canonical.strip_prefix("layers.") {
+        if let Some((idx, tail)) = rest.split_once('.') {
+            let mapped: Option<Vec<String>> = match tail {
+                "self_attn.o_proj.weight" => {
+                    Some(vec![format!("layers.{idx}.attention.output.weight")])
+                }
+                // Gate and up consume the IDENTICAL activation vector, and
+                // the fused gate|up decode dispatches only record the gate
+                // name — gate stats are exact for up, not a proxy.
+                "mlp.gate_proj.weight" => Some(vec![format!("layers.{idx}.ffn.gate.weight")]),
+                "mlp.up_proj.weight" => Some(vec![
+                    format!("layers.{idx}.ffn.up.weight"),
+                    format!("layers.{idx}.ffn.gate.weight"),
+                ]),
+                "mlp.down_proj.weight" => Some(vec![format!("layers.{idx}.ffn.down.weight")]),
+                "mlp.shared_expert.gate_proj.weight" => {
+                    Some(vec![format!("layers.{idx}.ffn_gate_shexp.weight")])
+                }
+                "mlp.shared_expert.up_proj.weight" => Some(vec![
+                    format!("layers.{idx}.ffn_up_shexp.weight"),
+                    format!("layers.{idx}.ffn_gate_shexp.weight"),
+                ]),
+                "mlp.shared_expert.down_proj.weight" => {
+                    Some(vec![format!("layers.{idx}.ffn_down_shexp.weight")])
+                }
+                // Routed experts aren't captured (bespoke MoE dispatches).
+                // Their gate/up input IS the shared expert's input (post
+                // ffn-norm), so the shexp stats are exact; shexp down is
+                // the closest available proxy for expert down.
+                "mlp.experts.gate_proj.weight" => Some(vec![
+                    format!("layers.{idx}.ffn_gate_exps.weight"),
+                    format!("layers.{idx}.ffn_gate_shexp.weight"),
+                ]),
+                "mlp.experts.up_proj.weight" => Some(vec![
+                    format!("layers.{idx}.ffn_up_exps.weight"),
+                    format!("layers.{idx}.ffn_up_shexp.weight"),
+                    format!("layers.{idx}.ffn_gate_shexp.weight"),
+                ]),
+                "mlp.experts.down_proj.weight" => Some(vec![
+                    format!("layers.{idx}.ffn_down_exps.weight"),
+                    format!("layers.{idx}.ffn_down_shexp.weight"),
+                ]),
+                _ => None,
+            };
+            if let Some(m) = mapped {
+                keys.extend(m);
+            }
+        }
+    }
+    keys
+}
+
+/// GLM 5.2 MLX/HF tensor names → the canonical names the GGUF
+/// `GlmDsaMapper` emits (see `base-arch/src/glm.rs`), so GGUF- and
+/// MLX-sourced `.base` bundles differ only where the checkpoints
+/// genuinely differ. Input is the wrapper-stripped name
+/// (`layers.N.…`, `lm_head.weight`, `norm.weight`).
+///
+/// MLX-specific structure (from mlx-lm's `deepseek_v32.py`, which
+/// `glm_moe_dsa` subclasses):
+///   * `self_attn.embed_q` / `self_attn.unembed_out` are the per-head
+///     nope/v split of the original `kv_b_proj` — exactly our
+///     `k_b_proj` / `v_b_proj`, in the same memory layout
+///     ([head, kv_lora, nope] row-major == GGUF ne0-fastest
+///     [nope, kv_lora, head]; same for v_b).
+///   * `indexer.wk` / `indexer.wq_b` ↔ GGUF `indexer.attn_k` /
+///     `indexer.attn_q_b`; indexer weights exist only on the 21 "full"
+///     layers (`indexer_types`) — the GGUF export carries junk copies
+///     on all 79, so the MLX bundle legitimately has fewer tensors.
+///   * `mlp.switch_mlp.*` is the stacked-expert block; `mlp.gate` is
+///     the router; `mlp.shared_experts` (plural) is the single
+///     ungated shared expert.
+fn glm_hf_canonical(stripped: &str) -> Option<String> {
+    if stripped == "norm.weight" {
+        return Some("final_norm.weight".to_string());
+    }
+    Some(
+        stripped
+            .replace(".mlp.switch_mlp.", ".mlp.experts.")
+            .replace(".mlp.shared_experts.", ".mlp.shared_expert.")
+            .replace(".mlp.gate.weight", ".mlp.router.weight")
+            .replace(".self_attn.embed_q.", ".self_attn.k_b_proj.")
+            .replace(".self_attn.unembed_out.", ".self_attn.v_b_proj.")
+            .replace(".indexer.wk.", ".indexer.k_proj.")
+            .replace(".indexer.wq_b.", ".indexer.q_b_proj.")
+            .replace(".input_layernorm.", ".input_norm.")
+            .replace(".post_attention_layernorm.", ".post_attn_norm."),
+    )
+}
+
 fn compute_sha256_streaming(path: &std::path::Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let f = std::fs::File::open(path)?;
@@ -3447,17 +4626,14 @@ fn compute_sha256_streaming(path: &std::path::Path) -> Result<String> {
 /// driven by profile.resolve; otherwise falls back to convert_synthetic
 /// for v1.0 behavior. Useful for end-to-end smoke testing the canonical
 /// pipeline without a real model checkpoint.
-fn convert_synthetic_with_ctx(
-    output: &std::path::Path,
-    ctx: &QuantContext,
-) -> Result<()> {
+fn convert_synthetic_with_ctx(output: &std::path::Path, ctx: &QuantContext) -> Result<()> {
     if ctx.profile.is_none() {
         return convert_synthetic(output, ctx.target);
     }
     use base_format::{
-        AlignmentConfig, BaseReader, BaseWriter, ComputeRegion, Header, HeaderFlags, LayerKind,
-        LayerDescriptor, LayerPrecision, ModelConfig, QuantScheme, SourceInfo, TargetBackend,
-        TensorFlags, TensorPayload, TokenizerBlob,
+        AlignmentConfig, BaseReader, BaseWriter, ComputeRegion, Header, HeaderFlags,
+        LayerDescriptor, LayerKind, LayerPrecision, ModelConfig, QuantScheme, SourceInfo,
+        TargetBackend, TensorFlags, TensorPayload, TokenizerBlob,
     };
     use std::collections::BTreeMap;
 
@@ -3495,10 +4671,7 @@ fn convert_synthetic_with_ctx(
         },
         metadata: Default::default(),
         target_backend: TargetBackend::Metal,
-        quant_profile: ctx
-            .profile_name()
-            .unwrap_or("")
-            .to_string(),
+        quant_profile: ctx.profile_name().unwrap_or("").to_string(),
         alignment: AlignmentConfig::default(),
         flags: HeaderFlags::QUANTIZED | HeaderFlags::TIED_EMBEDDINGS,
         layers: (0..n_layers)
@@ -3514,6 +4687,7 @@ fn convert_synthetic_with_ctx(
         tensors: vec![],
         mmproj: None,
         calibration: None,
+        provenance: None,
         sig: None,
     };
 
@@ -3588,7 +4762,9 @@ fn convert_synthetic_with_ctx(
     };
 
     // Embedding (always bf16 per default profiles).
-    let embed: Vec<f32> = (0..vocab * hidden).map(|i| ((i as f32) % 17.0) * 0.01).collect();
+    let embed: Vec<f32> = (0..vocab * hidden)
+        .map(|i| ((i as f32) % 17.0) * 0.01)
+        .collect();
     emit(
         &mut writer,
         "model.embed_tokens.weight",
@@ -3698,7 +4874,9 @@ fn convert_synthetic_with_ctx(
         ComputeRegion::Gpu,
     )?;
 
-    writer.finish().context("writing canonical synthetic bundle")?;
+    writer
+        .finish()
+        .context("writing canonical synthetic bundle")?;
 
     // Read it back; verify the canonical fields populated correctly.
     let reader = BaseReader::open(output).context("reopen canonical bundle")?;
@@ -3717,9 +4895,9 @@ fn convert_synthetic_with_ctx(
 /// disk, and verify it reads back.
 fn convert_synthetic(output: &std::path::Path, target: TargetScheme) -> Result<()> {
     use base_format::{
-        AlignmentConfig, BaseReader, BaseWriter, ComputeRegion, Header, HeaderFlags, LayerKind,
-        LayerDescriptor, LayerPrecision, ModelConfig, QuantScheme, SourceInfo, TargetBackend, TensorDtype,
-        TensorFlags, TensorPayload, TokenizerBlob,
+        AlignmentConfig, BaseReader, BaseWriter, ComputeRegion, Header, HeaderFlags,
+        LayerDescriptor, LayerKind, LayerPrecision, ModelConfig, QuantScheme, SourceInfo,
+        TargetBackend, TensorDtype, TensorFlags, TensorPayload, TokenizerBlob,
     };
     use std::collections::BTreeMap;
 
@@ -3781,13 +4959,16 @@ fn convert_synthetic(output: &std::path::Path, target: TargetScheme) -> Result<(
         tensors: vec![],
         mmproj: None,
         calibration: None,
+        provenance: None,
         sig: None,
     };
 
     let mut writer = BaseWriter::create(output, header.clone()).context("create writer")?;
 
     // Embedding (GPU region, bf16).
-    let embed: Vec<f32> = (0..vocab * hidden).map(|i| ((i as f32) % 17.0) * 0.01).collect();
+    let embed: Vec<f32> = (0..vocab * hidden)
+        .map(|i| ((i as f32) % 17.0) * 0.01)
+        .collect();
     let embed_bytes: Vec<u8> = embed
         .iter()
         .flat_map(|&f| half::bf16::from_f32(f).to_le_bytes())
@@ -3937,6 +5118,54 @@ fn pack_for_target(
     }
 }
 
+/// Row-aware sibling of [`pack_for_target`] for the profile-less path: the
+/// runtime GEMV / GEMM / MoE kernels index `K / group_size` scales per row,
+/// so a group may never span a row boundary. When the in-features dim is not
+/// a multiple of the scheme's default group size, pick the largest smaller
+/// group (down to 32) that divides it — the kernels read the group size from
+/// the tensor header — and fall back to bf16 only when none does. Before
+/// this, `--target base-q8` packed Nemotron-3-Nano's routed down experts
+/// (K = 1856 = 14.5 x 128) with row-spanning groups: every scale was read
+/// against the wrong weights and the bundle decoded garbage (PPL ~1e6).
+fn pack_for_target_rows(
+    weights: &[f32],
+    target: TargetScheme,
+    in_features: Option<usize>,
+    name: &str,
+) -> Result<(base_quant::Packed, base_format::TensorDtype)> {
+    use base_format::TensorDtype;
+    let (default_gs, dtype): (usize, TensorDtype) = match target {
+        TargetScheme::BaseQ4 => (base_quant::base_q4::GROUP_SIZE, TensorDtype::BaseQ4),
+        TargetScheme::BaseQ6 => (base_quant::base_q6::GROUP_SIZE, TensorDtype::BaseQ6),
+        TargetScheme::BaseQ8 => (base_quant::base_q8::GROUP_SIZE, TensorDtype::BaseQ8),
+        _ => return pack_for_target(weights, target),
+    };
+    let k = match in_features {
+        Some(k) if k > 0 && k % default_gs != 0 => k,
+        _ => return pack_for_target(weights, target),
+    };
+    let mut gs = default_gs;
+    while gs > 32 && k % gs != 0 {
+        gs /= 2;
+    }
+    if k % gs != 0 || weights.len() % gs != 0 {
+        eprintln!(
+            "    note: {name} has in_features={k} (not a multiple of any {target:?} group size >= 32); \
+             falling back to bf16 — quant grouping would misalign scales."
+        );
+        return Ok((pack_bf16(weights), TensorDtype::Bf16));
+    }
+    eprintln!(
+        "    note: {name} has in_features={k} (not a multiple of gs={default_gs}); packing {target:?} at gs={gs}"
+    );
+    let packed = match target {
+        TargetScheme::BaseQ4 => base_quant::base_q4::pack_with_group_size(weights, gs),
+        TargetScheme::BaseQ6 => base_quant::base_q6::pack_with_group_size(weights, gs),
+        _ => base_quant::base_q8::pack_with_group_size(weights, gs),
+    };
+    Ok((packed, dtype))
+}
+
 /// Wrap fp32 weights as bf16 raw bytes (no quant, no scales).
 fn pack_bf16(weights: &[f32]) -> base_quant::Packed {
     let bytes: Vec<u8> = weights
@@ -3964,8 +5193,23 @@ struct QuantContext {
     target: TargetScheme,
     /// Bypass the spec's already-quantized-source rejection.
     allow_quant_from_quant: bool,
+    /// Transplant MLX affine-q4 tensors into `base_q4` verbatim instead
+    /// of requantizing them through f32.
+    q4_passthrough: bool,
     /// Copy GGUF Q4_K/Q5_K/Q6_K super-blocks through verbatim.
     kquant_passthrough: bool,
+    /// MLX sources only: reuse the source's packed q4 payloads
+    /// verbatim instead of dequant→requant (see `--mlx-passthrough`).
+    mlx_passthrough: bool,
+    /// After an `--mlx-passthrough` conversion, byte-compare the
+    /// written `.base` against the MLX source.
+    validate: bool,
+    /// Direct-write the blob behind a reserved header region (no
+    /// `.blobtmp`, no 2× disk peak) — see `--direct-write`.
+    direct_write: bool,
+    /// Importance-weighted RTN from the awq_profile sidecar — see
+    /// `--imatrix`.
+    imatrix: bool,
 }
 
 impl QuantContext {
@@ -3989,13 +5233,34 @@ impl QuantContext {
                 "--awq-profile requires --profile (AWQ only applies to canonical bit-widths from a profile)"
             );
         }
+        if args.mlx_passthrough {
+            if profile.is_some() {
+                bail!("--mlx-passthrough and --profile are mutually exclusive (passthrough reuses the source's quant verbatim)");
+            }
+            if !matches!(args.target, TargetScheme::BaseQ4) {
+                bail!("--mlx-passthrough requires --target base-q4 (the MLX 4-bit layout)");
+            }
+        }
+        if args.validate && !args.mlx_passthrough {
+            bail!(
+                "--validate requires --mlx-passthrough (it byte-compares against the MLX source)"
+            );
+        }
+        if args.imatrix && args.awq_profile.is_none() {
+            bail!("--imatrix requires --awq-profile <sidecar> (the calibration absmax supplies the channel weights)");
+        }
         Ok(Self {
             profile,
             awq_profile,
             awq_config: base_awq::AwqConfig::default(),
             target: args.target,
             allow_quant_from_quant: args.allow_quant_from_quant,
+            q4_passthrough: !args.no_mlx_passthrough,
             kquant_passthrough: args.kquant_passthrough,
+            mlx_passthrough: args.mlx_passthrough,
+            validate: args.validate,
+            direct_write: args.direct_write,
+            imatrix: args.imatrix,
         })
     }
 
@@ -4021,7 +5286,7 @@ impl QuantContext {
         use base_format::TensorDtype;
         // Without a profile: legacy uniform-target behavior.
         let Some(profile) = &self.profile else {
-            return pack_for_target(weights, self.target);
+            return pack_for_target_rows(weights, self.target, in_features, name);
         };
         let resolved = profile
             .resolve_or_err(name)
@@ -4058,18 +5323,16 @@ impl QuantContext {
                     TensorDtype::F32,
                 ))
             }
-            TensorDtype::Mxfp4 => {
-                Ok((base_quant::mxfp4::pack(weights), TensorDtype::Mxfp4))
-            }
-            TensorDtype::Nvfp4 => {
-                Ok((base_quant::nvfp4::pack(weights), TensorDtype::Nvfp4))
-            }
+            TensorDtype::Mxfp4 => Ok((base_quant::mxfp4::pack(weights), TensorDtype::Mxfp4)),
+            TensorDtype::Nvfp4 => Ok((base_quant::nvfp4::pack(weights), TensorDtype::Nvfp4)),
             dtype @ (TensorDtype::BaseQ2
             | TensorDtype::BaseQ3
             | TensorDtype::BaseQ4
             | TensorDtype::BaseQ5
             | TensorDtype::BaseQ6
-            | TensorDtype::BaseQ8) => self.pack_canonical(name, weights, in_features, dtype, resolved),
+            | TensorDtype::BaseQ8) => {
+                self.pack_canonical(name, weights, in_features, dtype, resolved)
+            }
         }
     }
 
@@ -4122,24 +5385,64 @@ impl QuantContext {
             }
         }
 
+        // Importance-weighted RTN ("imatrix", --imatrix): fit each group's
+        // (scale, bias) under per-input-channel activation weights from the
+        // sidecar. Runtime-free (weights still approximate the originals) —
+        // takes precedence over the AWQ rotation path, which would require
+        // inference-side activation scaling the runtime doesn't implement.
+        if self.imatrix && !cfg.symmetric {
+            if let (Some(awq), Some(in_feat)) = (&self.awq_profile, in_features) {
+                if in_feat > 0 && in_feat % cfg.group_size as usize == 0 {
+                    for key in imatrix_stats_keys(name) {
+                        if let Some(absmax) = awq.absmax(&key) {
+                            if absmax.len() == in_feat {
+                                // Second moment proxy: importance = absmax².
+                                let w: Vec<f32> = absmax.iter().map(|&a| a * a).collect();
+                                let packed =
+                                    base_quant::rtn::pack_weighted(weights, cfg, &w, in_feat);
+                                return Ok((packed, dtype));
+                            }
+                            eprintln!(
+                                "    imatrix: skipping {name} — stats {key:?} len {} != in_features {}",
+                                absmax.len(),
+                                in_feat
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            // No stats → plain RTN below (uniform importance).
+        }
+
         // AWQ pre-process: only when sidecar carries an absmax for
-        // this tensor and we know the in_features dim.
-        let weights_for_pack: Vec<f32> = match (&self.awq_profile, in_features) {
+        // this tensor and we know the in_features dim. Never under
+        // --imatrix — rotation requires runtime activation scaling.
+        let weights_for_pack: Vec<f32> = match (
+            if self.imatrix {
+                &None
+            } else {
+                &self.awq_profile
+            },
+            in_features,
+        ) {
             (Some(awq), Some(in_feat)) => {
                 if let Some(absmax) = awq.absmax(name) {
                     if absmax.len() == in_feat {
-                        let plan = self
-                            .awq_config
-                            .search(weights, in_feat, absmax, bits, cfg.group_size, cfg.symmetric);
+                        let plan = self.awq_config.search(
+                            weights,
+                            in_feat,
+                            absmax,
+                            bits,
+                            cfg.group_size,
+                            cfg.symmetric,
+                        );
                         // Rotate weights. The runtime undoes the rotation by
                         // pre-multiplying activations with `plan.scales`;
                         // those scales are stored alongside the rotated
                         // tensor in the `.base` header so the runtime can
                         // recover the original output.
-                        eprintln!(
-                            "    awq: {name} α={:.2} mse={:.4e}",
-                            plan.alpha, plan.mse
-                        );
+                        eprintln!("    awq: {name} α={:.2} mse={:.4e}", plan.alpha, plan.mse);
                         base_awq::awq_apply(weights, in_feat, &plan.scales)
                     } else {
                         eprintln!(
@@ -4163,8 +5466,8 @@ impl QuantContext {
 }
 
 fn cmd_sign(args: SignArgs) -> Result<()> {
-    let key_bytes = std::fs::read(&args.key)
-        .with_context(|| format!("reading key {:?}", args.key))?;
+    let key_bytes =
+        std::fs::read(&args.key).with_context(|| format!("reading key {:?}", args.key))?;
     let key = base_sign::signing_key_from_bytes(&key_bytes)?;
     base_sign::sign_base_file(&args.input, &args.output, &key, &args.key_id)?;
     eprintln!("signed -> {}", args.output.display());
@@ -4173,8 +5476,8 @@ fn cmd_sign(args: SignArgs) -> Result<()> {
 
 fn cmd_verify(args: VerifyArgs) -> Result<()> {
     use ed25519_dalek::VerifyingKey;
-    let bytes = std::fs::read(&args.pubkey)
-        .with_context(|| format!("reading pubkey {:?}", args.pubkey))?;
+    let bytes =
+        std::fs::read(&args.pubkey).with_context(|| format!("reading pubkey {:?}", args.pubkey))?;
     if bytes.len() != 32 {
         bail!("ed25519 public key must be 32 bytes, got {}", bytes.len());
     }
@@ -4232,7 +5535,12 @@ fn cmd_inspect(args: InspectArgs) -> Result<()> {
     let slots = reader.slots()?;
     println!("n_slots:       {}", slots.len());
     for s in &slots {
-        println!("  slot kind={:?} raw=0x{:04x} len={}", s.kind(), s.kind_raw, s.payload.len());
+        println!(
+            "  slot kind={:?} raw=0x{:04x} len={}",
+            s.kind(),
+            s.kind_raw,
+            s.payload.len()
+        );
     }
 
     if args.verify_checksums {
@@ -4324,7 +5632,11 @@ mod canonical_name_tests {
                 "layers.0.linear_attn.dt_bias",
             ),
         ] {
-            assert_eq!(main_canon(src, "qwen35"), Some(want.to_string()), "src={src}");
+            assert_eq!(
+                main_canon(src, "qwen35"),
+                Some(want.to_string()),
+                "src={src}"
+            );
         }
 
         // Full-attention block: standard Qwen QK-norm + gate passthrough,
@@ -4396,7 +5708,10 @@ mod canonical_name_tests {
             "layers.0.mlp.gate_proj.weight",
             "layers.3.self_attn.q_proj.weight",
         ] {
-            assert!(!is_gdn_f32(n) && !is_gdn_f16(n), "unexpected override for {n}");
+            assert!(
+                !is_gdn_f32(n) && !is_gdn_f16(n),
+                "unexpected override for {n}"
+            );
         }
     }
 
@@ -4438,6 +5753,76 @@ mod canonical_name_tests {
                 "gemma4",
             ),
             Some("layers.7.ffn_down_exps.weight".to_string()),
+        );
+    }
+
+    // GLM 5.2 MLX (mlx-community/GLM-5.2-4bit) — the dedicated glm_dsa
+    // rename table must reproduce the GGUF mapper's canonical names.
+    #[test]
+    fn glm_dsa_mlx_tensor_canonicalization() {
+        let c = |n: &str| main_canon(n, "glm_dsa");
+        // MoE: stacked experts, router, bias, shared expert (plural → singular).
+        assert_eq!(
+            c("model.layers.5.mlp.switch_mlp.down_proj.weight").as_deref(),
+            Some("layers.5.mlp.experts.down_proj.weight")
+        );
+        assert_eq!(
+            c("model.layers.5.mlp.gate.weight").as_deref(),
+            Some("layers.5.mlp.router.weight")
+        );
+        assert_eq!(
+            c("model.layers.5.mlp.gate.e_score_correction_bias").as_deref(),
+            Some("layers.5.mlp.gate.e_score_correction_bias")
+        );
+        assert_eq!(
+            c("model.layers.5.mlp.shared_experts.up_proj.weight").as_deref(),
+            Some("layers.5.mlp.shared_expert.up_proj.weight")
+        );
+        // MLA absorb pair: MLX pre-absorbed names → k_b/v_b.
+        assert_eq!(
+            c("model.layers.5.self_attn.embed_q.weight").as_deref(),
+            Some("layers.5.self_attn.k_b_proj.weight")
+        );
+        assert_eq!(
+            c("model.layers.5.self_attn.unembed_out.weight").as_deref(),
+            Some("layers.5.self_attn.v_b_proj.weight")
+        );
+        // Indexer (only the 21 "full" layers carry these).
+        assert_eq!(
+            c("model.layers.6.self_attn.indexer.wk.weight").as_deref(),
+            Some("layers.6.self_attn.indexer.k_proj.weight")
+        );
+        assert_eq!(
+            c("model.layers.6.self_attn.indexer.wq_b.weight").as_deref(),
+            Some("layers.6.self_attn.indexer.q_b_proj.weight")
+        );
+        assert_eq!(
+            c("model.layers.6.self_attn.indexer.k_norm.bias").as_deref(),
+            Some("layers.6.self_attn.indexer.k_norm.bias")
+        );
+        assert_eq!(
+            c("model.layers.6.self_attn.indexer.weights_proj.weight").as_deref(),
+            Some("layers.6.self_attn.indexer.weights_proj.weight")
+        );
+        // Norms + globals.
+        assert_eq!(
+            c("model.layers.5.input_layernorm.weight").as_deref(),
+            Some("layers.5.input_norm.weight")
+        );
+        assert_eq!(
+            c("model.layers.5.post_attention_layernorm.weight").as_deref(),
+            Some("layers.5.post_attn_norm.weight")
+        );
+        assert_eq!(c("model.norm.weight").as_deref(), Some("final_norm.weight"));
+        assert_eq!(c("lm_head.weight").as_deref(), Some("lm_head.weight"));
+        assert_eq!(
+            c("model.embed_tokens.weight").as_deref(),
+            Some("embed_tokens.weight")
+        );
+        // Already-canonical MLA names pass through untouched.
+        assert_eq!(
+            c("model.layers.5.self_attn.kv_a_proj_with_mqa.weight").as_deref(),
+            Some("layers.5.self_attn.kv_a_proj_with_mqa.weight")
         );
     }
 
@@ -4525,10 +5910,7 @@ mod canonical_name_tests {
     #[test]
     fn shared_expert_not_rewritten_by_experts_rules() {
         assert_eq!(
-            main_canon(
-                "model.layers.3.mlp.shared_expert.gate_proj.weight",
-                "qwen3",
-            ),
+            main_canon("model.layers.3.mlp.shared_expert.gate_proj.weight", "qwen3",),
             Some("layers.3.mlp.shared_expert.gate_proj.weight".to_string()),
         );
     }
@@ -4572,7 +5954,10 @@ mod canonical_name_tests {
     fn nomic_bert_hf_canonical_names() {
         let cases: &[(&str, &str)] = &[
             ("embeddings.word_embeddings.weight", "embed_tokens.weight"),
-            ("embeddings.token_type_embeddings.weight", "token_types.weight"),
+            (
+                "embeddings.token_type_embeddings.weight",
+                "token_types.weight",
+            ),
             ("emb_ln.weight", "token_embd_norm.weight"),
             ("emb_ln.bias", "token_embd_norm.bias"),
             (
@@ -4624,7 +6009,10 @@ mod canonical_name_tests {
             main_canon("embeddings.position_embeddings.weight", "nomic-bert"),
             None,
         );
-        assert_eq!(main_canon("0.auto_model.pooler.dense.weight", "nomic-bert"), None);
+        assert_eq!(
+            main_canon("0.auto_model.pooler.dense.weight", "nomic-bert"),
+            None
+        );
     }
 }
 
@@ -4685,7 +6073,9 @@ mod stacking_tests {
 
         // rewritten names: per-expert dropped, attn kept, virtuals added
         let rw = sp.rewritten_names();
-        assert!(rw.iter().any(|n| n == "model.layers.0.self_attn.q_proj.weight"));
+        assert!(rw
+            .iter()
+            .any(|n| n == "model.layers.0.self_attn.q_proj.weight"));
         assert!(rw.iter().any(|n| n == gate));
         assert!(!rw.iter().any(|n| n.contains(".mlp.experts.0.")));
     }
@@ -4773,7 +6163,10 @@ mod splitting_tests {
         assert_eq!(sp.source_shape(u).unwrap(), vec![3, 2]);
 
         // qkv layout = [q rows 0..4 | k rows 4..6 | v rows 6..8]
-        assert_eq!(sp.to_f32(q).unwrap(), vec![0., 1., 10., 11., 20., 21., 30., 31.]);
+        assert_eq!(
+            sp.to_f32(q).unwrap(),
+            vec![0., 1., 10., 11., 20., 21., 30., 31.]
+        );
         assert_eq!(sp.to_f32(k).unwrap(), vec![40., 41., 50., 51.]);
         assert_eq!(sp.to_f32(v).unwrap(), vec![60., 61., 70., 71.]);
         // gate_up layout = [gate rows 0..3 | up rows 3..6], gate first
@@ -4782,7 +6175,9 @@ mod splitting_tests {
 
         // rewritten: fused dropped, o_proj passed through, virtuals present
         let rw = sp.rewritten_names();
-        assert!(rw.iter().any(|n| n == "model.layers.0.self_attn.o_proj.weight"));
+        assert!(rw
+            .iter()
+            .any(|n| n == "model.layers.0.self_attn.o_proj.weight"));
         assert!(rw.iter().any(|n| n == q));
         assert!(!rw.iter().any(|n| n.ends_with("qkv_proj.weight")));
         assert!(!rw.iter().any(|n| n.ends_with("gate_up_proj.weight")));
@@ -4803,7 +6198,7 @@ mod splitting_tests {
     #[test]
     fn mismatched_config_is_rejected() {
         let mock = SplitMock; // qkv_proj is [8, 2]
-        // nq=3 implies q+k+v = 3*2 + 2*(1*2) = 10 ≠ 8 rows → loud error, no garbage.
+                              // nq=3 implies q+k+v = 3*2 + 2*(1*2) = 10 ≠ 8 rows → loud error, no garbage.
         let bad = ArchConfig {
             head_dim: 2,
             num_attention_heads: 3,
@@ -4831,7 +6226,8 @@ fn rope_permute_rows(f32s: &[f32], rows: usize, cols: usize, n_heads: u32) -> Ve
             for k in 0..2usize {
                 let dst = h * hd + 2 * j + k;
                 let src = h * hd + k * half + j;
-                out[dst * cols..(dst + 1) * cols].copy_from_slice(&f32s[src * cols..(src + 1) * cols]);
+                out[dst * cols..(dst + 1) * cols]
+                    .copy_from_slice(&f32s[src * cols..(src + 1) * cols]);
             }
         }
     }
@@ -4914,7 +6310,10 @@ mod gguf_passthrough_tests {
         let original: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
         // What llama.cpp would have written into the GGUF.
         let permuted = rope_permute_rows(&original, rows, cols, n_heads);
-        assert_ne!(permuted, original, "forward permute must actually move rows");
+        assert_ne!(
+            permuted, original,
+            "forward permute must actually move rows"
+        );
 
         let out = unpermute_rope_rows(
             &info(cols as u64, rows as u64, GgmlType::F32),
@@ -4957,12 +6356,12 @@ mod gguf_passthrough_tests {
         let (n_heads, hd) = (2u32, 4usize);
         let rows = n_heads as usize * hd;
         let row_bytes = 2 * 144; // 512 elements / 256 per block x 144 B
-        // Give every row a distinct byte pattern so a mis-shuffle shows up.
+                                 // Give every row a distinct byte pattern so a mis-shuffle shows up.
         let src: Vec<u8> = (0..rows)
             .flat_map(|r| std::iter::repeat_n((r as u8) + 1, row_bytes))
             .collect();
-        let out = unpermute_rope_rows(&info(512, rows as u64, GgmlType::Q4K), &src, n_heads)
-            .unwrap();
+        let out =
+            unpermute_rope_rows(&info(512, rows as u64, GgmlType::Q4K), &src, n_heads).unwrap();
         assert_eq!(out.len(), src.len());
         // Expected destination rows: dst[h*HD + k*HD/2 + j] = src[h*HD + 2j + k].
         // Head 0 src rows 0,1,2,3 → dst 0,2,1,3.

@@ -63,6 +63,7 @@ pub enum ModelRef {
         arch: Option<String>,
         size: Option<u64>,
         sha256: Option<String>,
+        parts_sha256: Option<Vec<String>>,
     },
     /// Arbitrary HF repo of source safetensors — download and convert locally.
     HuggingFace {
@@ -273,6 +274,7 @@ impl CatalogRegistry {
             arch: e.arch.clone(),
             size: e.size,
             sha256: e.sha256.clone(),
+            parts_sha256: e.parts_sha256.clone(),
         }
     }
 
@@ -325,7 +327,11 @@ impl CatalogRegistry {
     /// fall through to a convert-on-pull of a bundle this client can't run. When
     /// the id+quant simply isn't published, both fields are `(None, false)` and
     /// the caller may convert-on-pull from the source repo.
-    pub fn resolve_with_status(&self, id: &str, want_quant: Option<&str>) -> (Option<ModelRef>, bool) {
+    pub fn resolve_with_status(
+        &self,
+        id: &str,
+        want_quant: Option<&str>,
+    ) -> (Option<ModelRef>, bool) {
         let is_exact = |e: &crate::catalog::CatalogEntry| e.id == id;
         let is_id = |e: &crate::catalog::CatalogEntry| e.id == id || e.id.eq_ignore_ascii_case(id);
 
@@ -351,13 +357,20 @@ impl CatalogRegistry {
             Some(w) => Self::quant_matches(&e.quant, w),
         };
 
-        let matched: Vec<&crate::catalog::CatalogEntry> =
-            self.catalog.models.iter().filter(|e| is_id(e) && quant_ok(e)).collect();
+        let matched: Vec<&crate::catalog::CatalogEntry> = self
+            .catalog
+            .models
+            .iter()
+            .filter(|e| is_id(e) && quant_ok(e))
+            .collect();
         if matched.is_empty() {
             return (None, false); // this id+quant isn't published — convert-on-pull
         }
-        let mut runnable: Vec<&crate::catalog::CatalogEntry> =
-            matched.iter().copied().filter(|e| Self::backend_ok(e)).collect();
+        let mut runnable: Vec<&crate::catalog::CatalogEntry> = matched
+            .iter()
+            .copied()
+            .filter(|e| Self::backend_ok(e))
+            .collect();
         if runnable.is_empty() {
             // Published, but only for a backend this client can't run.
             if let Some(e) = matched.first() {
@@ -551,7 +564,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let reg = MergedRegistry::new(tmp.path(), catalog_with_one());
 
-        match reg.resolve("basecompute/demo", "main", None, false).unwrap() {
+        match reg
+            .resolve("basecompute/demo", "main", None, false)
+            .unwrap()
+        {
             ModelRef::Catalog {
                 hf_repo, variant, ..
             } => {
@@ -590,7 +606,8 @@ mod tests {
 
         // Asking for q4 → the installed artifact.
         assert!(matches!(
-            reg.resolve("basecompute/demo", "main", Some("q4"), false).unwrap(),
+            reg.resolve("basecompute/demo", "main", Some("q4"), false)
+                .unwrap(),
             ModelRef::Local { .. }
         ));
         // Asking for q8 must NOT return the installed q4 — quant-aware catalog
@@ -610,8 +627,10 @@ mod tests {
     // Build a CatalogRegistry from inline JSON (test helper).
     fn catalog_json(models: &str) -> CatalogRegistry {
         CatalogRegistry::from_catalog(
-            Catalog::from_json(&format!(r#"{{"schema":1,"updated":"x","models":[{models}]}}"#))
-                .unwrap(),
+            Catalog::from_json(&format!(
+                r#"{{"schema":1,"updated":"x","models":[{models}]}}"#
+            ))
+            .unwrap(),
         )
     }
 
@@ -651,7 +670,10 @@ mod tests {
         for rows in [format!("{uni},{nat}"), format!("{nat},{uni}")] {
             let reg = catalog_json(&rows);
             reg.catalog.validate().unwrap(); // both rows coexist (backend in key)
-            match reg.resolve_variant("basecompute/hybrid", Some("q4")).unwrap() {
+            match reg
+                .resolve_variant("basecompute/hybrid", Some("q4"))
+                .unwrap()
+            {
                 ModelRef::Catalog { file, variant, .. } => {
                     assert_eq!(file, format!("hybrid-Q4-{be}.base"));
                     assert_eq!(variant, format!("{be}-q4")); // distinct cache dir
@@ -672,23 +694,37 @@ mod tests {
         }
         // A quant that isn't published: absent (not backend-locked) → the merged
         // resolver may convert-on-pull.
-        assert_eq!(reg.resolve_with_status("basecompute/demo", Some("q8")), (None, false));
+        assert_eq!(
+            reg.resolve_with_status("basecompute/demo", Some("q8")),
+            (None, false)
+        );
     }
 
     #[test]
     fn resolve_backend_locked_reports_status_not_absent() {
-        let foreign = if CatalogRegistry::client_backend() == "cuda" { "metal" } else { "cuda" };
+        let foreign = if CatalogRegistry::client_backend() == "cuda" {
+            "metal"
+        } else {
+            "cuda"
+        };
         let reg = catalog_json(&format!(
             r#"{{"id":"basecompute/locked","hf_repo":"basecompute/locked","file":"locked-Q4.base","arch":"llama","quant":"{foreign}-q4","backend":"{foreign}"}}"#
         ));
         // Published for this id+quant, but only for a foreign backend → refuse,
         // and flag it distinctly from "absent" so the caller errors (below).
-        assert_eq!(reg.resolve_with_status("basecompute/locked", Some("q4")), (None, true));
+        assert_eq!(
+            reg.resolve_with_status("basecompute/locked", Some("q4")),
+            (None, true)
+        );
     }
 
     #[test]
     fn merged_resolve_refuses_backend_locked_no_hf_fallthrough() {
-        let foreign = if CatalogRegistry::client_backend() == "cuda" { "metal" } else { "cuda" };
+        let foreign = if CatalogRegistry::client_backend() == "cuda" {
+            "metal"
+        } else {
+            "cuda"
+        };
         let tmp = tempfile::tempdir().unwrap();
         let reg = MergedRegistry::new(
             tmp.path(),
@@ -698,7 +734,9 @@ mod tests {
         );
         // Must ERROR (backend-locked), not fall through to a raw HF download of a
         // bundle this client can't run.
-        assert!(reg.resolve("basecompute/locked", "main", Some("q4"), false).is_err());
+        assert!(reg
+            .resolve("basecompute/locked", "main", Some("q4"), false)
+            .is_err());
     }
 
     #[test]
@@ -719,7 +757,10 @@ mod tests {
         let uni = cache::variant_dir(tmp.path(), "basecompute/h", "default-q4").unwrap();
         std::fs::create_dir_all(&uni).unwrap();
         std::fs::write(cache::base_artifact_path(&uni), b"universal").unwrap();
-        match reg.resolve("basecompute/h", "main", Some("q4"), false).unwrap() {
+        match reg
+            .resolve("basecompute/h", "main", Some("q4"), false)
+            .unwrap()
+        {
             ModelRef::Catalog { variant, .. } => assert_eq!(variant, format!("{be}-q4")),
             other => panic!("cached universal must not shadow the native pick, got {other:?}"),
         }
@@ -760,7 +801,10 @@ mod tests {
             r#"{"id":"basecompute/CamelModel","hf_repo":"basecompute/alias","file":"alias-Q4.base","arch":"llama","quant":"default-q4"},
                {"id":"basecompute/camelmodel","hf_repo":"basecompute/exact","file":"exact-Q4.base","arch":"llama","quant":"default-q4"}"#,
         );
-        match reg.resolve_variant("basecompute/camelmodel", Some("q4")).unwrap() {
+        match reg
+            .resolve_variant("basecompute/camelmodel", Some("q4"))
+            .unwrap()
+        {
             ModelRef::Catalog { hf_repo, .. } => assert_eq!(hf_repo, "basecompute/exact"),
             other => panic!("exact id must win, got {other:?}"),
         }
@@ -800,7 +844,10 @@ mod tests {
         std::fs::create_dir_all(&vdir).unwrap();
         std::fs::write(cache::base_artifact_path(&vdir), b"not a real base").unwrap();
 
-        match reg.resolve("basecompute/demo", "main", None, false).unwrap() {
+        match reg
+            .resolve("basecompute/demo", "main", None, false)
+            .unwrap()
+        {
             ModelRef::Local { variant, .. } => assert_eq!(variant, "default-q4"),
             other => panic!("expected Local, got {other:?}"),
         }

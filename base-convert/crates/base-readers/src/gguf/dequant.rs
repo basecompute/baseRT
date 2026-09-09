@@ -89,11 +89,11 @@ impl GgmlType {
             F16 | BF16 | I16 => (1, 2),
             I8 => (1, 1),
             I64 | F64 => (1, 8),
-            Q4_0 => (32, 18),  // fp16 d + 16 bytes (32 × 4-bit)
-            Q4_1 => (32, 20),  // fp16 d + fp16 m + 16 bytes
-            Q5_0 => (32, 22),  // fp16 d + 4-byte qh + 16 bytes (32 × 5-bit)
+            Q4_0 => (32, 18), // fp16 d + 16 bytes (32 × 4-bit)
+            Q4_1 => (32, 20), // fp16 d + fp16 m + 16 bytes
+            Q5_0 => (32, 22), // fp16 d + 4-byte qh + 16 bytes (32 × 5-bit)
             Q5_1 => (32, 24),
-            Q8_0 => (32, 34),  // fp16 d + 32 × i8
+            Q8_0 => (32, 34), // fp16 d + 32 × i8
             Q8_1 => (32, 36),
             Q2K => (256, 84),
             Q3K => (256, 110),
@@ -169,7 +169,11 @@ pub fn dequant_to_f32(info: &TensorInfo, bytes: &[u8]) -> Result<Vec<f32>> {
 
 fn f32_from_bytes(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if bytes.len() < n * 4 {
-        bail!("F32 byte length mismatch: got {}, need {}", bytes.len(), n * 4);
+        bail!(
+            "F32 byte length mismatch: got {}, need {}",
+            bytes.len(),
+            n * 4
+        );
     }
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -183,7 +187,11 @@ fn f32_from_bytes(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
 
 fn f16_from_bytes(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if bytes.len() < n * 2 {
-        bail!("F16 byte length mismatch: got {}, need {}", bytes.len(), n * 2);
+        bail!(
+            "F16 byte length mismatch: got {}, need {}",
+            bytes.len(),
+            n * 2
+        );
     }
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -194,7 +202,11 @@ fn f16_from_bytes(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
 
 fn bf16_from_bytes(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     if bytes.len() < n * 2 {
-        bail!("BF16 byte length mismatch: got {}, need {}", bytes.len(), n * 2);
+        bail!(
+            "BF16 byte length mismatch: got {}, need {}",
+            bytes.len(),
+            n * 2
+        );
     }
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -651,8 +663,8 @@ fn dequant_q6_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
         let sc: &[i8] = unsafe {
             std::slice::from_raw_parts(bytes[base + 128 + 64..].as_ptr() as *const i8, 16)
         };
-        let d = f16::from_le_bytes([bytes[base + 128 + 64 + 16], bytes[base + 128 + 64 + 17]])
-            .to_f32();
+        let d =
+            f16::from_le_bytes([bytes[base + 128 + 64 + 16], bytes[base + 128 + 64 + 17]]).to_f32();
 
         let out_base = b * QK_K;
         // Each block processes two 128-value halves.
@@ -663,17 +675,14 @@ fn dequant_q6_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
             let y_off = half * 128;
             for l in 0..32 {
                 let is = l / 16;
-                let q1 = ((ql[ql_off + l] & 0x0F)
-                    | ((qh[qh_off + l] & 0x03) << 4)) as i32
+                let q1 = ((ql[ql_off + l] & 0x0F) | ((qh[qh_off + l] & 0x03) << 4)) as i32 - 32;
+                let q2 = ((ql[ql_off + l + 32] & 0x0F) | (((qh[qh_off + l] >> 2) & 0x03) << 4))
+                    as i32
                     - 32;
-                let q2 = ((ql[ql_off + l + 32] & 0x0F)
-                    | (((qh[qh_off + l] >> 2) & 0x03) << 4)) as i32
-                    - 32;
-                let q3 = ((ql[ql_off + l] >> 4)
-                    | (((qh[qh_off + l] >> 4) & 0x03) << 4)) as i32
-                    - 32;
-                let q4 = ((ql[ql_off + l + 32] >> 4)
-                    | (((qh[qh_off + l] >> 6) & 0x03) << 4)) as i32
+                let q3 =
+                    ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 0x03) << 4)) as i32 - 32;
+                let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 0x03) << 4))
+                    as i32
                     - 32;
                 out[out_base + y_off + l] = d * sc[sc_off + is] as f32 * q1 as f32;
                 out[out_base + y_off + l + 32] = d * sc[sc_off + is + 2] as f32 * q2 as f32;
@@ -700,7 +709,8 @@ mod tests {
             -128, -64, 0, 64, 127, 1, -1, 100, 10, 20, 30, 40, 50, 60, 70, 80, 90, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
-        bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(qs.as_ptr() as *const u8, 32) });
+        bytes
+            .extend_from_slice(unsafe { std::slice::from_raw_parts(qs.as_ptr() as *const u8, 32) });
         let out = dequant_q8_0(&bytes, 32).unwrap();
         assert_eq!(out[0], -256.0);
         assert_eq!(out[1], -128.0);

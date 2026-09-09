@@ -31,7 +31,10 @@ pub fn pack(weights: &[f32]) -> Packed {
 /// Pack with an explicit group size (tests use smaller groups for
 /// hand-verified fixtures).
 pub fn pack_with_group_size(weights: &[f32], group_size: usize) -> Packed {
-    assert!(group_size > 0 && group_size % 2 == 0, "group_size must be even");
+    assert!(
+        group_size > 0 && group_size % 2 == 0,
+        "group_size must be even"
+    );
     assert!(
         weights.len() % group_size == 0,
         "weights.len()={} must be a multiple of group_size={}",
@@ -66,11 +69,9 @@ pub fn pack_with_group_size(weights: &[f32], group_size: usize) -> Packed {
             let q = ((val - bias) * inv_scale).round().clamp(0.0, 15.0) as u8;
             let byte_idx = (g * group_size + i) / 2;
             if i % 2 == 0 {
-                packed_weights[byte_idx] =
-                    (packed_weights[byte_idx] & 0xF0) | (q & 0x0F);
+                packed_weights[byte_idx] = (packed_weights[byte_idx] & 0xF0) | (q & 0x0F);
             } else {
-                packed_weights[byte_idx] =
-                    (packed_weights[byte_idx] & 0x0F) | ((q & 0x0F) << 4);
+                packed_weights[byte_idx] = (packed_weights[byte_idx] & 0x0F) | ((q & 0x0F) << 4);
             }
         }
     }

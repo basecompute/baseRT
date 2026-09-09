@@ -48,8 +48,8 @@ pub struct GgufFile {
 
 impl GgufFile {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let file = File::open(path.as_ref())
-            .with_context(|| format!("opening {:?}", path.as_ref()))?;
+        let file =
+            File::open(path.as_ref()).with_context(|| format!("opening {:?}", path.as_ref()))?;
         let mmap = unsafe { Mmap::map(&file)? };
         Self::from_mmap(mmap)
     }
@@ -289,6 +289,18 @@ impl KvValue {
         match self {
             KvValue::F32(f) => Some(*f),
             KvValue::F64(f) => Some(*f as f32),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            KvValue::Bool(b) => Some(*b),
+            // Some GGUF writers store boolean flags as small integers.
+            KvValue::U8(n) => Some(*n != 0),
+            KvValue::I8(n) => Some(*n != 0),
+            KvValue::U32(n) => Some(*n != 0),
+            KvValue::I32(n) => Some(*n != 0),
             _ => None,
         }
     }

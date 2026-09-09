@@ -64,7 +64,7 @@ extern "C" {
 
 #define BASERT_VERSION_MAJOR 0
 #define BASERT_VERSION_MINOR 2
-#define BASERT_VERSION_PATCH 3
+#define BASERT_VERSION_PATCH 4
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
@@ -89,7 +89,11 @@ typedef void *baseRT_model_t;
 ///   binary itself (single-file distributions ship the shared library with the
 ///   kernels linked in, so NULL just works). Named generically so non-Metal
 ///   backends (CUDA/ROCm, future) can reuse the same parameter.
-/// max_context: maximum context window (0 = use model default, capped at 4096).
+/// max_context: maximum context window. 0 = the model's trained window, capped
+///   at the chip's max prefill chunk — a shape default that ignores how much
+///   memory this device actually has. A serving front end should instead pass
+///   `baseRT_suggest_max_context()`, which derives the window from the device
+///   budget, or a number the operator chose.
 /// Returns NULL on failure.
 baseRT_model_t baseRT_load_model(const char *model_path, const char *kernel_library_path, int max_context);
 
@@ -123,6 +127,18 @@ enum {
 /// operator-facing "continuous batching disabled because ..." message), call
 /// the gated entry point once and read baseRT_get_error().
 uint32_t baseRT_capabilities(baseRT_model_t model);
+/// Hot-swap the kernel library on an already-loaded model, WITHOUT reloading
+/// weights. Weights are mmap-backed Metal buffers independent of the kernel
+/// library, so only the compiled pipelines + baked decode dispatch tables are
+/// rebuilt against the new metallib (sub-second). Built for the automated
+/// kernel-tuning loop: edit a `.metal`, `make shaders`, reload — no ~400 GB
+/// model reload per iteration. `metallib_path` NULL uses the default sidecar
+/// search (`build/baseRT.metallib`). Picks up `.metal`-only changes; a
+/// C++/param/dispatch change still needs a rebuilt binary + restart.
+/// Returns BASERT_OK, or an error code (leaves the model on the OLD library on
+/// load failure). Not supported for whisper models. NOT thread-safe against
+/// in-flight inference — serialize the caller.
+int baseRT_reload_metallib(baseRT_model_t model, const char *metallib_path);
 
 /// Override the KV cache element width for the next baseRT_load_model call.
 ///   bits = 0  → auto (per-model default; Q8_0 when head_dim%32==0)
@@ -228,6 +244,97 @@ size_t baseRT_model_config_sizeof(void);
 /// Get total GPU memory used by model (bytes).
 size_t baseRT_model_memory(baseRT_model_t model);
 
+/// The device memory budget the engine allocates within, in bytes, without
+/// needing a loaded model. NOT installed RAM: on Metal this is the unified-
+/// memory working set the OS recommends (~75% of physical RAM), on CUDA the
+/// device's total memory. 0 when no supported device is present.
+///
+/// This is the number that matters for sizing decisions — it is what the load
+/// path compares the model's working set against before warning that the OS
+/// will start paging weights.
+size_t baseRT_device_memory_budget(void);
+
+/// Floor on a window derived by `baseRT_suggest_max_context`. Policy, not a
+/// hardware limit: an explicit max_context is honoured below it. There is no
+/// corresponding ceiling — a derived window is bounded by the device's memory
+/// and by the model's trained window, and by nothing else.
+enum {
+    BASERT_AUTO_CONTEXT_MIN = 4096,
+};
+
+/// Suggest a `max_context` for `model_path` that fits this device: the memory
+/// budget above, less the weights and activation/scratch headroom, divided by
+/// what one token of KV costs across `max_batch` concurrent decode lanes. The
+/// result is a multiple of 1024, at least BASERT_AUTO_CONTEXT_MIN, and never
+/// above the model's trained window — a device with the memory for a model's
+/// whole window gets the whole window.
+///
+/// Reads the bundle's metadata only — no tensor upload, no allocation — so it
+/// is cheap enough to call before `baseRT_load_model`. A serving front end
+/// calls it once at startup instead of shipping a fixed default that is too
+/// small on a workstation and too large on a laptop.
+///
+/// max_batch: concurrent sequences the KV pool must hold (0 or 1 = single).
+///            Only counted for models the load will actually page, since a
+///            contiguous cache holds one history however wide the batch is.
+/// kv_bits:   the value that will be passed to `baseRT_set_kv_bits` (0 = auto,
+///            or 4 / 8 / 16 / 84), since KV precision changes the answer.
+/// paged_kv:  non-zero if the load will enable paged KV (`baseRT_set_paged_kv`
+///            or BaseRTLoadOptions::paged_kv). It changes both the per-layer
+///            shape and whether lanes multiply, and the two caches differ by
+///            several times on the hybrid decoders.
+/// Returns 0 if the bundle cannot be read, the device budget is unknown, or the
+/// bundle declares no trained window; the caller keeps its own default then.
+int baseRT_suggest_max_context(const char *model_path, int max_batch, int kv_bits, int paged_kv);
+
+/// As above for a set of models that will be resident AT THE SAME TIME, such
+/// as a server's eagerly loaded set. They share one budget, so their weights
+/// add up, their KV pools add up, and the window returned is the one that fits
+/// all of them at once, capped at the SHORTEST trained window among them.
+///
+/// This is not the same as calling the single-model form on each and taking
+/// the minimum: that answers "what fits this model alone", and two models that
+/// each fit alone can exceed the budget together.
+int baseRT_suggest_max_context_multi(const char *const *model_paths, int n_models, int max_batch, int kv_bits,
+                                     int paged_kv);
+
+/// Does `window` fit `model_paths` co-resident on this device, under the same
+/// budget the suggestion above derives from? 1 = yes, 0 = no, -1 = cannot tell
+/// (a bundle would not open, no trained window, unknown budget).
+///
+/// Distinct from comparing against `baseRT_suggest_max_context_multi`: that
+/// clamps its answer into the policy floor, so a set that fits NO tokens at all
+/// still reports the floor and would compare equal to it. Ask this instead
+/// before admitting a model into a window that was chosen without it.
+int baseRT_context_window_fits(const char *const *model_paths, int n_models, int max_batch, int kv_bits, int paged_kv,
+                               int window);
+/// KV-cache allocation strategy reported by BaseRTMemoryStats.
+typedef enum BaseRTKVCacheLayout {
+    BASERT_KV_CACHE_NONE = 0,
+    BASERT_KV_CACHE_CONTIGUOUS = 1,
+    BASERT_KV_CACHE_PAGED = 2,
+} BaseRTKVCacheLayout;
+
+/// Runtime-owned memory counters for an idle model handle. Capacity is the
+/// memory reserved for the KV cache; used bytes are the logical occupied
+/// portion (contiguous cache) or occupied physical blocks (paged cache).
+/// Neither value is process RSS, device-global usage, nor a peak.
+typedef struct BaseRTMemoryStats {
+    uint64_t runtime_allocated_bytes;
+    uint64_t kv_cache_capacity_bytes;
+    uint64_t kv_cache_used_bytes;
+    uint64_t kv_cache_blocks_total;
+    uint64_t kv_cache_blocks_used;
+    uint64_t kv_cache_tokens_used;
+    BaseRTKVCacheLayout kv_cache_layout;
+    uint32_t reserved;
+} BaseRTMemoryStats;
+
+/// Read current runtime and KV-cache memory counters. This is a boundary
+/// observation: call only while no inference operation is mutating `model`.
+/// Returns false for a null model or output pointer.
+bool baseRT_model_memory_stats(baseRT_model_t model, BaseRTMemoryStats *out_stats);
+
 /// Get last error message (thread-local). The string is valid until
 /// the next API call from the same thread that fails or that explicitly
 /// resets the error state. Returns "" when there is no pending error.
@@ -259,6 +366,25 @@ const char *baseRT_decode_token(baseRT_model_t model, uint32_t token_id);
 /// `top_logprobs` alternatives for `/v1/chat/completions`). The returned
 /// string lives in a thread-local buffer that is overwritten on each call.
 const char *baseRT_decode_token_static(baseRT_model_t model, uint32_t token_id);
+
+/// A caller-owned incremental-decode stream: the same UTF-8 assembly and
+/// channel-protocol normalization `baseRT_decode_token` applies (gpt-oss
+/// Harmony and Muse framing become reasoning spans / ChatML tool-call
+/// blocks), but with state private to this stream. One per continuously
+/// batched lane; the model's own stream is untouched.
+typedef struct baseRT_decode_stream *baseRT_decode_stream_t;
+baseRT_decode_stream_t baseRT_decode_stream_create(baseRT_model_t model);
+void baseRT_decode_stream_reset(baseRT_decode_stream_t stream);
+/// Returns a pointer into the stream's own buffer, valid until the next
+/// call on the same stream.
+const char *baseRT_decode_stream_token(baseRT_decode_stream_t stream, uint32_t token_id);
+void baseRT_decode_stream_free(baseRT_decode_stream_t stream);
+
+/// 1 when `token_id` ends the assistant turn: the bundle's eos_token_id OR
+/// any of its extra end-of-turn ids (Llama 3's <|eot_id|>, gpt-oss's
+/// <|call|> and <|endoftext|>, …). `baseRT_eos_token_id` reports only the
+/// first; a lane that compares against that alone runs past the others.
+int baseRT_is_eos_token(baseRT_model_t model, uint32_t token_id);
 
 /// Length-preserving variant of `baseRT_decode_token_static` for callers
 /// that need the token's EXACT raw bytes. Byte-level BPE / byte-fallback
@@ -810,6 +936,18 @@ uint32_t baseRT_prefill(baseRT_model_t model, const uint32_t *tokens, int n_toke
 /// on error).
 int baseRT_read_logits(baseRT_model_t model, float *out, int max_logits);
 
+/// Sliding-window teacher-forced perplexity of `tokens[0..n_tokens)` on this
+/// model. For each start position (advanced by `stride`, up to `max_positions`;
+/// <=0 means unbounded), prefills the preceding `window` tokens with a fresh KV
+/// cache and accumulates -log P(true next token); PPL = exp(mean NLL). Leaves
+/// the model's KV cache reset. Writes exp(mean NLL) to `*out_ppl` and the number
+/// of scored positions to `*out_positions` (either may be NULL). This is the
+/// exact loop the `baseRT_ppl` tool runs, exposed so a resident server can gate
+/// accuracy without a second model load. Returns BASERT_OK or an error code.
+/// NOT thread-safe against concurrent inference on the same model.
+int baseRT_perplexity(baseRT_model_t model, const uint32_t *tokens, int n_tokens, int window, int stride,
+                      int max_positions, double *out_ppl, int *out_positions);
+
 /// Multimodal prefill: run vision tower on image, then prefill tokens with
 /// image features spliced at positions where tokens[i] == config.image_token_id.
 /// The number of image placeholder tokens in the stream must equal the image's
@@ -875,6 +1013,13 @@ int baseRT_load_state(baseRT_model_t model, const char *path);
 /// plus metadata `lora.rank` (int) and `lora.alpha` (float). After load,
 /// every forward pass that runs a GEMM with a tensor_name registered in
 /// the adapter has a post-GEMM low-rank delta applied (`y += B @ A @ x`).
+///
+/// While an adapter is active, single-sequence decode skips the baked
+/// dispatch-table replay (the table carries no delta dispatches) and takes
+/// the per-token immediate encode instead — correct output at reduced
+/// decode throughput. Speculative decode is likewise disabled for the
+/// duration. The batched multi-sequence API (`baseRT_batch_step*`) does
+/// NOT apply adapters.
 ///
 /// Calling `baseRT_lora_load` again replaces the active adapter (no
 /// stacking). Returns 0 on success, negative on failure (see
@@ -1013,6 +1158,13 @@ const char *baseRT_bos_token(baseRT_model_t model);
 /// BOS token id, for callers that need to prepend BOS to raw token
 /// sequences (e.g. perplexity windows on BOS-sensitive models).
 uint32_t baseRT_bos_id(baseRT_model_t model);
+
+/// 1 when the tokenizer prepends BOS to encoded text (the model was trained
+/// with a leading BOS), 0 when it does not (byte-level BPE families such as
+/// GPT-2 / o200k). baseRT_bos_id can still name a token in the 0 case;
+/// callers that synthesize a sequence start (perplexity windows) must key
+/// on this, not on bos_id being valid.
+int baseRT_add_bos(baseRT_model_t model);
 const char *baseRT_eos_token(baseRT_model_t model);
 
 /// Primary end-of-sequence token id (the one the continuous-batching engine and

@@ -61,9 +61,7 @@ fn awq_then_rtn_mse(
     // `weights` here is post-AWQ rotation; inverse_scales undo it.
     let original_unrotated: Vec<f32> = (0..out_features)
         .flat_map(|i| {
-            (0..in_features).map(move |j| {
-                weights[i * in_features + j] * inverse_scales[j]
-            })
+            (0..in_features).map(move |j| weights[i * in_features + j] * inverse_scales[j])
         })
         .collect();
     for i in 0..out_features {
@@ -101,15 +99,7 @@ fn awq_plus_rtn_beats_plain_rtn_at_q2() {
     let rotated = awq_apply(&weights, n_in, &plan.scales);
 
     let plain = rtn_mse(&weights, n_in, n_out, 2, 32, false);
-    let awq = awq_then_rtn_mse(
-        &rotated,
-        n_in,
-        n_out,
-        &plan.inverse_scales,
-        2,
-        32,
-        false,
-    );
+    let awq = awq_then_rtn_mse(&rotated, n_in, n_out, &plan.inverse_scales, 2, 32, false);
 
     assert!(
         awq < plain,
@@ -137,15 +127,7 @@ fn awq_plus_rtn_at_q4_does_not_regress() {
     let rotated = awq_apply(&weights, n_in, &plan.scales);
 
     let plain = rtn_mse(&weights, n_in, n_out, 4, 64, false);
-    let awq = awq_then_rtn_mse(
-        &rotated,
-        n_in,
-        n_out,
-        &plan.inverse_scales,
-        4,
-        64,
-        false,
-    );
+    let awq = awq_then_rtn_mse(&rotated, n_in, n_out, &plan.inverse_scales, 4, 64, false);
 
     // Non-regression invariant: AWQ search includes α=0, so the
     // optimum is by construction never worse than plain.
@@ -176,15 +158,7 @@ fn awq_lite_is_a_safe_fallback() {
     let rotated = awq_apply(&weights, n_in, &plan.scales);
 
     let plain = rtn_mse(&weights, n_in, n_out, 4, 64, false);
-    let lite = awq_then_rtn_mse(
-        &rotated,
-        n_in,
-        n_out,
-        &plan.inverse_scales,
-        4,
-        64,
-        false,
-    );
+    let lite = awq_then_rtn_mse(&rotated, n_in, n_out, &plan.inverse_scales, 4, 64, false);
 
     // Uniform absmax → AWQ-lite is identity; lite ≈ plain.
     assert!(

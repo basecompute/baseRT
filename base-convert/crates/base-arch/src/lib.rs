@@ -8,8 +8,11 @@
 
 pub mod bert;
 pub mod gemma;
+pub mod glm;
+pub mod gpt_oss;
 pub mod llama;
 pub mod muse_glimmer;
+pub mod nemotron;
 pub mod qwen;
 pub mod tokenizer;
 pub mod whisper;
@@ -38,7 +41,10 @@ pub fn source_mapper_for_gguf(arch: &str) -> Option<&'static dyn GgufMapper> {
         "qwen2moe" | "qwen3moe" | "qwen35moe" | "qwen36moe" => Some(&qwen::QwenMoeMapper),
         "gemma" | "gemma2" | "gemma3" => Some(&gemma::Gemma3Mapper),
         "gemma4" => Some(&gemma::Gemma4Mapper),
+        "nemotron_h" | "nemotron_h_moe" => Some(&nemotron::NemotronHMapper),
         "nomic-bert" => Some(&bert::NomicBertMapper),
+        // GLM 5.2 — DeepSeek-V3.2-style MLA + sparse-attention MoE.
+        "glm-dsa" => Some(&glm::GlmDsaMapper),
         // Muse Glimmer. `general.architecture` in the llama.cpp-produced
         // GGUF is the HYPHENATED "muse-glimmer" (llama.cpp's arch registry
         // spells multi-word archs with hyphens: "nomic-bert",
@@ -54,6 +60,28 @@ pub fn source_mapper_for_gguf(arch: &str) -> Option<&'static dyn GgufMapper> {
 /// HF config.json model_type → mapper. HF tensor names already follow
 /// canonical convention, so the mapper only needs to extract ArchConfig
 /// from config.json — no tensor renaming.
+/// An element-wise reparameterization undone at convert time.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ValueTransform {
+    /// `x -> -exp(x)`. Mamba-2 checkpoints store the state-transition
+    /// matrix as `A_log` and materialize `A = -exp(A_log)` in the model
+    /// code; the value the scan kernel wants is `A`, which must be
+    /// negative for the recurrence to decay.
+    NegExp,
+}
+
+impl ValueTransform {
+    pub fn apply(self, values: &mut [f32]) {
+        match self {
+            ValueTransform::NegExp => {
+                for v in values.iter_mut() {
+                    *v = -v.exp();
+                }
+            }
+        }
+    }
+}
+
 pub trait HfMapper: Sync {
     fn canonical_arch(&self) -> &'static str;
     fn config_from_hf(&self, config: &serde_json::Value) -> anyhow::Result<ArchConfig>;
@@ -83,6 +111,30 @@ pub trait HfMapper: Sync {
         None
     }
 
+    /// Element-wise transform to apply to a tensor's values on the way
+    /// from HF to `.base`, or `None` to copy them through.
+    ///
+    /// Some architectures store a *reparameterized* weight that the
+    /// reference implementation undoes at load or at run time, while
+    /// the GGUF conversion bakes the undo in. Baking it at convert time
+    /// keeps the runtime kernel simple and keeps bundles from the two
+    /// sources interchangeable.
+    fn value_transform(&self, _canonical: &str) -> Option<ValueTransform> {
+        None
+    }
+
+    /// Write tensor `shape` fastest-varying dim first (GGUF's `ne`
+    /// order, `[in, out]`) instead of HF's C order (`[out, in]`).
+    ///
+    /// The two describe the *same bytes* — an HF `[out, in]` matrix is
+    /// stored with `in` contiguous, exactly like a GGUF `[in, out]` one
+    /// — so this changes how the header reports a tensor, not the
+    /// buffer behind it. Set it on architectures whose GGUF-converted
+    /// bundles are already in circulation, so a bundle built from either
+    /// source describes itself identically. Default: keep HF order.
+    fn shape_fastest_first(&self) -> bool {
+        false
+    }
     /// RMS-normalize each ROW of a 2-D tensor at HF→.base conversion
     /// time, returning the epsilon to use, or None to leave it alone.
     ///
@@ -151,6 +203,13 @@ pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMappe
         // text conversion skips like any other non-text tower. Config is
         // gemma4-shaped (uniform head_dim, rope_parameters, layer_types).
         "gemma4" | "gemma4_text" | "gemma4_unified" => Some(&gemma::Gemma4HfMapper),
+        // Nemotron-H hybrid (Mamba-2 + attention + MoE). The HF
+        // `model_type` is `nemotron_h` for both the dense and MoE
+        // builds — the block schedule comes from
+        // `hybrid_override_pattern`, and the MoE keys are simply absent
+        // on a dense checkpoint — so one mapper covers both. Canonical
+        // arch stays `nemotron_h_moe` to match the GGUF path.
+        "nemotron_h" | "nemotron_h_moe" => Some(&nemotron::NemotronHHfMapper),
         // Whisper encoder-decoder speech models (openai/whisper-*). HF
         // safetensors only — whisper GGML files are not GGUF, so the GGUF
         // dispatch table stays untouched. Tensor renaming is
@@ -158,6 +217,11 @@ pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMappe
         // path emits everything as f16 (the engine's fused whisper
         // kernels are f16-only in v1).
         "whisper" => Some(&whisper::WhisperHfMapper),
+        // GLM 5.2 — DeepSeek-V3.2-style MLA + DSA MoE. HF/MLX
+        // checkpoints declare `model_type: glm_moe_dsa`.
+        "glm_moe_dsa" => Some(&glm::GlmDsaMapper),
+        // OpenAI gpt-oss (MXFP4 MoE, attention sinks, YaRN, alternating SWA).
+        "gpt_oss" => Some(&gpt_oss::GptOssHfMapper),
         _ => None,
     }
 }
@@ -190,6 +254,8 @@ pub const SUPPORTED_HF_MODEL_TYPES: &[&str] = &[
     "muse_glimmer",
     "muse_glimmer_text",
     "whisper",
+    "glm_moe_dsa",
+    "gpt_oss",
 ];
 
 pub trait GgufMapper: Sync {
@@ -393,6 +459,43 @@ pub struct ArchConfig {
     /// concatenating them (Qwen3.5 = true).
     pub mrope_interleaved: bool,
 
+    // ── gpt-oss fields (zero/false for other archs) ──────────────────
+    /// YaRN correction-range betas (HF `rope_scaling.beta_fast` /
+    /// `beta_slow`). Only meaningful when `rope_scaling_type == "yarn"`.
+    pub rope_yarn_beta_fast: f32,
+    pub rope_yarn_beta_slow: f32,
+    /// YaRN `truncate` (HF `rope_scaling.truncate`, default true): floor/ceil
+    /// the correction range. gpt-oss ships `false` (continuous ramp bounds).
+    pub rope_yarn_truncate: bool,
+    /// Clamped-SwiGLU limit (`gate <= limit`, `|up| <= limit`) and the
+    /// swish alpha (`gate * sigmoid(alpha * gate)`). 0 = plain SwiGLU.
+    pub swiglu_limit: f32,
+    pub swiglu_alpha: f32,
+    /// Learned per-head attention sinks (`self_attn.sinks`).
+    pub attention_sinks: bool,
+    /// q/k/v/o projections carry biases.
+    pub attention_bias: bool,
+
+    // ── Nemotron-H / Mamba-2 SSM fields (zero for non-SSM archs) ─────
+    // Nemotron-H interleaves Mamba-2 SSM blocks, GQA attention blocks
+    // and (MoE) FFN blocks — the schedule rides in `layer_types`
+    // ("mamba" | "attention" | "moe" | "mlp").
+    /// Mamba-2 SSM state size per head (`d_state`). 0 = no SSM.
+    pub ssm_state_size: u32,
+    /// Causal depthwise conv kernel width in the SSM mixer (`d_conv`).
+    pub ssm_conv_kernel: u32,
+    /// Number of B/C groups (`n_groups`).
+    pub ssm_num_groups: u32,
+    /// SSM inner width (`d_inner` = heads × head dim).
+    pub ssm_inner_size: u32,
+    /// Number of SSM heads (GGUF stores this in `ssm.time_step_rank`
+    /// for Mamba-2 checkpoints).
+    pub ssm_num_heads: u32,
+
+    // ── MoE routing extensions (DeepSeek-style routers) ──────────────
+    /// Routed-expert scaling factor applied after top-k
+    /// renormalization (Nemotron 3 Nano: 2.5). 0 = none.
+    pub expert_weights_scale: f32,
     // ── Whisper encoder-decoder fields (zero/empty for other archs) ──
     // The decoder half reuses the standard fields above (hidden_size /
     // num_hidden_layers / num_attention_heads / intermediate_size /
@@ -446,6 +549,66 @@ pub struct ArchConfig {
     pub max_source_positions: u32,
     /// Decoder positional-embedding length (`max_target_positions`, 448).
     pub max_target_positions: u32,
+
+    // ── GLM-DSA / DeepSeek-V3.2-style MLA + sparse-attention fields ───
+    // (all zero for other archs). GLM 5.2 uses Multi-head Latent
+    // Attention (compressed q/kv latents + decoupled RoPE) plus a
+    // DeepSeek Sparse Attention "lightning indexer", with a sigmoid-gated
+    // MoE (bias-corrected top-k, routed weight scaling, shared expert)
+    // and the first `first_k_dense_replace` layers dense.
+    /// MLA query compression rank (`attn_q_a` output width). 0 = not MLA.
+    pub q_lora_rank: u32,
+    /// MLA key/value compression rank (`attn_kv_a_mqa` kv part). 0 = not MLA.
+    pub kv_lora_rank: u32,
+    /// Per-head non-positional Q/K dim (the part that attends in latent
+    /// space via k_b). GLM 5.2 = 192.
+    pub qk_nope_head_dim: u32,
+    /// Per-head decoupled-RoPE Q/K dim (the only rotated part). GLM 5.2 = 64.
+    pub qk_rope_head_dim: u32,
+    /// Per-head value dim after v_b up-projection. GLM 5.2 = 256.
+    pub v_head_dim: u32,
+    /// Routed-expert output scaling (DeepSeek `routed_scaling_factor`).
+    /// GLM 5.2 = 2.5. 0 = no scaling.
+    pub routed_scaling_factor: f32,
+    /// Expert gating function: 0 = softmax (default), 1 = sigmoid
+    /// (GLM/DeepSeek; GGUF `expert_gating_func = 2`).
+    pub expert_gating: u32,
+    /// First N layers use a dense SwiGLU FFN instead of MoE
+    /// (`leading_dense_block_count` / HF `first_k_dense_replace`).
+    /// GLM 5.2 = 3. 0 = all MoE layers.
+    pub first_k_dense_replace: u32,
+    /// Multi-Token-Prediction (nextn) head layer count. Tensors are
+    /// dropped at convert time; kept for the header record. GLM 5.2 = 1.
+    pub nextn_predict_layers: u32,
+    /// DSA lightning-indexer head count. GLM 5.2 = 32. 0 = no indexer.
+    pub indexer_head_count: u32,
+    /// DSA indexer per-head key dim. GLM 5.2 = 128.
+    pub indexer_key_length: u32,
+    /// DSA indexer top-k keys selected per query. GLM 5.2 = 2048.
+    pub indexer_top_k: u32,
+    /// Per-layer indexer kind: "full" (layer computes its own top-k
+    /// selection and carries indexer weights) or "shared" (layer reuses
+    /// the most recent full layer's selection; NO indexer weights).
+    /// GLM 5.2: 21 full / 57 shared. Empty = every layer is full (the
+    /// GGUF metadata doesn't carry the pattern). HF `indexer_types`.
+    pub indexer_layer_types: Vec<String>,
+    /// Selection-reuse period for shared indexer layers (HF
+    /// `index_topk_freq`). GLM 5.2 = 4. 0 = unset.
+    pub index_topk_freq: u32,
+    /// Offset into the reuse period (HF `index_skip_topk_offset`).
+    /// GLM 5.2 = 3. Only meaningful when `index_topk_freq > 0`.
+    pub index_skip_topk_offset: u32,
+    /// Indexer RoPE layout: true = interleaved/traditional (GPT-J
+    /// adjacent-pair — what mlx-lm applies via `traditional=True`),
+    /// false = NeoX half-split. HF `indexer_rope_interleave`.
+    /// GLM 5.2 = true. NOTE: llama.cpp's deepseek32 reference uses NeoX
+    /// for its indexer; GLM's config + the MLX implementation say
+    /// interleaved. Trust this flag, not the deepseek32 source.
+    pub indexer_rope_interleave: bool,
+    /// Whether MTP iterations reuse the same top-k selection (HF
+    /// `index_share_for_mtp_iteration`). Recorded for the header; only
+    /// relevant once MTP lands.
+    pub index_share_for_mtp_iteration: bool,
 }
 
 impl ArchConfig {
@@ -506,14 +669,17 @@ impl ArchConfig {
         }
         if self.num_experts > 0 {
             m.insert("num_experts".into(), json!(self.num_experts));
-            m.insert("num_experts_per_tok".into(), json!(self.num_experts_per_tok));
-            m.insert("moe_intermediate_size".into(), json!(self.moe_intermediate_size));
+            m.insert(
+                "num_experts_per_tok".into(),
+                json!(self.num_experts_per_tok),
+            );
+            m.insert(
+                "moe_intermediate_size".into(),
+                json!(self.moe_intermediate_size),
+            );
             m.insert("norm_topk_prob".into(), json!(self.norm_topk_prob));
             if self.num_shared_experts > 0 {
-                m.insert(
-                    "num_shared_experts".into(),
-                    json!(self.num_shared_experts),
-                );
+                m.insert("num_shared_experts".into(), json!(self.num_shared_experts));
             }
         }
         if self.max_position_embeddings > 0 {
@@ -595,7 +761,10 @@ impl ArchConfig {
                 "linear_num_value_heads".into(),
                 json!(self.linear_num_value_heads),
             );
-            m.insert("linear_key_head_dim".into(), json!(self.linear_key_head_dim));
+            m.insert(
+                "linear_key_head_dim".into(),
+                json!(self.linear_key_head_dim),
+            );
             m.insert(
                 "linear_value_head_dim".into(),
                 json!(self.linear_value_head_dim),
@@ -635,6 +804,45 @@ impl ArchConfig {
             m.insert("mrope_section".into(), json!(self.mrope_section));
             m.insert("mrope_interleaved".into(), json!(self.mrope_interleaved));
         }
+        // gpt-oss fields — emitted only when set.
+        if self.rope_yarn_beta_fast > 0.0 {
+            m.insert(
+                "rope_yarn_beta_fast".into(),
+                json!(self.rope_yarn_beta_fast),
+            );
+            m.insert(
+                "rope_yarn_beta_slow".into(),
+                json!(self.rope_yarn_beta_slow),
+            );
+            m.insert("rope_yarn_truncate".into(), json!(self.rope_yarn_truncate));
+        }
+        if self.swiglu_limit > 0.0 {
+            m.insert("swiglu_limit".into(), json!(self.swiglu_limit));
+            m.insert("swiglu_alpha".into(), json!(self.swiglu_alpha));
+        }
+        if self.attention_sinks {
+            m.insert("attention_sinks".into(), json!(true));
+        }
+        if self.attention_bias {
+            m.insert("attention_bias".into(), json!(true));
+        }
+        // Nemotron-H / Mamba-2 SSM fields — only emit when set.
+        if self.ssm_inner_size > 0 {
+            m.insert("ssm_state_size".into(), json!(self.ssm_state_size));
+            m.insert("ssm_conv_kernel".into(), json!(self.ssm_conv_kernel));
+            m.insert("ssm_num_groups".into(), json!(self.ssm_num_groups));
+            m.insert("ssm_inner_size".into(), json!(self.ssm_inner_size));
+            m.insert("ssm_num_heads".into(), json!(self.ssm_num_heads));
+        }
+        if self.expert_gating > 0 {
+            m.insert("expert_gating".into(), json!(self.expert_gating));
+        }
+        if self.expert_weights_scale > 0.0 {
+            m.insert(
+                "expert_weights_scale".into(),
+                json!(self.expert_weights_scale),
+            );
+        }
         // Whisper encoder-decoder fields — only emit when the encoder
         // half is populated so decoder-only archs' headers stay tidy.
         if self.encoder_layers > 0 {
@@ -662,6 +870,73 @@ impl ArchConfig {
             // `norm_eps` (rms_norm_eps above carries the same value for
             // struct-level uniformity).
             m.insert("norm_eps".into(), json!(self.rms_norm_eps));
+        }
+        // GLM-DSA / MLA + sparse-attention fields — only emit when set so
+        // other archs' headers stay tidy. The runtime reads these back in
+        // BaseWeightStore::extract_config.
+        if self.q_lora_rank > 0 {
+            m.insert("q_lora_rank".into(), json!(self.q_lora_rank));
+        }
+        if self.kv_lora_rank > 0 {
+            m.insert("kv_lora_rank".into(), json!(self.kv_lora_rank));
+        }
+        if self.qk_nope_head_dim > 0 {
+            m.insert("qk_nope_head_dim".into(), json!(self.qk_nope_head_dim));
+        }
+        if self.qk_rope_head_dim > 0 {
+            m.insert("qk_rope_head_dim".into(), json!(self.qk_rope_head_dim));
+        }
+        if self.v_head_dim > 0 {
+            m.insert("v_head_dim".into(), json!(self.v_head_dim));
+        }
+        if self.routed_scaling_factor > 0.0 {
+            m.insert(
+                "routed_scaling_factor".into(),
+                json!(self.routed_scaling_factor),
+            );
+        }
+        // expert_gating is meaningful even when 0 (softmax) for MoE models,
+        // but we only emit non-default sigmoid to keep other headers tidy.
+        if self.expert_gating > 0 {
+            m.insert("expert_gating".into(), json!(self.expert_gating));
+        }
+        if self.first_k_dense_replace > 0 {
+            m.insert(
+                "first_k_dense_replace".into(),
+                json!(self.first_k_dense_replace),
+            );
+        }
+        if self.nextn_predict_layers > 0 {
+            m.insert(
+                "nextn_predict_layers".into(),
+                json!(self.nextn_predict_layers),
+            );
+        }
+        if self.indexer_head_count > 0 {
+            m.insert("indexer_head_count".into(), json!(self.indexer_head_count));
+            m.insert("indexer_key_length".into(), json!(self.indexer_key_length));
+            m.insert("indexer_top_k".into(), json!(self.indexer_top_k));
+        }
+        // DSA full/shared layer pattern — present only on sources that
+        // declare it (the MLX/HF config.json; GGUF metadata doesn't).
+        if !self.indexer_layer_types.is_empty() {
+            m.insert(
+                "indexer_layer_types".into(),
+                json!(self.indexer_layer_types),
+            );
+            m.insert("index_topk_freq".into(), json!(self.index_topk_freq));
+            m.insert(
+                "index_skip_topk_offset".into(),
+                json!(self.index_skip_topk_offset),
+            );
+            m.insert(
+                "indexer_rope_interleave".into(),
+                json!(self.indexer_rope_interleave),
+            );
+            m.insert(
+                "index_share_for_mtp_iteration".into(),
+                json!(self.index_share_for_mtp_iteration),
+            );
         }
         m
     }

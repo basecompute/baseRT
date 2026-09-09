@@ -84,8 +84,8 @@ fn to_e4m3(x: f32) -> (u8, f32) {
     }
     let exp = x.log2().floor() as i32;
     let mantissa_f = x / 2f32.powi(exp); // in [1, 2)
-    // 3-bit mantissa → 8 bins in [1, 2) spanning mantissa = 1.0..1.875
-    // (values are 1 + n/8).
+                                         // 3-bit mantissa → 8 bins in [1, 2) spanning mantissa = 1.0..1.875
+                                         // (values are 1 + n/8).
     let man_q_bits = ((mantissa_f - 1.0) * 8.0).round().clamp(0.0, 7.0) as u32;
     let man_q = 1.0 + (man_q_bits as f32) / 8.0;
 

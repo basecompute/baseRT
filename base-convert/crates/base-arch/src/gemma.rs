@@ -129,14 +129,14 @@ impl crate::HfMapper for Gemma4HfMapper {
         // `head_dim` (HF) = SWA head dim (256 on E2B/E4B);
         // `global_head_dim` (HF) = Global head dim (512 on E2B/E4B).
         config.head_dim_swa = u32_key("head_dim").unwrap_or(config.head_dim);
-        config.head_dim_global =
-            u32_key("global_head_dim").unwrap_or(config.head_dim_swa);
+        config.head_dim_global = u32_key("global_head_dim").unwrap_or(config.head_dim_swa);
         let num_kv_shared = u32_key("num_kv_shared_layers").unwrap_or(0);
-        config.n_layer_kv_from_start = if num_kv_shared > 0 && num_kv_shared < config.num_hidden_layers {
-            config.num_hidden_layers - num_kv_shared
-        } else {
-            config.num_hidden_layers
-        };
+        config.n_layer_kv_from_start =
+            if num_kv_shared > 0 && num_kv_shared < config.num_hidden_layers {
+                config.num_hidden_layers - num_kv_shared
+            } else {
+                config.num_hidden_layers
+            };
         config.logit_softcap = f32_key("final_logit_softcapping").unwrap_or(0.0);
         config.sliding_window = u32_key("sliding_window").unwrap_or(0);
 
@@ -150,9 +150,7 @@ impl crate::HfMapper for Gemma4HfMapper {
                 if let Some(theta) = full.get("rope_theta").and_then(|v| v.as_f64()) {
                     config.rope_theta = theta as f32;
                 }
-                if let Some(prf) =
-                    full.get("partial_rotary_factor").and_then(|v| v.as_f64())
-                {
+                if let Some(prf) = full.get("partial_rotary_factor").and_then(|v| v.as_f64()) {
                     config.global_rope_partial_factor = prf as f32;
                 }
             }
@@ -172,7 +170,11 @@ impl crate::HfMapper for Gemma4HfMapper {
         if let Some(arr) = source.get("layer_types").and_then(|v| v.as_array()) {
             config.swa_layers = arr
                 .iter()
-                .map(|v| v.as_str().map(|s| s == "sliding_attention").unwrap_or(false))
+                .map(|v| {
+                    v.as_str()
+                        .map(|s| s == "sliding_attention")
+                        .unwrap_or(false)
+                })
                 .collect();
             config.per_layer_attn = arr
                 .iter()
@@ -188,10 +190,7 @@ impl crate::HfMapper for Gemma4HfMapper {
             .get("sliding_window_pattern")
             .and_then(|v| v.as_array())
         {
-            config.swa_layers = arr
-                .iter()
-                .map(|v| v.as_bool().unwrap_or(false))
-                .collect();
+            config.swa_layers = arr.iter().map(|v| v.as_bool().unwrap_or(false)).collect();
             config.per_layer_attn = config
                 .swa_layers
                 .iter()
@@ -261,13 +260,14 @@ fn extract_config(m: &BTreeMap<String, KvValue>, prefix: &str) -> Result<ArchCon
                 .iter()
                 .filter_map(|v| v.as_u64().map(|n| n as u32))
                 .collect();
-            let default_kv = per_layer.iter().max().copied().unwrap_or(num_attention_heads);
+            let default_kv = per_layer
+                .iter()
+                .max()
+                .copied()
+                .unwrap_or(num_attention_heads);
             (default_kv, per_layer)
         }
-        Some(_) => (
-            u32_key(&kv_key).unwrap_or(num_attention_heads),
-            Vec::new(),
-        ),
+        Some(_) => (u32_key(&kv_key).unwrap_or(num_attention_heads), Vec::new()),
         None => (num_attention_heads, Vec::new()),
     };
 
@@ -499,11 +499,9 @@ impl GgufMapper for Gemma4Mapper {
         // 1/sqrt(head_dim) like other archs).
         config.attention_scale = 1.0;
 
-        config.n_embd_per_layer =
-            u32_key("gemma4.embedding_length_per_layer_input").unwrap_or(0);
+        config.n_embd_per_layer = u32_key("gemma4.embedding_length_per_layer_input").unwrap_or(0);
 
-        config.head_dim_global =
-            u32_key("gemma4.attention.key_length").unwrap_or(config.head_dim);
+        config.head_dim_global = u32_key("gemma4.attention.key_length").unwrap_or(config.head_dim);
         config.head_dim_swa =
             u32_key("gemma4.attention.key_length_swa").unwrap_or(config.head_dim_global);
 
@@ -511,17 +509,15 @@ impl GgufMapper for Gemma4Mapper {
         // layer's KV cache. n_layer_kv_from_start is therefore
         // (n_layers - shared_kv_layers).
         let n_shared_kv = u32_key("gemma4.attention.shared_kv_layers").unwrap_or(0);
-        config.n_layer_kv_from_start =
-            if n_shared_kv > 0 && n_shared_kv < config.num_hidden_layers {
-                config.num_hidden_layers - n_shared_kv
-            } else {
-                config.num_hidden_layers
-            };
+        config.n_layer_kv_from_start = if n_shared_kv > 0 && n_shared_kv < config.num_hidden_layers
+        {
+            config.num_hidden_layers - n_shared_kv
+        } else {
+            config.num_hidden_layers
+        };
 
-        config.logit_softcap =
-            f32_key("gemma4.final_logit_softcapping").unwrap_or(0.0);
-        config.sliding_window =
-            u32_key("gemma4.attention.sliding_window").unwrap_or(0);
+        config.logit_softcap = f32_key("gemma4.final_logit_softcapping").unwrap_or(0.0);
+        config.sliding_window = u32_key("gemma4.attention.sliding_window").unwrap_or(0);
         config.rope_local_theta = f32_key("gemma4.rope.local.freq_base")
             .or_else(|| f32_key("gemma4.rope.freq_base_swa"))
             .unwrap_or(0.0);
@@ -535,8 +531,7 @@ impl GgufMapper for Gemma4Mapper {
         // absent (MLX-source bundles skip that tensor).
         if let Some(rope_dim) = u32_key("gemma4.rope.dimension_count") {
             if config.head_dim_global > 0 {
-                config.global_rope_partial_factor =
-                    rope_dim as f32 / config.head_dim_global as f32;
+                config.global_rope_partial_factor = rope_dim as f32 / config.head_dim_global as f32;
             }
         }
 
@@ -589,11 +584,21 @@ pub fn map_gemma4_mmproj_name(n: &str) -> Option<String> {
         // Patch embedder + factorized positional embedding.
         match rest {
             "patch_embedder.input_proj.weight" => return Some("vision.patch_embed.weight".into()),
-            "patch_embedder.input_proj.input_max" => return Some("vision.patch_embed.input_max".into()),
-            "patch_embedder.input_proj.input_min" => return Some("vision.patch_embed.input_min".into()),
-            "patch_embedder.input_proj.output_max" => return Some("vision.patch_embed.output_max".into()),
-            "patch_embedder.input_proj.output_min" => return Some("vision.patch_embed.output_min".into()),
-            "patch_embedder.position_embedding_table" => return Some("vision.pos_embed.weight".into()),
+            "patch_embedder.input_proj.input_max" => {
+                return Some("vision.patch_embed.input_max".into())
+            }
+            "patch_embedder.input_proj.input_min" => {
+                return Some("vision.patch_embed.input_min".into())
+            }
+            "patch_embedder.input_proj.output_max" => {
+                return Some("vision.patch_embed.output_max".into())
+            }
+            "patch_embedder.input_proj.output_min" => {
+                return Some("vision.patch_embed.output_min".into())
+            }
+            "patch_embedder.position_embedding_table" => {
+                return Some("vision.pos_embed.weight".into())
+            }
             _ => {}
         }
         // encoder.layers.{n}.<suffix>
@@ -616,11 +621,21 @@ pub fn map_gemma4_mmproj_name(n: &str) -> Option<String> {
     if let Some(rest) = n.strip_prefix("audio_tower.") {
         // SubSampleConvProjection (front-end).
         match rest {
-            "subsample_conv_projection.layer0.conv.weight" => return Some("audio.sscp.layer0.conv.weight".into()),
-            "subsample_conv_projection.layer0.norm.weight" => return Some("audio.sscp.layer0.norm.weight".into()),
-            "subsample_conv_projection.layer1.conv.weight" => return Some("audio.sscp.layer1.conv.weight".into()),
-            "subsample_conv_projection.layer1.norm.weight" => return Some("audio.sscp.layer1.norm.weight".into()),
-            "subsample_conv_projection.input_proj_linear.weight" => return Some("audio.sscp.proj.weight".into()),
+            "subsample_conv_projection.layer0.conv.weight" => {
+                return Some("audio.sscp.layer0.conv.weight".into())
+            }
+            "subsample_conv_projection.layer0.norm.weight" => {
+                return Some("audio.sscp.layer0.norm.weight".into())
+            }
+            "subsample_conv_projection.layer1.conv.weight" => {
+                return Some("audio.sscp.layer1.conv.weight".into())
+            }
+            "subsample_conv_projection.layer1.norm.weight" => {
+                return Some("audio.sscp.layer1.norm.weight".into())
+            }
+            "subsample_conv_projection.input_proj_linear.weight" => {
+                return Some("audio.sscp.proj.weight".into())
+            }
             "output_proj.weight" => return Some("audio.output_proj.weight".into()),
             "output_proj.bias" => return Some("audio.output_proj.bias".into()),
             _ => {}
@@ -657,12 +672,16 @@ fn vision_layer_suffix(s: &str) -> Option<String> {
         _ => {}
     }
     // Self-attention: q/k/v/o proj and qk-norm.
-    if let Some(out) = strip_clipped_proj(s, "self_attn", &[
-        ("q_proj", "attention.q"),
-        ("k_proj", "attention.k"),
-        ("v_proj", "attention.v"),
-        ("o_proj", "attention.output"),
-    ]) {
+    if let Some(out) = strip_clipped_proj(
+        s,
+        "self_attn",
+        &[
+            ("q_proj", "attention.q"),
+            ("k_proj", "attention.k"),
+            ("v_proj", "attention.v"),
+            ("o_proj", "attention.output"),
+        ],
+    ) {
         return Some(out);
     }
     if s == "self_attn.q_norm.weight" {
@@ -672,11 +691,15 @@ fn vision_layer_suffix(s: &str) -> Option<String> {
         return Some("attention.k_norm.weight".into());
     }
     // MLP (GeGLU): gate / up / down with clipped-linear bounds.
-    if let Some(out) = strip_clipped_proj(s, "mlp", &[
-        ("gate_proj", "ffn.gate"),
-        ("up_proj", "ffn.up"),
-        ("down_proj", "ffn.down"),
-    ]) {
+    if let Some(out) = strip_clipped_proj(
+        s,
+        "mlp",
+        &[
+            ("gate_proj", "ffn.gate"),
+            ("up_proj", "ffn.up"),
+            ("down_proj", "ffn.down"),
+        ],
+    ) {
         return Some(out);
     }
     None
@@ -846,14 +869,17 @@ mod tests {
         g.insert(
             "gemma4.attention.head_count_kv".into(),
             KvValue::Array(
-                std::iter::repeat_n([
-                    KvValue::U32(8),
-                    KvValue::U32(8),
-                    KvValue::U32(8),
-                    KvValue::U32(8),
-                    KvValue::U32(8),
-                    KvValue::U32(2),
-                ], 5)
+                std::iter::repeat_n(
+                    [
+                        KvValue::U32(8),
+                        KvValue::U32(8),
+                        KvValue::U32(8),
+                        KvValue::U32(8),
+                        KvValue::U32(8),
+                        KvValue::U32(2),
+                    ],
+                    5,
+                )
                 .flatten()
                 .collect(),
             ),
@@ -866,7 +892,10 @@ mod tests {
         g.insert("gemma4.attention.key_length".into(), KvValue::U32(512));
         g.insert("gemma4.attention.value_length".into(), KvValue::U32(512));
         g.insert("gemma4.attention.key_length_swa".into(), KvValue::U32(256));
-        g.insert("gemma4.attention.value_length_swa".into(), KvValue::U32(256));
+        g.insert(
+            "gemma4.attention.value_length_swa".into(),
+            KvValue::U32(256),
+        );
         g.insert("gemma4.vocab_size".into(), KvValue::U32(262144));
         g.insert("gemma4.rope.freq_base".into(), KvValue::F32(1_000_000.0));
         g.insert("gemma4.rope.freq_base_swa".into(), KvValue::F32(10_000.0));
@@ -878,23 +907,23 @@ mod tests {
         );
         g.insert("gemma4.expert_count".into(), KvValue::U32(128));
         g.insert("gemma4.expert_used_count".into(), KvValue::U32(8));
-        g.insert(
-            "gemma4.final_logit_softcapping".into(),
-            KvValue::F32(30.0),
-        );
+        g.insert("gemma4.final_logit_softcapping".into(), KvValue::F32(30.0));
         g.insert("gemma4.attention.sliding_window".into(), KvValue::U32(1024));
         g.insert("gemma4.attention.shared_kv_layers".into(), KvValue::U32(0));
         g.insert(
             "gemma4.attention.sliding_window_pattern".into(),
             KvValue::Array(
-                std::iter::repeat_n([
-                    KvValue::Bool(true),
-                    KvValue::Bool(true),
-                    KvValue::Bool(true),
-                    KvValue::Bool(true),
-                    KvValue::Bool(true),
-                    KvValue::Bool(false),
-                ], 5)
+                std::iter::repeat_n(
+                    [
+                        KvValue::Bool(true),
+                        KvValue::Bool(true),
+                        KvValue::Bool(true),
+                        KvValue::Bool(true),
+                        KvValue::Bool(true),
+                        KvValue::Bool(false),
+                    ],
+                    5,
+                )
                 .flatten()
                 .collect(),
             ),
@@ -968,7 +997,10 @@ mod tests {
         g.insert("gemma3.attention.key_length".into(), KvValue::U32(256));
         g.insert("gemma3.attention.value_length".into(), KvValue::U32(256));
         g.insert("gemma3.feed_forward_length".into(), KvValue::U32(6912));
-        g.insert("gemma3.attention.layer_norm_rms_epsilon".into(), KvValue::F32(1e-6));
+        g.insert(
+            "gemma3.attention.layer_norm_rms_epsilon".into(),
+            KvValue::F32(1e-6),
+        );
         g.insert("gemma3.rope.freq_base".into(), KvValue::F32(1_000_000.0));
         g.insert("gemma3.vocab_size".into(), KvValue::U32(262144));
         g.insert("gemma3.attention.sliding_window".into(), KvValue::U32(512));
@@ -976,12 +1008,18 @@ mod tests {
         let c = Gemma3Mapper.config_from_gguf(&g).unwrap();
         assert_eq!(c.sliding_window, 512, "read from the GGUF, not assumed");
         assert_eq!(c.sliding_window_pattern, 6, "5 SWA : 1 global");
-        assert_eq!(c.rope_local_theta, 10_000.0, "SWA layers use their own theta");
+        assert_eq!(
+            c.rope_local_theta, 10_000.0,
+            "SWA layers use their own theta"
+        );
         assert_eq!(c.rope_theta, 1_000_000.0, "global layers keep freq_base");
 
         // 4B/12B/27B ship a 1024 window — the value must track the file.
         g.insert("gemma3.attention.sliding_window".into(), KvValue::U32(1024));
-        assert_eq!(Gemma3Mapper.config_from_gguf(&g).unwrap().sliding_window, 1024);
+        assert_eq!(
+            Gemma3Mapper.config_from_gguf(&g).unwrap().sliding_window,
+            1024
+        );
     }
 
     /// The gemma3 defaults must NOT leak onto the gemma2/gemma fallback
@@ -995,7 +1033,10 @@ mod tests {
         g.insert("gemma2.attention.head_count".into(), KvValue::U32(8));
         g.insert("gemma2.attention.head_count_kv".into(), KvValue::U32(4));
         g.insert("gemma2.feed_forward_length".into(), KvValue::U32(9216));
-        g.insert("gemma2.attention.layer_norm_rms_epsilon".into(), KvValue::F32(1e-6));
+        g.insert(
+            "gemma2.attention.layer_norm_rms_epsilon".into(),
+            KvValue::F32(1e-6),
+        );
         g.insert("gemma2.vocab_size".into(), KvValue::U32(256000));
         g.insert("gemma2.attention.sliding_window".into(), KvValue::U32(4096));
 
@@ -1025,7 +1066,7 @@ mod tests {
             "lm_head.weight",
             "layers.0.self_attn.q_proj.weight",
             "layers.0.mlp.gate_proj.weight",
-            "layers.0.input_layernorm.bias",  // hypothetical; norms have no bias in gemma3
+            "layers.0.input_layernorm.bias", // hypothetical; norms have no bias in gemma3
         ] {
             assert_eq!(m.norm_shift(s), 0.0, "should not shift: {s}");
         }
@@ -1078,7 +1119,12 @@ mod tests {
         });
         let c = Gemma3HfMapper.config_from_hf(&cfg).unwrap();
         let want = 1.0_f32 / (168.0_f32).sqrt();
-        assert!((c.attention_scale - want).abs() < 1e-6, "want {}, got {}", want, c.attention_scale);
+        assert!(
+            (c.attention_scale - want).abs() < 1e-6,
+            "want {}, got {}",
+            want,
+            c.attention_scale
+        );
     }
 
     /// Defensive: HF sometimes stores numeric scalars as floats. Make
@@ -1095,6 +1141,11 @@ mod tests {
         });
         let c = Gemma3HfMapper.config_from_hf(&cfg).unwrap();
         let want = 1.0_f32 / (168.0_f32).sqrt();
-        assert!((c.attention_scale - want).abs() < 1e-6, "want {}, got {}", want, c.attention_scale);
+        assert!(
+            (c.attention_scale - want).abs() < 1e-6,
+            "want {}, got {}",
+            want,
+            c.attention_scale
+        );
     }
 }

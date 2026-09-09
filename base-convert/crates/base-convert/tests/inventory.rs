@@ -18,9 +18,10 @@ use std::process::Command;
 /// Known-not-yet-supported GGUF variants. Each entry is a substring
 /// match against the filename. Maintaining this list documents the
 /// coverage frontier.
-const EXPECTED_SKIP: &[(&str, &str)] = &[
-    ("mmproj", "standalone mmproj bundles handled as sub-bundles, not primary"),
-];
+const EXPECTED_SKIP: &[(&str, &str)] = &[(
+    "mmproj",
+    "standalone mmproj bundles handled as sub-bundles, not primary",
+)];
 
 fn models_dir() -> Option<PathBuf> {
     // BASE_MODELS_DIR is the explicit override; otherwise look for a
