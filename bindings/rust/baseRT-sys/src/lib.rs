@@ -70,6 +70,13 @@ pub struct BaseRTModelConfig {
     pub gdn_value_head_dim: u32,
     pub gdn_conv_kernel: u32,
 
+    // Nemotron-H hybrid Mamba-2 SSM
+    pub ssm_state_size: u32,
+    pub ssm_conv_kernel: u32,
+    pub ssm_num_groups: u32,
+    pub ssm_inner_size: u32,
+    pub ssm_num_heads: u32,
+
     // Mixture-of-Experts (0 = dense)
     pub n_experts: u32,
     pub n_experts_used: u32,
@@ -78,6 +85,7 @@ pub struct BaseRTModelConfig {
     pub expert_gating: u8,
     pub norm_topk_prob: u8,
     pub _moe_pad: [u8; 2],
+    pub expert_weights_scale: c_float,
 
     // Vision tower (all zero = none)
     pub vision_n_layers: u32,
@@ -142,6 +150,27 @@ pub struct BaseRTModelConfig {
     pub vision_pos_embed_w: u32,
     pub vision_adapter_dim: u32,
     pub video_token_id: u32,
+    // GLM 5.2 / glm-dsa
+    pub q_lora_rank: u32,
+    pub kv_lora_rank: u32,
+    pub qk_nope_head_dim: u32,
+    pub qk_rope_head_dim: u32,
+    pub v_head_dim: u32,
+    pub routed_scaling_factor: c_float,
+    pub first_k_dense_replace: u32,
+    pub nextn_predict_layers: u32,
+    pub indexer_head_count: u32,
+    pub indexer_key_length: u32,
+    pub indexer_top_k: u32,
+    // gpt-oss
+    pub rope_yarn_beta_fast: f32,
+    pub rope_yarn_beta_slow: f32,
+    pub swiglu_limit: f32,
+    pub swiglu_alpha: f32,
+    pub attention_sinks: u8,
+    pub attention_bias: u8,
+    pub rope_yarn_truncate: u8,
+    pub _gptoss_pad: u8,
 }
 
 /// Transcription result statistics.
@@ -266,6 +295,36 @@ extern "C" {
     pub fn baseRT_get_config(model: baseRT_model_t) -> BaseRTModelConfig;
     pub fn baseRT_model_config_sizeof() -> usize;
     pub fn baseRT_model_memory(model: baseRT_model_t) -> usize;
+    /// Device memory budget in bytes (Metal: recommended working set; CUDA:
+    /// total device memory). 0 when no supported device is present.
+    pub fn baseRT_device_memory_budget() -> usize;
+    /// A `max_context` sized for this device and this bundle. Metadata-only,
+    /// so it is safe to call before loading. 0 = could not size.
+    pub fn baseRT_suggest_max_context(
+        model_path: *const c_char,
+        max_batch: c_int,
+        kv_bits: c_int,
+        paged_kv: c_int,
+    ) -> c_int;
+    /// As above for a set of models that will be resident at the same time:
+    /// weights and KV pools add up, and the trained-window cap is the
+    /// shortest among them.
+    pub fn baseRT_suggest_max_context_multi(
+        model_paths: *const *const c_char,
+        n_models: c_int,
+        max_batch: c_int,
+        kv_bits: c_int,
+        paged_kv: c_int,
+    ) -> c_int;
+    /// 1 = the window fits the co-resident set, 0 = it does not, -1 = unknown.
+    pub fn baseRT_context_window_fits(
+        model_paths: *const *const c_char,
+        n_models: c_int,
+        max_batch: c_int,
+        kv_bits: c_int,
+        paged_kv: c_int,
+        window: c_int,
+    ) -> c_int;
     pub fn baseRT_get_error() -> *const c_char;
 
     // === Tokenization ===
@@ -465,7 +524,7 @@ mod tests {
             "config struct unexpectedly small ({})",
             mem::size_of::<BaseRTModelConfig>()
         );
-        assert_eq!(mem::size_of::<BaseRTModelConfig>(), 1704);
+        assert_eq!(mem::size_of::<BaseRTModelConfig>(), 1792);
     }
 
     #[test]
@@ -549,21 +608,29 @@ mod tests {
         assert_eq!(&base.attn_output_gate as *const _ as usize - base_ptr, 1232);
         assert_eq!(&base.linear_attn_layers as *const _ as usize - base_ptr, 1244);
         assert_eq!(&base.gdn_num_k_heads as *const _ as usize - base_ptr, 1308);
-        assert_eq!(&base.n_experts as *const _ as usize - base_ptr, 1328);
-        assert_eq!(&base.vision_n_layers as *const _ as usize - base_ptr, 1348);
-        assert_eq!(&base.vision_arch as *const _ as usize - base_ptr, 1408);
-        assert_eq!(&base.audio_n_layers as *const _ as usize - base_ptr, 1424);
-        assert_eq!(&base.eoa_token_id as *const _ as usize - base_ptr, 1500);
-        assert_eq!(&base.mrope_section as *const _ as usize - base_ptr, 1504);
-        assert_eq!(&base.mrope_interleaved as *const _ as usize - base_ptr, 1516);
-        assert_eq!(&base.rope_scaling_factor as *const _ as usize - base_ptr, 1520);
-        assert_eq!(&base.rope_orig_max_pos as *const _ as usize - base_ptr, 1532);
-        assert_eq!(&base.rope_scaling_type as *const _ as usize - base_ptr, 1536);
-        assert_eq!(&base.qk_scale_factor as *const _ as usize - base_ptr, 1540);
-        assert_eq!(&base.nope_layers as *const _ as usize - base_ptr, 1552);
-        assert_eq!(&base.embed_norm_eps as *const _ as usize - base_ptr, 1616);
-        assert_eq!(&base.vision_window_layers as *const _ as usize - base_ptr, 1620);
-        assert_eq!(&base.video_token_id as *const _ as usize - base_ptr, 1700);
+        // Nemotron-H SSM block, inserted between gdn_* and the MoE block —
+        // 20 bytes that shifted every field below it.
+        assert_eq!(&base.ssm_state_size as *const _ as usize - base_ptr, 1328);
+        assert_eq!(&base.ssm_num_heads as *const _ as usize - base_ptr, 1344);
+        assert_eq!(&base.n_experts as *const _ as usize - base_ptr, 1348);
+        assert_eq!(&base.expert_weights_scale as *const _ as usize - base_ptr, 1368);
+        assert_eq!(&base.vision_n_layers as *const _ as usize - base_ptr, 1372);
+        assert_eq!(&base.vision_arch as *const _ as usize - base_ptr, 1432);
+        assert_eq!(&base.audio_n_layers as *const _ as usize - base_ptr, 1448);
+        assert_eq!(&base.eoa_token_id as *const _ as usize - base_ptr, 1524);
+        assert_eq!(&base.mrope_section as *const _ as usize - base_ptr, 1528);
+        assert_eq!(&base.mrope_interleaved as *const _ as usize - base_ptr, 1540);
+        assert_eq!(&base.rope_scaling_factor as *const _ as usize - base_ptr, 1544);
+        assert_eq!(&base.rope_orig_max_pos as *const _ as usize - base_ptr, 1556);
+        assert_eq!(&base.rope_scaling_type as *const _ as usize - base_ptr, 1560);
+        assert_eq!(&base.qk_scale_factor as *const _ as usize - base_ptr, 1564);
+        assert_eq!(&base.nope_layers as *const _ as usize - base_ptr, 1576);
+        assert_eq!(&base.embed_norm_eps as *const _ as usize - base_ptr, 1640);
+        assert_eq!(&base.vision_window_layers as *const _ as usize - base_ptr, 1644);
+        assert_eq!(&base.video_token_id as *const _ as usize - base_ptr, 1724);
+        assert_eq!(&base.q_lora_rank as *const _ as usize - base_ptr, 1728);
+        assert_eq!(&base.indexer_top_k as *const _ as usize - base_ptr, 1768);
+        assert_eq!(&base.rope_yarn_beta_fast as *const _ as usize - base_ptr, 1772);
     }
 
     #[test]

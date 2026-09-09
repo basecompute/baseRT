@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-08-19",
+  "updated": "2026-09-08",
   "models": [
     {
       "id": "basecompute/Llama-3.1-8B-Instruct",
@@ -1132,6 +1132,72 @@
       "quant": "default-q8",
       "size": 62423808,
       "sha256": "3dbaaad2a23d0c68f1bac54963aadeb151c4bd38cf92d70cc2d27bf626feeb07"
+    },
+    {
+      "id": "basecompute/gpt-oss-20b",
+      "hf_repo": "basecompute/gpt-oss-20b",
+      "file": "gpt-oss-20b-MXFP4.base",
+      "revision": "main",
+      "source_repo": "openai/gpt-oss-20b",
+      "arch": "gpt_oss",
+      "quant": "default-bf16",
+      "size": 13789700096,
+      "sha256": "bbd2324ad5fca191cc016daa5d696ee45c0dc96def18a14a77aa4f0799463f00"
+    },
+    {
+      "id": "basecompute/gpt-oss-20b",
+      "hf_repo": "basecompute/gpt-oss-20b",
+      "file": "gpt-oss-20b-Q8.base",
+      "revision": "main",
+      "source_repo": "openai/gpt-oss-20b",
+      "arch": "gpt_oss",
+      "quant": "default-q8",
+      "size": 13183361024,
+      "sha256": "f95fe4a1c1fd69a8771515b8673c353afc49ecfce97fc48565477aa7e5235772"
+    },
+    {
+      "id": "basecompute/gpt-oss-20b",
+      "hf_repo": "basecompute/gpt-oss-20b",
+      "file": "gpt-oss-20b-Q4.base",
+      "revision": "main",
+      "source_repo": "openai/gpt-oss-20b",
+      "arch": "gpt_oss",
+      "quant": "default-q4",
+      "size": 12873900032,
+      "sha256": "6b7ae00571be1b9d4e5204c34e9fe22c19ee69c5dd6e51d32900cf8d41091c7f"
+    },
+    {
+      "id": "basecompute/NVIDIA-Nemotron-3-Nano-30B-A3B",
+      "hf_repo": "basecompute/NVIDIA-Nemotron-3-Nano-30B-A3B",
+      "file": "NVIDIA-Nemotron-3-Nano-30B-A3B-Q4.base",
+      "revision": "main",
+      "source_repo": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "arch": "nemotron_h_moe",
+      "quant": "default-q4",
+      "size": 17774510080,
+      "sha256": "1b13d5d33fdc7312ca6ac1fd23bc41c74c2fddc3219e038bf6060a7e6dae28fb"
+    },
+    {
+      "id": "basecompute/NVIDIA-Nemotron-3-Nano-30B-A3B",
+      "hf_repo": "basecompute/NVIDIA-Nemotron-3-Nano-30B-A3B",
+      "file": "NVIDIA-Nemotron-3-Nano-30B-A3B-Q8.base",
+      "revision": "main",
+      "source_repo": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "arch": "nemotron_h_moe",
+      "quant": "default-q8",
+      "size": 33035943936,
+      "sha256": "417ff3cfc93fed22d3be71f0fcfb0317bb436c404656d793f9cbb8281e2bd7a4"
+    },
+    {
+      "id": "basecompute/NVIDIA-Nemotron-3-Nano-30B-A3B",
+      "hf_repo": "basecompute/NVIDIA-Nemotron-3-Nano-30B-A3B",
+      "file": "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.base",
+      "revision": "main",
+      "source_repo": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "arch": "nemotron_h_moe",
+      "quant": "bf16",
+      "size": 63165857792,
+      "sha256": "f1bbee6ad05870c33d09a4ffeb2f6480b2fe13e34d4d8aaead8b302f115535e1"
     }
   ]
 }

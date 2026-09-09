@@ -120,9 +120,8 @@ mod tests {
 
     #[test]
     fn skips_empty_lines_and_headings() {
-        let f = write_temp(
-            " \n = Title = \n  \nFirst paragraph.\n \n = = Subsection = = \nSecond.\n",
-        );
+        let f =
+            write_temp(" \n = Title = \n  \nFirst paragraph.\n \n = = Subsection = = \nSecond.\n");
         let mut r = WikiTextReader::open(f.path()).unwrap();
         let text = r.read_n_lines(5).unwrap();
         assert!(text.contains("First paragraph."));
@@ -149,7 +148,11 @@ mod tests {
         let mut r = WikiTextReader::open(f.path()).unwrap();
         let got = r.read_chars(50).unwrap();
         assert!(got.len() >= 50, "got {} chars", got.len());
-        assert!(got.len() < 100, "should stop near target, got {}", got.len());
+        assert!(
+            got.len() < 100,
+            "should stop near target, got {}",
+            got.len()
+        );
     }
 
     #[test]

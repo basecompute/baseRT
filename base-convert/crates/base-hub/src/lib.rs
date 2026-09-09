@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod download;
 pub mod fetch;
 pub mod gen;
+pub mod parts;
 pub mod registry;
 pub mod scan;
 

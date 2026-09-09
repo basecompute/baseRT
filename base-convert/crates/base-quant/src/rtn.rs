@@ -64,7 +64,8 @@ pub fn pack(weights: &[f32], cfg: RtnConfig) -> Packed {
     let group_size = cfg.group_size as usize;
     let n_groups = weights.len() / group_size;
     let mut q_lanes: Vec<u32> = vec![0; weights.len()];
-    let mut scales_bytes = Vec::with_capacity(n_groups * cfg.scale_dtype.bytes_per_group() as usize);
+    let mut scales_bytes =
+        Vec::with_capacity(n_groups * cfg.scale_dtype.bytes_per_group() as usize);
     let mut biases_bytes = Vec::with_capacity(if cfg.symmetric {
         0
     } else {
@@ -118,7 +119,9 @@ pub fn pack(weights: &[f32], cfg: RtnConfig) -> Packed {
         let inv_scale = 1.0 / scale_rt;
         for (i, &val) in group.iter().enumerate() {
             let q = if cfg.symmetric {
-                (val * inv_scale).round().clamp(q_min_sym as f32, q_max_sym as f32) as i32
+                (val * inv_scale)
+                    .round()
+                    .clamp(q_min_sym as f32, q_max_sym as f32) as i32
             } else {
                 ((val - bias_rt) * inv_scale)
                     .round()
@@ -140,6 +143,111 @@ pub fn pack(weights: &[f32], cfg: RtnConfig) -> Packed {
 
     Packed {
         packed_weights,
+        scales: scales_bytes,
+        biases: biases_bytes,
+        group_size: cfg.group_size,
+        scale_dtype: Some(cfg.scale_dtype),
+    }
+}
+
+/// Importance-weighted RTN ("imatrix-lite"): per-group affine fit that
+/// minimizes Σ w·(x − (q·s + b))² instead of plain min/max range fitting,
+/// where `w` is a per-INPUT-CHANNEL importance (activation second moment
+/// from the calibration sidecar). Groups run along the input dim, so group
+/// g covers channels [(g·gs) mod in_features, +gs). The packed layout,
+/// scale dtype round-trip and value space are identical to `pack` — the
+/// runtime cannot tell the difference; only WHERE the quantization error
+/// lands changes (away from salient channels). Asymmetric only.
+///
+/// This is the runtime-free counterpart of AWQ: same intuition (spend the
+/// grid on channels the network actually feels), no folded activation
+/// scale to apply at inference.
+pub fn pack_weighted(
+    weights: &[f32],
+    cfg: RtnConfig,
+    channel_w: &[f32],
+    in_features: usize,
+) -> Packed {
+    assert!(!cfg.symmetric, "pack_weighted supports asymmetric only");
+    assert!(cfg.group_size > 0 && weights.len() % cfg.group_size as usize == 0);
+    assert!(
+        in_features > 0 && in_features % cfg.group_size as usize == 0,
+        "in_features {in_features} must be a multiple of group_size {}",
+        cfg.group_size
+    );
+    assert_eq!(
+        channel_w.len(),
+        in_features,
+        "one importance per input channel"
+    );
+
+    let group_size = cfg.group_size as usize;
+    let n_groups = weights.len() / group_size;
+    let mut q_lanes: Vec<u32> = vec![0; weights.len()];
+    let mut scales_bytes =
+        Vec::with_capacity(n_groups * cfg.scale_dtype.bytes_per_group() as usize);
+    let mut biases_bytes =
+        Vec::with_capacity(n_groups * cfg.scale_dtype.bytes_per_group() as usize);
+    let q_max: f32 = ((1u32 << cfg.bits) - 1) as f32;
+
+    for g in 0..n_groups {
+        let group = &weights[g * group_size..(g + 1) * group_size];
+        let ch0 = (g * group_size) % in_features;
+        let w = &channel_w[ch0..ch0 + group_size];
+
+        // Seed from plain min/max, then a few weighted-Lloyd rounds:
+        // assign under (s, b), refit (s, b) by weighted least squares.
+        let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &x in group {
+            mn = mn.min(x);
+            mx = mx.max(x);
+        }
+        let mut s = (mx - mn) / q_max;
+        if s == 0.0 {
+            s = 1.0;
+        }
+        let mut b = mn;
+        let wsum: f64 = w.iter().map(|&v| v.max(1e-8) as f64).sum();
+        for _ in 0..8 {
+            // Weighted moments of (q, x) under the current assignment.
+            let (mut sq, mut sx, mut sqq, mut sqx) = (0f64, 0f64, 0f64, 0f64);
+            for (i, &x) in group.iter().enumerate() {
+                let wi = w[i].max(1e-8) as f64;
+                let q = (((x - b) / s).round()).clamp(0.0, q_max) as f64;
+                sq += wi * q;
+                sx += wi * x as f64;
+                sqq += wi * q * q;
+                sqx += wi * q * x as f64;
+            }
+            let qm = sq / wsum;
+            let xm = sx / wsum;
+            let var = sqq / wsum - qm * qm;
+            if var > 1e-12 {
+                let cov = sqx / wsum - qm * xm;
+                let s_new = (cov / var) as f32;
+                if s_new.abs() > 1e-12 {
+                    s = s_new;
+                    b = (xm - qm * (s as f64)) as f32;
+                }
+            }
+        }
+
+        // Final encode: round (s, b) through the scale dtype FIRST, then
+        // assign q under the rounded pair (matches `pack`'s contract that
+        // pack-side rounding equals dequant exactly).
+        let (scale_rt, scale_enc) = round_trip_scale(s, cfg.scale_dtype);
+        scales_bytes.extend_from_slice(&scale_enc);
+        let (bias_rt, bias_enc) = round_trip_scale(b, cfg.scale_dtype);
+        biases_bytes.extend_from_slice(&bias_enc);
+        let inv = 1.0 / scale_rt;
+        for (i, &x) in group.iter().enumerate() {
+            let q = (((x - bias_rt) * inv).round()).clamp(0.0, q_max) as u32;
+            q_lanes[g * group_size + i] = q;
+        }
+    }
+
+    Packed {
+        packed_weights: pack_lanes(&q_lanes, cfg.bits),
         scales: scales_bytes,
         biases: biases_bytes,
         group_size: cfg.group_size,
@@ -179,11 +287,7 @@ pub fn unpack(packed: &Packed, total_values: usize, cfg: RtnConfig) -> Vec<f32> 
         for i in 0..group_size {
             let flat = g * group_size + i;
             let q = q_lanes[flat] as i32;
-            let q_real = if cfg.symmetric {
-                q - q_offset_sym
-            } else {
-                q
-            };
+            let q_real = if cfg.symmetric { q - q_offset_sym } else { q };
             out[flat] = q_real as f32 * scale + bias;
         }
     }
@@ -285,8 +389,7 @@ fn unpack_q3(bytes: &[u8], total: usize) -> Vec<u32> {
     assert!(total % 8 == 0);
     let mut out = Vec::with_capacity(total);
     for chunk in bytes.chunks_exact(3) {
-        let acc =
-            (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
+        let acc = (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
         for i in 0..8 {
             out.push((acc >> (i * 3)) & 0x7);
         }
@@ -353,8 +456,7 @@ fn unpack_q6(bytes: &[u8], total: usize) -> Vec<u32> {
     assert!(total % 4 == 0);
     let mut out = Vec::with_capacity(total);
     for chunk in bytes.chunks_exact(3) {
-        let acc =
-            (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
+        let acc = (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
         for i in 0..4 {
             out.push((acc >> (i * 6)) & 0x3F);
         }
@@ -447,7 +549,7 @@ fn encode_e4m3_approx(x: f32) -> u8 {
     let mag = x.abs();
     let log2 = mag.log2().round() as i32;
     let exp = (log2 + 7).clamp(0, 15) as u8; // 4-bit exponent, bias 7
-    // Mantissa: 3 bits of fraction beyond the implicit leading 1.
+                                             // Mantissa: 3 bits of fraction beyond the implicit leading 1.
     let frac = mag / 2f32.powi(log2) - 1.0;
     let mantissa = (frac * 8.0).round().clamp(0.0, 7.0) as u8;
     sign | (exp << 3) | (mantissa & 0x7)
@@ -483,10 +585,7 @@ mod tests {
         let r = unpack(&p, weights.len(), cfg);
         let levels = (1 << cfg.bits) as f32;
         let mn = weights.iter().cloned().fold(f32::INFINITY, f32::min);
-        let mx = weights
-            .iter()
-            .cloned()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let mx = weights.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let range = (mx - mn).max(1e-6);
         let step = range / levels;
         let tol = step * 0.6;
@@ -559,7 +658,9 @@ mod tests {
         let mut xs = Vec::with_capacity(1024);
         let mut s = 0xCAFEBABEu64;
         for _ in 0..1024 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let t = ((s >> 33) & 0x7FFFFFFF) as f32 / 0x7FFFFFFF as f32;
             xs.push(-1.5 + 3.0 * t);
         }
@@ -571,10 +672,27 @@ mod tests {
         };
         let new = pack(&xs, cfg);
         let old = crate::base_q4::pack(&xs);
-        assert_eq!(new.packed_weights.len(), old.packed_weights.len(), "weight byte count mismatch");
-        assert_eq!(new.scales.len(), old.scales.len(), "scale byte count mismatch");
-        assert_eq!(new.biases.len(), old.biases.len(), "bias byte count mismatch");
-        for (i, (a, b)) in new.packed_weights.iter().zip(old.packed_weights.iter()).enumerate() {
+        assert_eq!(
+            new.packed_weights.len(),
+            old.packed_weights.len(),
+            "weight byte count mismatch"
+        );
+        assert_eq!(
+            new.scales.len(),
+            old.scales.len(),
+            "scale byte count mismatch"
+        );
+        assert_eq!(
+            new.biases.len(),
+            old.biases.len(),
+            "bias byte count mismatch"
+        );
+        for (i, (a, b)) in new
+            .packed_weights
+            .iter()
+            .zip(old.packed_weights.iter())
+            .enumerate()
+        {
             if a != b {
                 panic!("weight bytes diverge at index {i}: new=0x{a:02x} old=0x{b:02x}");
             }
@@ -613,7 +731,11 @@ mod tests {
         let p = pack(&xs, cfg);
         assert!(p.biases.is_empty(), "symmetric must have no biases");
         let r = unpack(&p, xs.len(), cfg);
-        let max_err = xs.iter().zip(r.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let max_err = xs
+            .iter()
+            .zip(r.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
         assert!(max_err < 4.5, "symmetric q4 range max err {max_err}");
     }
 

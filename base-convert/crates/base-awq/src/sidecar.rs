@@ -20,15 +20,13 @@ impl AwqProfile {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading AWQ profile {}", path.display()))?;
-        let p: AwqProfile = serde_json::from_slice(&bytes)
-            .context("parsing AWQ profile JSON")?;
+        let p: AwqProfile = serde_json::from_slice(&bytes).context("parsing AWQ profile JSON")?;
         Ok(p)
     }
 
     /// Write the profile to `path` (canonical JSON, sorted keys).
     pub fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_vec_pretty(self)
-            .context("serializing AWQ profile")?;
+        let json = serde_json::to_vec_pretty(self).context("serializing AWQ profile")?;
         std::fs::write(path, json)
             .with_context(|| format!("writing AWQ profile {}", path.display()))?;
         Ok(())
@@ -38,7 +36,9 @@ impl AwqProfile {
     /// Returns None if the profile lacks an entry — callers fall back
     /// to plain RTN for that tensor.
     pub fn absmax(&self, tensor_name: &str) -> Option<&[f32]> {
-        self.per_tensor_absmax.get(tensor_name).map(|v| v.as_slice())
+        self.per_tensor_absmax
+            .get(tensor_name)
+            .map(|v| v.as_slice())
     }
 
     /// Validate the profile against an expected source fingerprint

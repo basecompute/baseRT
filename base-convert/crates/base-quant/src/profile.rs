@@ -72,16 +72,15 @@ pub struct ResolvedQuant {
 impl QuantProfile {
     /// Parse a profile from JSON bytes.
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
-        let p: Self = serde_json::from_slice(bytes)
-            .context("parsing quant profile JSON")?;
+        let p: Self = serde_json::from_slice(bytes).context("parsing quant profile JSON")?;
         p.validate()?;
         Ok(p)
     }
 
     /// Read a profile from a path on disk.
     pub fn from_path(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading profile {}", path.display()))?;
+        let bytes =
+            std::fs::read(path).with_context(|| format!("reading profile {}", path.display()))?;
         Self::from_json(&bytes)
     }
 
@@ -106,9 +105,7 @@ impl QuantProfile {
                 bail!("rule {i}: unbalanced {{}} in pattern {:?}", rule.pattern);
             }
             // e4m3 is q8-only per spec.
-            if rule.scale_dtype == Some(ScaleDtype::E4m3)
-                && rule.dtype != TensorDtype::BaseQ8
-            {
+            if rule.scale_dtype == Some(ScaleDtype::E4m3) && rule.dtype != TensorDtype::BaseQ8 {
                 bail!(
                     "rule {i}: scale_dtype=e4m3 is only valid for base_q8, not {:?}",
                     rule.dtype
@@ -314,18 +311,29 @@ mod tests {
 
     #[test]
     fn alternation_expands() {
-        let pats =
-            expand_alternations("a.{b,c,d}.e");
+        let pats = expand_alternations("a.{b,c,d}.e");
         assert_eq!(pats, vec!["a.b.e", "a.c.e", "a.d.e"]);
     }
 
     #[test]
     fn alternation_in_match() {
         let pat = "model.layers.*.self_attn.{q,k,v,o}_proj.weight";
-        assert!(pattern_matches(pat, "model.layers.0.self_attn.q_proj.weight"));
-        assert!(pattern_matches(pat, "model.layers.5.self_attn.k_proj.weight"));
-        assert!(pattern_matches(pat, "model.layers.5.self_attn.v_proj.weight"));
-        assert!(pattern_matches(pat, "model.layers.5.self_attn.o_proj.weight"));
+        assert!(pattern_matches(
+            pat,
+            "model.layers.0.self_attn.q_proj.weight"
+        ));
+        assert!(pattern_matches(
+            pat,
+            "model.layers.5.self_attn.k_proj.weight"
+        ));
+        assert!(pattern_matches(
+            pat,
+            "model.layers.5.self_attn.v_proj.weight"
+        ));
+        assert!(pattern_matches(
+            pat,
+            "model.layers.5.self_attn.o_proj.weight"
+        ));
         assert!(!pattern_matches(
             pat,
             "model.layers.5.self_attn.gate_proj.weight"
@@ -373,7 +381,10 @@ mod tests {
             TensorDtype::Bf16
         );
         assert_eq!(
-            profile.resolve("model.layers.0.q_proj.weight").unwrap().dtype,
+            profile
+                .resolve("model.layers.0.q_proj.weight")
+                .unwrap()
+                .dtype,
             TensorDtype::BaseQ4
         );
     }
@@ -472,8 +483,9 @@ mod tests {
         let p = QuantProfile::from_path(&path).unwrap();
 
         // MoE expert: q4 / gs=64.
-        let expert =
-            p.resolve("model.layers.0.mlp.experts.0.gate_proj.weight").unwrap();
+        let expert = p
+            .resolve("model.layers.0.mlp.experts.0.gate_proj.weight")
+            .unwrap();
         assert_eq!(expert.dtype, TensorDtype::BaseQ4);
         assert_eq!(expert.group_size, 64);
 
@@ -491,10 +503,7 @@ mod tests {
         // Router stays in fp (kernel reads f16; profile uses f16
         // since the runtime's norm/router kernels assume half).
         let router = p.resolve("model.layers.0.mlp.router.weight").unwrap();
-        assert!(matches!(
-            router.dtype,
-            TensorDtype::F16 | TensorDtype::Bf16
-        ));
+        assert!(matches!(router.dtype, TensorDtype::F16 | TensorDtype::Bf16));
     }
 
     /// q3-aggressive profile routes MLP / experts to q3 / gs=32 per spec.
@@ -543,7 +552,9 @@ mod tests {
         // residual-stream noise doesn't compound through 30 layers).
         for proj in ["gate_proj", "up_proj", "down_proj"] {
             let name = format!("model.layers.0.mlp.{proj}.weight");
-            let r = p.resolve(&name).unwrap_or_else(|| panic!("no rule for {name}"));
+            let r = p
+                .resolve(&name)
+                .unwrap_or_else(|| panic!("no rule for {name}"));
             assert_eq!(r.dtype, TensorDtype::BaseQ8, "mlp.{proj} should be q8");
             assert_eq!(r.group_size, 64, "mlp.{proj} should be gs=64");
         }
@@ -556,7 +567,9 @@ mod tests {
             "model.layers.0.mlp.router.weight",
             "model.layers.0.ffn_gate_inp.weight",
         ] {
-            let r = p.resolve(name).unwrap_or_else(|| panic!("no rule for {name}"));
+            let r = p
+                .resolve(name)
+                .unwrap_or_else(|| panic!("no rule for {name}"));
             assert_eq!(r.dtype, TensorDtype::BaseQ8, "{name} should be q8");
             assert_eq!(r.group_size, 64, "{name} should be gs=64");
         }
@@ -568,7 +581,9 @@ mod tests {
             "model.layers.0.ffn_gate_up_exps.weight",
             "model.layers.0.ffn_down_exps.weight",
         ] {
-            let r = p.resolve(name).unwrap_or_else(|| panic!("no rule for {name}"));
+            let r = p
+                .resolve(name)
+                .unwrap_or_else(|| panic!("no rule for {name}"));
             assert_eq!(r.dtype, TensorDtype::BaseQ4, "{name} should be q4");
             assert_eq!(r.group_size, 64, "{name} should be gs=64");
         }
@@ -576,8 +591,14 @@ mod tests {
         // Attention projections — q4/gs=64.
         for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
             let name = format!("model.layers.0.self_attn.{proj}.weight");
-            let r = p.resolve(&name).unwrap_or_else(|| panic!("no rule for {name}"));
-            assert_eq!(r.dtype, TensorDtype::BaseQ4, "self_attn.{proj} should be q4");
+            let r = p
+                .resolve(&name)
+                .unwrap_or_else(|| panic!("no rule for {name}"));
+            assert_eq!(
+                r.dtype,
+                TensorDtype::BaseQ4,
+                "self_attn.{proj} should be q4"
+            );
         }
 
         // Embed_tokens — q4/gs=64 to match MLX (also drops lm_head with
@@ -596,7 +617,9 @@ mod tests {
             "model.layers.0.pre_feedforward_layernorm.weight",
             "model.layers.0.pre_feedforward_layernorm_2.weight",
         ] {
-            let r = p.resolve(name).unwrap_or_else(|| panic!("no rule for {name}"));
+            let r = p
+                .resolve(name)
+                .unwrap_or_else(|| panic!("no rule for {name}"));
             assert_eq!(r.dtype, TensorDtype::F16, "{name} should be f16");
         }
 
@@ -609,7 +632,9 @@ mod tests {
             "model.layers.0.router.scale",
             "model.layers.0.ffn_gate_inp.scale",
         ] {
-            let r = p.resolve(name).unwrap_or_else(|| panic!("no rule for {name}"));
+            let r = p
+                .resolve(name)
+                .unwrap_or_else(|| panic!("no rule for {name}"));
             assert_eq!(r.dtype, TensorDtype::F16, "{name} should be f16");
         }
     }
@@ -646,7 +671,9 @@ mod tests {
                 "encoder.blocks.0.mlp.0.weight",
                 "decoder.blocks.2.mlp.2.weight",
             ] {
-                let r = p.resolve(name).unwrap_or_else(|| panic!("{file}: no rule for {name}"));
+                let r = p
+                    .resolve(name)
+                    .unwrap_or_else(|| panic!("{file}: no rule for {name}"));
                 assert_eq!(r.dtype, dtype, "{file}: {name}");
                 assert_eq!(r.group_size, gs, "{file}: {name}");
                 assert_eq!(r.scale_dtype, ScaleDtype::Bf16, "{file}: {name}");
@@ -670,7 +697,9 @@ mod tests {
                 "encoder.blocks.0.mlp.0.bias",
                 "decoder.ln.bias",
             ] {
-                let r = p.resolve(name).unwrap_or_else(|| panic!("{file}: no rule for {name}"));
+                let r = p
+                    .resolve(name)
+                    .unwrap_or_else(|| panic!("{file}: no rule for {name}"));
                 assert_eq!(r.dtype, TensorDtype::F16, "{file}: {name} must stay f16");
             }
         }

@@ -117,6 +117,12 @@ const ModelConfigC = koffi.struct("BaseRTModelConfig", {
   gdn_key_head_dim: "uint32",
   gdn_value_head_dim: "uint32",
   gdn_conv_kernel: "uint32",
+  // Nemotron-H hybrid Mamba-2 SSM
+  ssm_state_size: "uint32",
+  ssm_conv_kernel: "uint32",
+  ssm_num_groups: "uint32",
+  ssm_inner_size: "uint32",
+  ssm_num_heads: "uint32",
   // MoE
   n_experts: "uint32",
   n_experts_used: "uint32",
@@ -125,6 +131,7 @@ const ModelConfigC = koffi.struct("BaseRTModelConfig", {
   expert_gating: "uint8",
   norm_topk_prob: "uint8",
   _moe_pad: koffi.array("uint8", 2),
+  expert_weights_scale: "float",
   // Vision tower
   vision_n_layers: "uint32",
   vision_dim: "uint32",
@@ -186,6 +193,27 @@ const ModelConfigC = koffi.struct("BaseRTModelConfig", {
   vision_pos_embed_w: "uint32",
   vision_adapter_dim: "uint32",
   video_token_id: "uint32",
+  // GLM 5.2 / glm-dsa
+  q_lora_rank: "uint32",
+  kv_lora_rank: "uint32",
+  qk_nope_head_dim: "uint32",
+  qk_rope_head_dim: "uint32",
+  v_head_dim: "uint32",
+  routed_scaling_factor: "float",
+  first_k_dense_replace: "uint32",
+  nextn_predict_layers: "uint32",
+  indexer_head_count: "uint32",
+  indexer_key_length: "uint32",
+  indexer_top_k: "uint32",
+  // gpt-oss
+  rope_yarn_beta_fast: "float",
+  rope_yarn_beta_slow: "float",
+  swiglu_limit: "float",
+  swiglu_alpha: "float",
+  attention_sinks: "uint8",
+  attention_bias: "uint8",
+  rope_yarn_truncate: "uint8",
+  _gptoss_pad: "uint8",
 });
 
 const SamplingConfigC = koffi.struct("BaseRTSamplingConfig", {

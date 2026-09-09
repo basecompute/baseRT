@@ -234,24 +234,22 @@ impl GgufMapper for QwenMapper {
         let hidden_size = u32_key(&format!("{prefix}.embedding_length"))?;
         let num_hidden_layers = u32_key(&format!("{prefix}.block_count"))?;
         let num_attention_heads = u32_key(&format!("{prefix}.attention.head_count"))?;
-        let num_kv_heads = u32_key(&format!("{prefix}.attention.head_count_kv"))
-            .unwrap_or(num_attention_heads);
+        let num_kv_heads =
+            u32_key(&format!("{prefix}.attention.head_count_kv")).unwrap_or(num_attention_heads);
         let intermediate_size = u32_key(&format!("{prefix}.feed_forward_length"))?;
-        let vocab_size = u32_key(&format!("{prefix}.vocab_size"))
-            .or_else(|_| {
-                m.get("tokenizer.ggml.tokens")
-                    .and_then(|v| match v {
-                        KvValue::Array(a) => Some(a.len() as u32),
-                        _ => None,
-                    })
-                    .context("no vocab_size and no tokenizer.ggml.tokens")
-            })?;
+        let vocab_size = u32_key(&format!("{prefix}.vocab_size")).or_else(|_| {
+            m.get("tokenizer.ggml.tokens")
+                .and_then(|v| match v {
+                    KvValue::Array(a) => Some(a.len() as u32),
+                    _ => None,
+                })
+                .context("no vocab_size and no tokenizer.ggml.tokens")
+        })?;
         let head_dim = u32_key(&format!("{prefix}.attention.key_length"))
             .unwrap_or(hidden_size / num_attention_heads);
 
         let rope_theta = f32_key(&format!("{prefix}.rope.freq_base")).unwrap_or(10_000.0);
-        let rope_scale =
-            f32_key(&format!("{prefix}.rope.scaling.factor")).unwrap_or(1.0);
+        let rope_scale = f32_key(&format!("{prefix}.rope.scaling.factor")).unwrap_or(1.0);
         let rms_norm_eps =
             f32_key(&format!("{prefix}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-6);
 
@@ -308,8 +306,8 @@ impl GgufMapper for QwenMoeMapper {
         let hidden_size = u32_key(&format!("{prefix}.embedding_length"))?;
         let num_hidden_layers = u32_key(&format!("{prefix}.block_count"))?;
         let num_attention_heads = u32_key(&format!("{prefix}.attention.head_count"))?;
-        let num_kv_heads = u32_key(&format!("{prefix}.attention.head_count_kv"))
-            .unwrap_or(num_attention_heads);
+        let num_kv_heads =
+            u32_key(&format!("{prefix}.attention.head_count_kv")).unwrap_or(num_attention_heads);
         // For MoE, GGUF carries two FFN widths:
         //   `feed_forward_length`        = nominal/dense width (HF `intermediate_size`)
         //   `expert_feed_forward_length` = per-expert width (HF `moe_intermediate_size`)
