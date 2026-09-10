@@ -91,8 +91,14 @@ curl -fSL --progress-bar "$url" -o "$tmp/bundle.tar.gz"
 # (the bundle is flat: libbaseRT.{dylib,so}, baseRT.metallib on macOS, basert,
 # basert-*, include/), so an unrelated file in a custom INSTALL_DIR is left alone.
 mkdir -p "$INSTALL_DIR"
+# libbaseRT*.dylib, not libbaseRT.dylib: since 0.2.4 the macOS bundle ships a
+# VERSIONED library plus two symlinks (libbaseRT.0.2.4.dylib <- libbaseRT.0.dylib
+# <- libbaseRT.dylib), and the bare name matched only the last of those. Every
+# upgrade then left the previous release's real library behind — an orphan of
+# the full binary size that nothing points at, and a loaded gun for any future
+# change to the install name. (The .so pattern was already globbed.)
 rm -f  "$INSTALL_DIR"/basert "$INSTALL_DIR"/basert-* "$INSTALL_DIR"/baseRT_* \
-       "$INSTALL_DIR"/libbaseRT.dylib "$INSTALL_DIR"/libbaseRT.so* "$INSTALL_DIR"/baseRT.metallib
+       "$INSTALL_DIR"/libbaseRT*.dylib "$INSTALL_DIR"/libbaseRT.so* "$INSTALL_DIR"/baseRT.metallib
 rm -rf "$INSTALL_DIR"/include
 
 tar -xzf "$tmp/bundle.tar.gz" -C "$INSTALL_DIR"
