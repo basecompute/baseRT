@@ -1,4 +1,4 @@
-//! `basert pull` / `basert list` — the model-hub CLI surface — plus
+//! `basert pull` / `basert list` / `basert rm` — the model-hub CLI surface — plus
 //! `dispatch_external`, the launcher that forwards `basert <cmd>` (serve, chat,
 //! …) to the matching `basert-<cmd>` runtime binary.
 //!
@@ -6,7 +6,7 @@
 //! glue that drives it from the CLI and, for convert-on-pull, hands the
 //! downloaded snapshot to the existing `cmd_convert` pipeline.
 
-use crate::{AwqMode, ConvertArgs, ListArgs, PullArgs, TargetScheme};
+use crate::{AwqMode, ConvertArgs, ListArgs, PullArgs, RmArgs, TargetScheme};
 use anyhow::{bail, Context, Result};
 use base_hub::cache::{self, HubSidecar};
 use base_hub::fetch::{self, Fetcher, HfFetcher};
@@ -999,6 +999,12 @@ fn write_sidecar_for(
             base_sha256,
         },
     )
+}
+
+pub fn cmd_rm(args: RmArgs) -> Result<()> {
+    cache::remove_model(&cache::models_dir()?, &args.model)?;
+    eprintln!("Removed {}", args.model.trim());
+    Ok(())
 }
 
 pub fn cmd_list(args: ListArgs) -> Result<()> {
