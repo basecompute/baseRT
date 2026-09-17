@@ -968,9 +968,63 @@ fn download_source(repo: &str, revision: &str, fetcher: &dyn Fetcher) -> Result<
         if f.as_str() == "config.json" {
             continue;
         }
-        fetcher.get_file(repo, revision, f)?;
+        let src = fetcher.get_file(repo, revision, f)?;
+        link_into_snapshot(&snapshot, f, &src)?;
     }
     Ok(snapshot)
+}
+
+/// Make `filename` resolvable under `snapshot`, the dir the converter reads.
+///
+/// hf-hub's own download path writes a `snapshots/<rev>/<file>` pointer into
+/// `blobs/`, but the resumable range path (every file of 32MB or more, i.e.
+/// every safetensors shard) parks its result at `blobs/<etag>` and returns
+/// that path with no pointer. Without this link the snapshot holds config
+/// and tokenizer but no weights, and conversion fails with "no .safetensors
+/// shards" on a pull that downloaded everything.
+fn link_into_snapshot(snapshot: &Path, filename: &str, src: &Path) -> Result<()> {
+    // `filename` comes from the remote repo's file listing. Reuse the cache's
+    // rule so a hostile or malformed entry (`..`, an absolute path, a Windows
+    // prefix) cannot place a symlink outside the snapshot — `Path::join`
+    // would otherwise honour a leading `/` and discard the snapshot prefix.
+    let rel = cache::id_to_relpath(filename)
+        .with_context(|| format!("refusing to link unsafe source path {filename}"))?;
+    let pointer = snapshot.join(rel);
+    // A symlink target is stored verbatim and resolved RELATIVE TO THE LINK's
+    // directory, not the process CWD. `BASERT_MODELS_DIR` is used exactly as
+    // given (it is not canonicalised), so a relative models root would other-
+    // wise write a target that dangles the moment it is read from inside the
+    // snapshot directory. Absolutise before linking.
+    let src = std::path::absolute(src)
+        .with_context(|| format!("resolving fetched path {}", src.display()))?;
+    let src = src.as_path();
+    if pointer == src {
+        return Ok(());
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(&pointer) {
+        let same = match (std::fs::canonicalize(&pointer), std::fs::canonicalize(src)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if same {
+            return Ok(());
+        }
+        if !meta.file_type().is_symlink() {
+            bail!(
+                "{} exists and is not the fetched {}",
+                pointer.display(),
+                src.display()
+            );
+        }
+        // A stale or dangling pointer from an earlier pull: replace it.
+        std::fs::remove_file(&pointer)
+            .with_context(|| format!("replacing stale {}", pointer.display()))?;
+    }
+    if let Some(parent) = pointer.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(src, &pointer)
+        .with_context(|| format!("linking {} -> {}", pointer.display(), src.display()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1609,6 +1663,122 @@ mod tests {
 
         let snapshot = download_source("org/model", "main", &fetcher).unwrap();
         assert_eq!(snapshot, repo_dir);
+    }
+
+    /// Serves small files from `snapshots/main/` but large ones as bare
+    /// `blobs/` paths with no snapshot pointer — the shape `HfFetcher`'s
+    /// resumable range path returns.
+    struct BlobFetcher {
+        root: PathBuf,
+    }
+
+    impl Fetcher for BlobFetcher {
+        fn get_file(&self, _repo: &str, _revision: &str, filename: &str) -> Result<PathBuf> {
+            if filename.ends_with(".safetensors") {
+                Ok(self.root.join("blobs").join(filename.replace('/', "_")))
+            } else {
+                Ok(self.root.join("snapshots").join("main").join(filename))
+            }
+        }
+
+        fn list_files(&self, _repo: &str, _revision: &str) -> Result<Vec<String>> {
+            Ok([
+                "config.json",
+                "tokenizer.json",
+                "model.safetensors",
+                "sub/model-2.safetensors",
+            ]
+            .map(String::from)
+            .to_vec())
+        }
+    }
+
+    #[test]
+    fn download_source_links_blob_only_files_into_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = tmp.path().join("snapshots").join("main");
+        let blobs = tmp.path().join("blobs");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(snap.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
+        std::fs::write(snap.join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(blobs.join("model.safetensors"), b"w1").unwrap();
+        std::fs::write(blobs.join("sub_model-2.safetensors"), b"w2").unwrap();
+        // A dangling pointer left by an earlier, cleaned-up pull.
+        std::os::unix::fs::symlink(tmp.path().join("gone"), snap.join("model.safetensors"))
+            .unwrap();
+        let fetcher = BlobFetcher {
+            root: tmp.path().to_path_buf(),
+        };
+
+        // Twice: a re-pull over an already-linked snapshot is a no-op.
+        for _ in 0..2 {
+            let snapshot = download_source("org/model", "main", &fetcher).unwrap();
+            assert_eq!(snapshot, snap);
+            assert_eq!(
+                std::fs::read(snap.join("model.safetensors")).unwrap(),
+                b"w1"
+            );
+            assert_eq!(
+                std::fs::read(snap.join("sub/model-2.safetensors")).unwrap(),
+                b"w2"
+            );
+        }
+    }
+
+    // A symlink target is resolved relative to the LINK's directory, so a
+    // relative `src` (which a relative BASERT_MODELS_DIR produces, since the
+    // env var is used verbatim) must be absolutised before it is stored —
+    // otherwise every shard pointer dangles and conversion dies on open.
+    // The source path here is deliberately relative to the crate's CWD; no
+    // chdir, so this stays safe under the parallel test runner.
+    #[test]
+    fn link_into_snapshot_absolutises_a_relative_source() {
+        let rel_dir = Path::new("target").join("link-into-snapshot-relative-src");
+        std::fs::create_dir_all(&rel_dir).unwrap();
+        let rel_src = rel_dir.join("blob.safetensors");
+        std::fs::write(&rel_src, b"w1").unwrap();
+        assert!(rel_src.is_relative());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join("snapshots").join("main");
+        std::fs::create_dir_all(&snapshot).unwrap();
+
+        link_into_snapshot(&snapshot, "model.safetensors", &rel_src).unwrap();
+
+        let pointer = snapshot.join("model.safetensors");
+        assert!(
+            std::fs::read_link(&pointer).unwrap().is_absolute(),
+            "symlink target must be absolute or it dangles from inside the snapshot"
+        );
+        // The real symptom: reading THROUGH the link from the snapshot.
+        assert_eq!(std::fs::read(&pointer).unwrap(), b"w1");
+
+        std::fs::remove_dir_all(&rel_dir).ok();
+    }
+
+    // The file list comes from the remote repo, so a traversing entry must be
+    // refused rather than placing a symlink outside the snapshot.
+    #[test]
+    fn link_into_snapshot_rejects_traversing_filenames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join("snapshots").join("main");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let src = tmp.path().join("blob.safetensors");
+        std::fs::write(&src, b"w").unwrap();
+
+        for bad in [
+            "../escaped.safetensors",
+            "/etc/escaped.safetensors",
+            "a/../../b.safetensors",
+        ] {
+            let err = link_into_snapshot(&snapshot, bad, &src).unwrap_err();
+            assert!(
+                err.to_string().contains("unsafe source path"),
+                "{bad}: {err}"
+            );
+        }
+        assert!(!tmp.path().join("escaped.safetensors").exists());
     }
 
     #[test]
