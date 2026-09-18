@@ -2,7 +2,7 @@
 
 `basert` is a single front-end with two kinds of commands:
 
-- **Native** (run by the CLI itself): `pull`, `list`, `convert`, `inspect`,
+- **Native** (run by the CLI itself): `pull`, `list`, `rm`, `convert`, `inspect`,
   `sign`, `verify`, `keygen`. These are the model hub + converter.
 - **Forwarded** (dispatched to the engine): `serve`, `chat`, `complete`,
   `bench`, `profile`, `transcribe`. These exec the matching `basert-<cmd>`
