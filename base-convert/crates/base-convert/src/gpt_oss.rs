@@ -235,6 +235,19 @@ pub(crate) fn convert_gpt_oss(
             // fine and runs past `<|call|>`.
             let gc: serde_json::Value = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing {}", gc_path.display()))?;
+            // Same file also carries the author's recommended SAMPLING
+            // settings. gpt-oss is routed here before the generic format
+            // detection, so it never reaches the shared
+            // apply_generation_config() and would otherwise be the one family
+            // served with runtime fallbacks instead of its published defaults.
+            config.sampling_defaults = base_arch::SamplingDefaults::from_generation_config(&gc);
+            if !config.sampling_defaults.is_empty() {
+                let sd = &config.sampling_defaults;
+                eprintln!(
+                    "  sampling: model defaults temp={:?} top_p={:?} top_k={:?} min_p={:?}",
+                    sd.temperature, sd.top_p, sd.top_k, sd.min_p
+                );
+            }
             let ids: Vec<u32> = match gc.get("eos_token_id") {
                 Some(serde_json::Value::Number(n)) => {
                     n.as_u64().map(|x| vec![x as u32]).unwrap_or_default()
@@ -348,6 +361,7 @@ pub(crate) fn convert_gpt_oss(
             .collect(),
         tensors: vec![],
         mmproj: None,
+        speculator: None,
         calibration: None,
         sig: None,
         provenance: None, // filled below via the writer's header

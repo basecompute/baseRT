@@ -7,6 +7,7 @@
 //! consistently regardless of source format.
 
 pub mod bert;
+pub mod dflash;
 pub mod gemma;
 pub mod glm;
 pub mod gpt_oss;
@@ -34,6 +35,43 @@ pub struct LayerNames {
 }
 
 /// Dispatch table: which arch module to use for a given GGUF arch string.
+/// Token ids (bos/eos) live at the WRAPPER level of multimodal HF configs —
+/// `text_config` carries none — so a mapper that reads only the text
+/// sub-config silently drops them. gemma-3-4b lost its BOS this way (a
+/// BOS-mandatory family: scored without BOS it degrades to ~1b quality,
+/// which is how the bug was found). Call after `hf_generic_config(text)`
+/// with the FULL config to backfill from the wrapper level.
+pub fn backfill_wrapper_token_ids(config: &mut ArchConfig, full: &serde_json::Value) {
+    let ids = |k: &str| -> Vec<u32> {
+        match full.get(k) {
+            Some(v) if v.is_u64() => vec![v.as_u64().unwrap() as u32],
+            Some(v) => v
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_u64().map(|n| n as u32))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    };
+    if config.bos_token_id == 0 {
+        if let Some(&b) = ids("bos_token_id").first() {
+            config.bos_token_id = b;
+        }
+    }
+    if config.eos_token_id == 0 {
+        let eos = ids("eos_token_id");
+        if let Some(&e) = eos.first() {
+            config.eos_token_id = e;
+            if eos.len() > 1 && config.eos_token_ids.is_empty() {
+                config.eos_token_ids = eos[1..].to_vec();
+            }
+        }
+    }
+}
+
 pub fn source_mapper_for_gguf(arch: &str) -> Option<&'static dyn GgufMapper> {
     match arch {
         "llama" => Some(&llama::LlamaMapper),
@@ -68,6 +106,12 @@ pub enum ValueTransform {
     /// code; the value the scan kernel wants is `A`, which must be
     /// negative for the recurrence to decay.
     NegExp,
+    /// `x -> x / n`. Block drafters fold 1/256 into the context projection
+    /// `fc`: its output only ever feeds `hidden_norm`, which is invariant to
+    /// a uniform scale (eps aside), and the un-scaled output overflows f16 —
+    /// the target's residual stream carries massive activations (|x| up to
+    /// ~5e3 on Qwen3-4B) and the fc sum over five taps reaches ~8e4.
+    DivBy(u32),
 }
 
 impl ValueTransform {
@@ -76,6 +120,12 @@ impl ValueTransform {
             ValueTransform::NegExp => {
                 for v in values.iter_mut() {
                     *v = -v.exp();
+                }
+            }
+            ValueTransform::DivBy(n) => {
+                let s = 1.0f32 / n as f32;
+                for v in values.iter_mut() {
+                    *v *= s;
                 }
             }
         }
@@ -94,6 +144,18 @@ pub trait HfMapper: Sync {
     /// rmsnorm kernel. Default: no shift.
     fn norm_shift(&self, _canonical: &str) -> f32 {
         0.0
+    }
+
+    /// [`norm_shift`](Self::norm_shift) for an MLX (mlx-lm) source, whose
+    /// stored norm values need not follow the HF checkpoint's convention.
+    /// mlx-lm's own converters may bake a family's `(1 + weight)` offset
+    /// into the stored tensor so its runtime uses the plain `nn.RMSNorm`;
+    /// an HF-shaped +1 on top of that doubles it, and the bundle decodes
+    /// garbage while `--validate` (which mirrors the converter) passes.
+    /// Default: the HF rule, for families whose MLX export keeps the HF
+    /// values.
+    fn mlx_norm_shift(&self, canonical: &str) -> f32 {
+        self.norm_shift(canonical)
     }
 
     /// RoPE row-permutation head count for a canonical tensor at HF→.base
@@ -171,8 +233,12 @@ pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMappe
         // (tokenizer_defaults.h). REVALIDATED on microsoft/Phi-3-mini-4k-instruct
         // (converted Q8): chat output is coherent across probes, no flood.
         // Phi-3.5 stays OUT — it needs LongRoPE, which the engine (linear scaling
-        // only) does not implement.
-        "llama" | "mistral" | "phi3" => Some(&llama::LlamaHfMapper),
+        // only) does not implement. HF ships Phi-3.5 under the same broad
+        // `phi3` model_type, so phi3 routes through a guarded wrapper that
+        // fails the conversion when `rope_scaling` (LongRoPE) is present
+        // instead of silently converting with incorrect rotary scaling.
+        "llama" | "mistral" => Some(&llama::LlamaHfMapper),
+        "phi3" => Some(&llama::Phi3HfMapper),
         "qwen2" | "qwen3" => Some(&qwen::QwenHfMapper),
         "qwen2_moe" | "qwen3_moe" => Some(&qwen::QwenMoeHfMapper),
         // Qwen3.5 / 3.6: hybrid Gated-DeltaNet + full-attention decoder
@@ -326,8 +392,71 @@ pub trait GgufMapper: Sync {
     }
 }
 
+/// Generation defaults the MODEL publishes, from the checkpoint's
+/// `generation_config.json` — the file HF model authors use to say how their
+/// model should be sampled. Qwen3.8-27B ships `top_k: 20, top_p: 0.95`;
+/// Qwen2.5-0.5B-Instruct ships `temperature: 0.7, top_p: 0.8, top_k: 20`. They
+/// differ per model, which is exactly why a serving runtime cannot express
+/// this as one global constant.
+///
+/// `None` means the checkpoint made no claim, and the runtime keeps its own
+/// default. Every field is validated on the way in (see `from_generation_config`):
+/// a checkpoint is free to publish nonsense and we would rather ignore a field
+/// than bake a bad value into a bundle that outlives the conversion.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SamplingDefaults {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    /// Recorded for visibility but DELIBERATELY NOT applied as a default: a
+    /// repetition penalty damages dialect structure (baseRT PR #417 — the
+    /// model swerves to unpenalized near-synonyms and tool calls leak as
+    /// visible text), and several checkpoints publish 1.1. A caller that wants
+    /// one asks for it explicitly.
+    pub repetition_penalty: Option<f32>,
+    /// `do_sample: false` means the author wants greedy decoding.
+    pub do_sample: Option<bool>,
+}
+
+impl SamplingDefaults {
+    /// Parse an HF `generation_config.json` body. Out-of-range values are
+    /// dropped field-by-field rather than failing the conversion — a bad
+    /// `temperature` should not cost us a good `top_k`.
+    pub fn from_generation_config(gc: &serde_json::Value) -> Self {
+        let f32_in = |key: &str, lo: f32, hi: f32| -> Option<f32> {
+            let v = gc.get(key)?.as_f64()? as f32;
+            (v.is_finite() && v >= lo && v <= hi).then_some(v)
+        };
+        Self {
+            // 0 is legal and means greedy; above ~2 is a sampling experiment,
+            // not a recommendation.
+            temperature: f32_in("temperature", 0.0, 4.0),
+            // 0 would admit nothing; 1.0 means "no truncation" and is a claim
+            // worth honouring as much as 0.95 is.
+            top_p: f32_in("top_p", 0.001, 1.0),
+            top_k: gc
+                .get("top_k")
+                .and_then(|v| v.as_u64())
+                .filter(|k| *k <= 1_000_000)
+                .map(|k| k as u32),
+            min_p: f32_in("min_p", 0.0, 1.0),
+            repetition_penalty: f32_in("repetition_penalty", 0.5, 2.0),
+            do_sample: gc.get("do_sample").and_then(|v| v.as_bool()),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ArchConfig {
+    /// Open-namespace header keys a mapper adds beyond the typed fields
+    /// (block drafters: `speculator_kind`, `block_size`, `mask_token_id`,
+    /// `target_layer_ids`, …). Merged into the header config verbatim.
+    pub extra_config: std::collections::BTreeMap<String, serde_json::Value>,
     pub hidden_size: u32,
     pub num_hidden_layers: u32,
     pub num_attention_heads: u32,
@@ -385,6 +514,10 @@ pub struct ArchConfig {
     /// element; the rest land here. Runtime registers each via
     /// `Tokenizer::add_eos_id` so generation honors any of them.
     pub eos_token_ids: Vec<u32>,
+
+    /// Sampling defaults published by the checkpoint (see `SamplingDefaults`).
+    /// Empty when it published none.
+    pub sampling_defaults: SamplingDefaults,
 
     // ── Gemma-4-specific fields (zero/empty for other archs) ─────────
     /// Explicit attention scale used at Q·K^T (Gemma 4 uses 1.0 instead
@@ -617,6 +750,29 @@ impl ArchConfig {
     pub fn to_config_map(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
         use serde_json::json;
         let mut m = std::collections::BTreeMap::new();
+        // Model-published sampling defaults. Emitted only when the checkpoint
+        // actually claimed one, so "absent" stays distinguishable from "the
+        // author asked for this value" — the runtime needs that difference to
+        // know when its own default applies.
+        let sd = &self.sampling_defaults;
+        if let Some(v) = sd.temperature {
+            m.insert("default_temperature".into(), json!(v));
+        }
+        if let Some(v) = sd.top_p {
+            m.insert("default_top_p".into(), json!(v));
+        }
+        if let Some(v) = sd.top_k {
+            m.insert("default_top_k".into(), json!(v));
+        }
+        if let Some(v) = sd.min_p {
+            m.insert("default_min_p".into(), json!(v));
+        }
+        if let Some(v) = sd.repetition_penalty {
+            m.insert("default_repetition_penalty".into(), json!(v));
+        }
+        if let Some(v) = sd.do_sample {
+            m.insert("default_do_sample".into(), json!(v));
+        }
         m.insert("hidden_size".into(), json!(self.hidden_size));
         m.insert("num_hidden_layers".into(), json!(self.num_hidden_layers));
         m.insert(
@@ -938,13 +1094,93 @@ impl ArchConfig {
                 json!(self.index_share_for_mtp_iteration),
             );
         }
+        for (k, v) in &self.extra_config {
+            m.insert(k.clone(), v.clone());
+        }
         m
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Real published values, verbatim from the checkpoints. Qwen3.8-27B is
+    /// the model whose full-tail sampling produced runaway repeats.
+    #[test]
+    fn parses_real_generation_configs() {
+        let qwen38 = serde_json::json!({
+            "bos_token_id": 248044, "do_sample": true,
+            "eos_token_id": [248046, 248044], "pad_token_id": 248044,
+            "temperature": 1.0, "top_k": 20, "top_p": 0.95,
+            "min_p": 0, "repetition_penalty": 1.0
+        });
+        let sd = SamplingDefaults::from_generation_config(&qwen38);
+        assert_eq!(sd.top_k, Some(20), "Qwen3.8 asks for top_k 20");
+        assert_eq!(sd.top_p, Some(0.95));
+        assert_eq!(sd.temperature, Some(1.0));
+        assert_eq!(sd.min_p, Some(0.0));
+        assert_eq!(sd.do_sample, Some(true));
+
+        let qwen25 = serde_json::json!({
+            "do_sample": true, "repetition_penalty": 1.1,
+            "temperature": 0.7, "top_p": 0.8, "top_k": 20
+        });
+        let sd = SamplingDefaults::from_generation_config(&qwen25);
+        assert_eq!(sd.temperature, Some(0.7), "defaults differ per model");
+        assert_eq!(sd.top_p, Some(0.8));
+        assert_eq!(sd.repetition_penalty, Some(1.1));
+    }
+
+    /// A checkpoint free-texting nonsense must not poison a bundle that
+    /// outlives the conversion — drop the bad field, keep the good ones.
+    #[test]
+    fn out_of_range_fields_are_dropped_individually() {
+        let junk = serde_json::json!({
+            "temperature": 99.0, "top_p": 5.0, "top_k": 20, "min_p": -1.0
+        });
+        let sd = SamplingDefaults::from_generation_config(&junk);
+        assert_eq!(sd.temperature, None, "99.0 is not a recommendation");
+        assert_eq!(sd.top_p, None, "top_p > 1 is meaningless");
+        assert_eq!(sd.min_p, None);
+        assert_eq!(sd.top_k, Some(20), "the sane field survives");
+    }
+
+    /// No generation_config keys at all = no claim, and the runtime keeps its
+    /// own default. "Absent" must stay distinguishable from "author chose".
+    #[test]
+    fn absent_keys_make_no_claim() {
+        let sd = SamplingDefaults::from_generation_config(&serde_json::json!({"eos_token_id": 7}));
+        assert!(sd.is_empty());
+        assert!(!ArchConfig::default()
+            .to_config_map()
+            .contains_key("default_top_k"));
+    }
+
+    /// Only claimed fields reach the bundle header.
+    #[test]
+    fn only_claimed_defaults_are_emitted() {
+        let mut c = ArchConfig::default();
+        c.sampling_defaults.top_k = Some(20);
+        let m = c.to_config_map();
+        assert_eq!(m.get("default_top_k"), Some(&serde_json::json!(20)));
+        assert!(!m.contains_key("default_top_p"), "unclaimed stays absent");
+    }
     use super::*;
+
+    /// Explicitly unsupported architectures stay fail-closed at the dispatch
+    /// layer (capability-audit): Gemma 3n's AltUp/Laurel/per-layer-FFN stack
+    /// has no engine execution path, so neither its model_type nor any
+    /// variant spelling may resolve to a mapper.
+    #[test]
+    fn gemma3n_has_no_mapper() {
+        for t in ["gemma3n", "gemma3n_text", "gemma-3n"] {
+            assert!(
+                hf_mapper_for_model_type(t).is_none(),
+                "{t} must not convert"
+            );
+            assert!(!SUPPORTED_HF_MODEL_TYPES.contains(&t));
+        }
+    }
 
     /// `SUPPORTED_HF_MODEL_TYPES` must list exactly what the dispatch match
     /// accepts — every advertised type resolves, and nothing else creeps in.

@@ -118,13 +118,23 @@ impl ScanReport {
 }
 
 /// List every model repository under `org`, following pagination.
+///
+/// Authenticated when a Hub token resolves (the same one the tree reads
+/// send): an anonymous listing hides the org's private repositories, and a
+/// scan that cannot see a repository drops its rows as "no longer
+/// published" — every private drafter sidecar, on the last run.
 pub fn list_org_repos(org: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut url = format!("{}/api/models?author={org}&limit=100", endpoint());
+    let token = crate::fetch::resolve_token();
     // The Hub paginates with a `Link: <…>; rel="next"` header. Bounded so a
     // malformed or cyclic Link chain cannot spin forever.
     for _ in 0..50 {
-        let resp = ureq::get(&url)
+        let mut req = ureq::get(&url);
+        if let Some(t) = &token {
+            req = req.header("Authorization", &format!("Bearer {t}"));
+        }
+        let resp = req
             .call()
             .with_context(|| format!("listing models for {org}"))?;
         let next = resp
@@ -196,6 +206,28 @@ fn inherited_source_repo(known: &Catalog, repo: &str) -> Option<String> {
         .iter()
         .find(|m| m.hf_repo == repo && m.source_repo.is_some())
         .and_then(|m| m.source_repo.clone())
+}
+
+/// Which target a sidecar drafts for (`speculator_for`) is curated the same
+/// way: a sidecar's header names its own architecture (dflash / dspark /
+/// eagle3), never the model it was trained against. Carried across from any
+/// known row of the same repo, as `source_repo` is.
+fn inherited_speculator_for(known: &Catalog, repo: &str) -> Option<String> {
+    known
+        .models
+        .iter()
+        .find(|m| m.hf_repo == repo && m.speculator_for.is_some())
+        .and_then(|m| m.speculator_for.clone())
+}
+
+/// A sidecar's rank among its target's drafters is curated beside
+/// `speculator_for` and carried across the same way.
+fn inherited_speculator_rank(known: &Catalog, repo: &str) -> Option<u32> {
+    known
+        .models
+        .iter()
+        .find(|m| m.hf_repo == repo && m.speculator_rank.is_some())
+        .and_then(|m| m.speculator_rank)
 }
 
 /// Read a published bundle's header without downloading the bundle.
@@ -570,6 +602,8 @@ pub fn scan_org(
                     // so publishing a new quant does not quietly drop it from
                     // the ones already curated.
                     entry.source_repo = inherited_source_repo(known, repo);
+                    entry.speculator_for = inherited_speculator_for(known, repo);
+                    entry.speculator_rank = inherited_speculator_rank(known, repo);
                     entry.parts_sha256 = parts_sha256;
                     report.entries.push(entry)
                 }
@@ -717,6 +751,9 @@ mod tests {
                 sha256: Some("abc123".into()),
                 parts_sha256: None,
                 backend: None,
+                speculator: None,
+                speculator_for: None,
+                speculator_rank: None,
             }],
         };
         let r = scan_org(
@@ -782,6 +819,9 @@ mod tests {
                     sha256: Some("q4sha".into()),
                     parts_sha256: None,
                     backend: None,
+                    speculator: None,
+                    speculator_for: None,
+                    speculator_rank: None,
                 },
                 CatalogEntry {
                     id: "basecompute/other".into(),
@@ -795,6 +835,9 @@ mod tests {
                     sha256: Some("othersha".into()),
                     parts_sha256: None,
                     backend: None,
+                    speculator: None,
+                    speculator_for: None,
+                    speculator_rank: None,
                 },
             ],
         };
@@ -806,6 +849,73 @@ mod tests {
         // neighbour's.
         assert_eq!(inherited_source_repo(&known, "basecompute/other"), None);
         assert_eq!(inherited_source_repo(&known, "basecompute/unknown"), None);
+    }
+
+    #[test]
+    fn a_rescanned_sidecar_keeps_its_curated_target() {
+        // A sidecar's header says what it is (its own arch), not what it
+        // drafts for: `speculator_for` lives only in the checked-in catalog,
+        // so a re-read of the same repo (a changed file, a new quant) must
+        // inherit it from a sibling row or the association is lost.
+        let known = Catalog {
+            schema: 1,
+            updated: String::new(),
+            models: vec![
+                CatalogEntry {
+                    id: "basecompute/Qwen3-4B-DFlash".into(),
+                    hf_repo: "basecompute/Qwen3-4B-DFlash".into(),
+                    file: "Qwen3-4B-DFlash-F16.base".into(),
+                    revision: "main".into(),
+                    source_repo: Some("z-lab/Qwen3-4B-DFlash".into()),
+                    arch: Some("dflash".into()),
+                    quant: "default-f16".into(),
+                    size: Some(1),
+                    sha256: Some("f16sha".into()),
+                    parts_sha256: None,
+                    backend: None,
+                    speculator: Some("dflash".into()),
+                    speculator_for: Some("basecompute/Qwen3-4B".into()),
+                    speculator_rank: Some(2),
+                },
+                CatalogEntry {
+                    id: "basecompute/Qwen3-4B".into(),
+                    hf_repo: "basecompute/Qwen3-4B".into(),
+                    file: "Qwen3-4B-Q4.base".into(),
+                    revision: "main".into(),
+                    source_repo: Some("Qwen/Qwen3-4B".into()),
+                    arch: Some("qwen".into()),
+                    quant: "default-q4".into(),
+                    size: Some(1),
+                    sha256: Some("q4sha".into()),
+                    parts_sha256: None,
+                    backend: None,
+                    speculator: None,
+                    speculator_for: None,
+                    speculator_rank: None,
+                },
+            ],
+        };
+        assert_eq!(
+            inherited_speculator_for(&known, "basecompute/Qwen3-4B-DFlash").as_deref(),
+            Some("basecompute/Qwen3-4B")
+        );
+        assert_eq!(
+            inherited_speculator_rank(&known, "basecompute/Qwen3-4B-DFlash"),
+            Some(2)
+        );
+        assert_eq!(
+            inherited_speculator_rank(&known, "basecompute/Qwen3-4B"),
+            None
+        );
+        // A target repo never borrows a sidecar's association.
+        assert_eq!(
+            inherited_speculator_for(&known, "basecompute/Qwen3-4B"),
+            None
+        );
+        assert_eq!(
+            inherited_speculator_for(&known, "basecompute/unknown"),
+            None
+        );
     }
 
     #[test]
@@ -1112,6 +1222,9 @@ mod tests {
                 sha256: Some("abc123".into()),
                 parts_sha256: None,
                 backend: None,
+                speculator: None,
+                speculator_for: None,
+                speculator_rank: None,
             }],
         };
         let r = scan_org(

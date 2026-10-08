@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod gpt_oss;
 mod hub;
+mod lora;
 
 /// Hand-written top-level help: the runtime commands are dispatched via
 /// clap's external-subcommand catch-all (invisible to clap's auto listing),
@@ -54,6 +55,9 @@ struct Args {
 enum Cmd {
     /// Convert a source model to `.base`.
     Convert(ConvertArgs),
+    /// Convert a PEFT LoRA adapter directory to an adapter `.base`
+    /// (loadable via `/v1/lora/load` / `baseRT_lora_load`).
+    ConvertLora(lora::ConvertLoraArgs),
     /// Sign an existing unsigned `.base` file.
     Sign(SignArgs),
     /// Verify a signed `.base` file.
@@ -148,6 +152,15 @@ struct ConvertArgs {
     /// transplant path existed.
     #[arg(long)]
     no_mlx_passthrough: bool,
+    /// Block-drafter / EAGLE-3 sidecars only: quantize the drafter's own
+    /// transformer layers (`layers.*` q/k/v/o and FFN projections) with
+    /// `--target` instead of keeping the whole sidecar f16. The heads that
+    /// define the scheme (fc taps, hidden_norm, Markov / confidence heads,
+    /// the EAGLE-3 lm_head and d2t) and every norm stay f16. A DFlash-b16
+    /// head for Qwen3-4B is 1 GB f16 — streamed on every block step; q8
+    /// halves it, q4 quarters it, at a small cost in acceptance.
+    #[arg(long)]
+    quantize_drafter: bool,
     /// GGUF sources only: copy Q4_K / Q5_K / Q6_K super-blocks into the
     /// bundle VERBATIM instead of dequantizing and re-packing them.
     ///
@@ -166,6 +179,52 @@ struct ConvertArgs {
     /// unaffected and take the normal path.
     #[arg(long)]
     kquant_passthrough: bool,
+
+    /// Do NOT materialize a separate `lm_head.weight` for a tied model.
+    ///
+    /// By default a `tie_word_embeddings` source gets a second copy of its
+    /// embedding appended under `lm_head.weight`, so the profile's head rule
+    /// (q6/q8, or the `**.weight` catch-all) sets the LOGIT-projection
+    /// precision while `embed_tokens.weight` keeps its own (usually f16)
+    /// rule — see `plan_tied_lm_head`. Relative to a bundle converted before
+    /// that existed, the logits of Qwen3-0.6B/1.7B/4B or Llama-3.2 move from
+    /// f16 to the head rule's dtype on reconvert. This flag reproduces the
+    /// older layout: the runtime projects logits through the embedding
+    /// tensor at the embedding's precision. Every conversion prints which
+    /// of the two it did and which profile rule the head hit.
+    ///
+    /// Archs whose runtime never reads `output.weight` (Gemma 3/4) never
+    /// synthesize a head regardless of this flag.
+    #[arg(long)]
+    no_synth_tied_head: bool,
+
+    /// Give a bundle's MTP speculator head its OWN copy of the lm_head
+    /// (`mtp.lm_head.weight`, quantized by the profile's rule for that
+    /// name — the `**.weight` catch-all otherwise) instead of sharing the
+    /// target's. On q4mix profiles the target's head is q8 for accuracy,
+    /// and every chained draft of the speculator then streams the full q8
+    /// head (the 27B's 1.27 GB is 8 of a draft's 10 ms on a GB10); the
+    /// drafts are verified against the target anyway, so the head can use
+    /// a q4 copy. Costs the copy's bytes (a q4 head is half the q8 one).
+    #[arg(long)]
+    speculator_lm_head: bool,
+
+    /// Ship a drafting-vocabulary ranking with the bundle's MTP speculator
+    /// head: a ranking JSON (`{"ranked_ids": [...]}`, token ids most frequent
+    /// first — tools/mtp_draft_ranking.py writes one) stored as
+    /// `mtp.draft_rank` (f32 ids) in the speculator section. The runtime's
+    /// chain then scores only the top `--mtp-draft-vocab` rows of the lm_head
+    /// per drafted token (plus every special token) instead of the whole
+    /// vocabulary — FR-Spec; the target's verify is unchanged, so output is
+    /// too. Refused on a bundle without an MTP speculator.
+    #[arg(long, value_name = "RANKING_JSON")]
+    mtp_draft_ranking: Option<PathBuf>,
+
+    /// With `--mtp-draft-ranking`: the drafting vocabulary's default size
+    /// (`draft_vocab_size` in the speculator config; BASERT_MTP_DRAFT_VOCAB
+    /// overrides it at run time). Unset = the runtime's default.
+    #[arg(long, value_name = "K", requires = "mtp_draft_ranking")]
+    mtp_draft_vocab: Option<u32>,
 
     /// GGUF sources only: fold a companion `mmproj-*.gguf` perception tower
     /// into the bundle, so one `.base` carries both the text model and the
@@ -417,6 +476,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd {
         Cmd::Convert(a) => cmd_convert(a),
+        Cmd::ConvertLora(a) => lora::cmd_convert_lora(a),
         Cmd::Sign(a) => cmd_sign(a),
         Cmd::Verify(a) => cmd_verify(a),
         Cmd::Inspect(a) => cmd_inspect(a),
@@ -489,7 +549,7 @@ fn cmd_convert(args: ConvertArgs) -> Result<()> {
     let fmt = base_readers::detect_format(&args.input)
         .with_context(|| format!("detecting format for {:?}", args.input))?;
 
-    match fmt {
+    let result = match fmt {
         SourceFormat::Gguf => convert_gguf(
             &args.input,
             &output,
@@ -499,7 +559,35 @@ fn cmd_convert(args: ConvertArgs) -> Result<()> {
         ),
         SourceFormat::HfSafetensors => convert_hf(&args.input, &output, &ctx),
         SourceFormat::MlxSafetensors => convert_mlx(&args.input, &output, &ctx),
+    };
+    if result.is_ok()
+        && ctx.awq_profile.is_some()
+        && ctx.awq_applied.load(std::sync::atomic::Ordering::Relaxed) == 0
+    {
+        // Two different failures end in the same "0 rotated": no name in the
+        // sidecar matched any tensor, or names matched but every absmax had
+        // the wrong length. The fix differs (re-name vs re-capture), so say
+        // which one happened.
+        let shape_skipped = ctx
+            .awq_shape_skipped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if shape_skipped == 0 {
+            eprintln!(
+                "  WARNING: --awq-profile matched ZERO tensors — every sidecar \
+                 lookup missed and plain RTN was used throughout. The sidecar's \
+                 tensor names do not correspond to this model."
+            );
+        } else {
+            eprintln!(
+                "  WARNING: --awq-profile rotated ZERO tensors — {shape_skipped} sidecar \
+                 lookups hit but every absmax length differed from the tensor's \
+                 in_features, so plain RTN was used throughout. The sidecar's names \
+                 correspond to this model but its stats were captured at a different \
+                 geometry (another size or variant); re-run calibration on this model."
+            );
+        }
     }
+    result
 }
 
 /// Build the typed per-layer descriptors for the header. Homogeneous
@@ -624,7 +712,14 @@ fn convert_gguf(
 
     let mapper = source_mapper_for_gguf(arch)
         .ok_or_else(|| anyhow::anyhow!("arch {:?} not supported yet", arch))?;
-    let config = mapper.config_from_gguf(&gguf.metadata)?;
+    let mut config = mapper.config_from_gguf(&gguf.metadata)?;
+
+    config.tie_word_embeddings = infer_gguf_tied_embeddings(
+        mapper,
+        config.tie_word_embeddings,
+        gguf.tensors.iter().map(|t| t.name.as_str()),
+    );
+    let config = config;
 
     eprintln!(
         "  config:  hidden={}, layers={}, heads={}/{}, ffn={}, vocab={}",
@@ -696,6 +791,7 @@ fn convert_gguf(
         layers: layer_descriptors_from_config(&config),
         tensors: vec![],
         mmproj: None,
+        speculator: None,
         calibration: None,
         provenance: None,
         sig: None,
@@ -733,11 +829,51 @@ fn convert_gguf(
     let mut kept = 0usize;
     let mut passthrough_tensors = 0usize;
     let mut unpermuted = 0usize;
-    for info in gguf.tensors.iter() {
+    // Resolve names first so a tie_word_embeddings model can append a synthetic
+    // `lm_head.weight` sourced from the embedding (see plan_tied_lm_head). Index
+    // into gguf.tensors rather than holding references so the extra entry can
+    // alias an earlier tensor.
+    let mut work: Vec<(usize, String)> = Vec::new();
+    for (i, info) in gguf.tensors.iter().enumerate() {
         let Some(canonical) = mapper.map_tensor_name(&info.name) else {
             dropped += 1;
             continue;
         };
+        work.push((i, canonical));
+    }
+    {
+        let pairs: Vec<(String, String)> = work
+            .iter()
+            .map(|(i, c)| (gguf.tensors[*i].name.clone(), c.clone()))
+            .collect();
+        let plan = plan_tied_lm_head(
+            &pairs,
+            config.tie_word_embeddings,
+            mapper.canonical_arch(),
+            ctx.synth_tied_head,
+        );
+        let src_idx = match &plan {
+            TiedHeadPlan::Synthesize { src } => gguf.tensors.iter().position(|t| t.name == *src),
+            _ => None,
+        };
+        // The passthrough branch below copies k-quant super-blocks verbatim,
+        // so a k-quant embedding yields a head at the SAME precision as the
+        // embedding — the profile's head rule never runs. Say so.
+        let copy = match src_idx {
+            Some(idx) if kquant_passthrough && is_kquant(gguf.tensors[idx].ggml_type) => {
+                TiedHeadCopy::Verbatim {
+                    ggml_type: ggml_type_name(gguf.tensors[idx].ggml_type),
+                }
+            }
+            _ => TiedHeadCopy::Quantized,
+        };
+        report_tied_head_plan(&plan, ctx, mapper.canonical_arch(), copy);
+        if let Some(idx) = src_idx {
+            work.push((idx, "lm_head.weight".to_string()));
+        }
+    }
+    for (idx, canonical) in work {
+        let info = &gguf.tensors[idx];
         kept += 1;
 
         let raw = gguf
@@ -1428,45 +1564,31 @@ fn kquant_passthrough_entry(
 }
 
 /// Convert from an HF safetensors directory.
-fn convert_hf(input: &std::path::Path, output: &std::path::Path, ctx: &QuantContext) -> Result<()> {
-    use base_arch::hf_mapper_for_model_type;
-    use base_readers::hf::HfDir;
-    let hf = HfDir::open(input)?;
-    let model_type = hf
-        .model_type()
-        .ok_or_else(|| anyhow::anyhow!("config.json missing model_type"))?;
-    eprintln!("  arch:    {}", model_type);
-    let mapper = hf_mapper_for_model_type(model_type)
-        .ok_or_else(|| anyhow::anyhow!("HF model_type {:?} not supported yet", model_type))?;
-    let config = mapper.config_from_hf(&hf.config)?;
-    // Whisper is an encoder-decoder speech model with its own
-    // engine-native tensor naming, flat `whisper.*` token metadata, and
-    // an all-f16 tensor policy — none of which fit the decoder-only
-    // quantize path below. Dedicated path.
-    if mapper.canonical_arch() == "whisper" {
-        return convert_whisper(input, output, ctx, &hf, config);
-    }
-    eprintln!(
-        "  config:  hidden={}, layers={}, heads={}/{}, ffn={}, vocab={}",
-        config.hidden_size,
-        config.num_hidden_layers,
-        config.num_attention_heads,
-        config.num_kv_heads,
-        config.intermediate_size,
-        config.vocab_size
-    );
-    // Merge the generation stop set from generation_config.json. HF declares
-    // the authoritative end-of-generation ids there; config.json often carries
-    // only a single scalar eos. Phi-3 is the canonical case: config.json has
-    // eos_token_id=32000 (<|endoftext|>) but generation_config.json has
-    // [32000, 32001, 32007] where <|end|>(32007) ends every chat turn. Without
-    // the full set the runtime never stops on <|end|>, so the model floods /
-    // repeats past its turn (finish_reason=length forever). Keep config.json's
-    // primary eos first; append any extra ids from generation_config.json.
-    let mut config = config;
+/// Fold a checkpoint's `generation_config.json` into `config`: the generation
+/// STOP SET and the author's recommended SAMPLING settings.
+///
+/// Shared by every directory-shaped conversion path. It used to live inline in
+/// `convert_hf`, which meant an MLX checkpoint carrying the same file — and the
+/// source downloader keeps it — silently lost both, and was served with runtime
+/// fallbacks instead of what its author published.
+fn apply_generation_config(input: &std::path::Path, config: &mut base_arch::ArchConfig) {
     let gc_path = input.join("generation_config.json");
     if let Ok(text) = std::fs::read_to_string(&gc_path) {
         if let Ok(gc) = serde_json::from_str::<serde_json::Value>(&text) {
+            // The same file also carries the author's recommended SAMPLING
+            // settings, which a serving runtime otherwise has to guess at (and
+            // guessed wrong: Qwen3.8 asks for top_k 20 / top_p 0.95, and
+            // sampling its whole 150K-id tail instead is what tipped agent
+            // turns into verbatim repeat loops).
+            config.sampling_defaults = base_arch::SamplingDefaults::from_generation_config(&gc);
+            if !config.sampling_defaults.is_empty() {
+                let sd = &config.sampling_defaults;
+                eprintln!(
+                    "  sampling: model defaults temp={:?} top_p={:?} top_k={:?} min_p={:?} \
+                 (repetition_penalty={:?} recorded, not applied)",
+                    sd.temperature, sd.top_p, sd.top_k, sd.min_p, sd.repetition_penalty
+                );
+            }
             let mut gen_ids: Vec<u32> = Vec::new();
             match &gc["eos_token_id"] {
                 serde_json::Value::Number(n) => {
@@ -1509,7 +1631,71 @@ fn convert_hf(input: &std::path::Path, output: &std::path::Path, ctx: &QuantCont
             }
         }
     }
+}
 
+fn convert_hf(input: &std::path::Path, output: &std::path::Path, ctx: &QuantContext) -> Result<()> {
+    use base_arch::hf_mapper_for_model_type;
+    use base_readers::hf::HfDir;
+    let hf = HfDir::open(input)?;
+    // RedHat's speculators packaging keeps model_type inside
+    // `transformer_layer_config` (the EAGLE-3 layer's own config).
+    let nested_model_type = hf
+        .config
+        .get("transformer_layer_config")
+        .and_then(|t| t.get("model_type"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let model_type: &str = hf
+        .model_type()
+        .or(nested_model_type.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("config.json missing model_type"))?;
+    // Block drafters (DFlash / DSpark) carry the BACKBONE's model_type
+    // (`qwen3`); their `architectures` entry is what tells them apart from
+    // the LM they draft for.
+    let mapper: &dyn base_arch::HfMapper = if let Some(m) =
+        base_arch::dflash::hf_mapper_for_architectures(&hf.config)
+    {
+        eprintln!(
+            "  arch:    {} (block drafter sidecar: {})",
+            model_type,
+            m.canonical_arch()
+        );
+        m
+    } else if let Some(m) = base_arch::dflash::hf_mapper_for_eagle3(&hf.config) {
+        eprintln!("  arch:    {} (EAGLE-3 head sidecar)", model_type);
+        m
+    } else {
+        eprintln!("  arch:    {}", model_type);
+        hf_mapper_for_model_type(model_type)
+            .ok_or_else(|| anyhow::anyhow!("HF model_type {:?} not supported yet", model_type))?
+    };
+    let config = mapper.config_from_hf(&hf.config)?;
+    // Whisper is an encoder-decoder speech model with its own
+    // engine-native tensor naming, flat `whisper.*` token metadata, and
+    // an all-f16 tensor policy — none of which fit the decoder-only
+    // quantize path below. Dedicated path.
+    if mapper.canonical_arch() == "whisper" {
+        return convert_whisper(input, output, ctx, &hf, config);
+    }
+    eprintln!(
+        "  config:  hidden={}, layers={}, heads={}/{}, ffn={}, vocab={}",
+        config.hidden_size,
+        config.num_hidden_layers,
+        config.num_attention_heads,
+        config.num_kv_heads,
+        config.intermediate_size,
+        config.vocab_size
+    );
+    // Merge the generation stop set from generation_config.json. HF declares
+    // the authoritative end-of-generation ids there; config.json often carries
+    // only a single scalar eos. Phi-3 is the canonical case: config.json has
+    // eos_token_id=32000 (<|endoftext|>) but generation_config.json has
+    // [32000, 32001, 32007] where <|end|>(32007) ends every chat turn. Without
+    // the full set the runtime never stops on <|end|>, so the model floods /
+    // repeats past its turn (finish_reason=length forever). Keep config.json's
+    // primary eos first; append any extra ids from generation_config.json.
+    let mut config = config;
+    apply_generation_config(input, &mut config);
     let provider = HfTensorProvider { hf: &hf };
     let mmproj_cfg = mmproj_config_from_hf(&hf);
     let config_for_permute = config.clone();
@@ -1524,6 +1710,13 @@ fn convert_hf(input: &std::path::Path, output: &std::path::Path, ctx: &QuantCont
         .unwrap_or(false);
     if nvfp4_source {
         eprintln!("  source:  NVFP4-quantized checkpoint (mirror policy: transplant + carry)");
+    }
+    if let Some([bo, bi]) = hf.fp8_block_size() {
+        eprintln!(
+            "  source:  block-FP8 checkpoint ({} e4m3 weights × [{bo}, {bi}] scales, \
+             dequantized to f32 before the target scheme)",
+            hf.fp8_weight_count()
+        );
     }
     convert_generic(
         input,
@@ -1776,6 +1969,7 @@ fn convert_whisper(
             .collect(),
         tensors: vec![],
         mmproj: None,
+        speculator: None,
         calibration: None,
         sig: None,
         provenance: None,
@@ -1968,7 +2162,11 @@ fn convert_mlx(
     }
     let mapper = hf_mapper_for_model_type(model_type)
         .ok_or_else(|| anyhow::anyhow!("model_type {:?} not supported yet", model_type))?;
-    let config = mapper.config_from_hf(&mlx.hf.config)?;
+    let mut config = mapper.config_from_hf(&mlx.hf.config)?;
+    // An MLX checkpoint ships the same generation_config.json as its HF source
+    // (the source downloader keeps it), so it gets the same stop set and the
+    // same published sampling defaults.
+    apply_generation_config(input, &mut config);
     eprintln!(
         "  config:  hidden={}, layers={}, heads={}/{}, ffn={}, vocab={}",
         config.hidden_size,
@@ -2009,7 +2207,10 @@ fn convert_mlx(
         names.clone(),
         &tokenizer_from_hf(&mlx.hf),
         mmproj_cfg,
-        &|n| mapper.norm_shift(n),
+        // The MLX rule, not the HF one: mlx-lm may have baked a family's
+        // norm offset into the stored values already (Qwen3.5+ does), and
+        // shifting those again is BAS-959.
+        &|n| mapper.mlx_norm_shift(n),
         &|n| mapper.rope_permute_heads(n, &config_for_permute),
         &|n| mapper.value_transform(n),
         mapper.shape_fastest_first(),
@@ -2021,7 +2222,7 @@ fn convert_mlx(
     )?;
     if ctx.validate {
         validate_mlx_bundle(output, &mlx, &names, mapper.canonical_arch(), &|n| {
-            mapper.norm_shift(n)
+            mapper.mlx_norm_shift(n)
         })?;
     }
     Ok(())
@@ -2054,6 +2255,12 @@ fn validate_mlx_bundle(
     use base_format::{BaseReader, TensorDtype};
     let reader = BaseReader::open(output).context("re-opening written .base for --validate")?;
     let (mut n_pass, mut n_f16, mut n_repack, mut n_skip) = (0usize, 0usize, 0usize, 0usize);
+    // 1-D tensors the converter offset from the source. The comparison
+    // below mirrors the converter's own rule, so it cannot judge the rule;
+    // the count makes the rule's effect visible (BAS-959 passed "byte-
+    // identical" with every norm shifted — it should read 0 shifted for
+    // a family whose MLX export already carries its offset).
+    let mut n_shifted = 0usize;
     for n in source_names {
         let Some(Canonical::Main(canonical)) = to_canonical_name(n, canonical_arch) else {
             continue;
@@ -2124,6 +2331,7 @@ fn validate_mlx_bundle(
                 if entry.shape.len() == 1 {
                     let s = norm_shift(&canonical);
                     if s != 0.0 {
+                        n_shifted += 1;
                         for v in f32s.iter_mut() {
                             *v += s;
                         }
@@ -2142,8 +2350,8 @@ fn validate_mlx_bundle(
         }
     }
     eprintln!(
-        "  validate: OK — byte-identical to source ({n_pass} passthrough, {n_f16} f16, \
-         {n_repack} repacked, {n_skip} skipped)"
+        "  validate: OK — byte-identical to source ({n_pass} passthrough, {n_f16} f16 of which \
+         {n_shifted} norm-shifted, {n_repack} repacked, {n_skip} skipped)"
     );
     Ok(())
 }
@@ -2546,6 +2754,9 @@ fn bf16_lossless(vals: &[f32]) -> bool {
 fn vt_label(vt: base_arch::ValueTransform) -> &'static str {
     match vt {
         base_arch::ValueTransform::NegExp => "neg_exp",
+        // The divisor is the drafter mappers' fixed FC_SCALE_DIV (256); the
+        // header's `fc_scale` records the value.
+        base_arch::ValueTransform::DivBy(_) => "div_by_fc_scale",
     }
 }
 
@@ -3206,6 +3417,195 @@ impl TensorProvider for GlmKvbSplitProvider<'_> {
     }
 }
 
+/// Column-block split of a fused projection into per-input GEMM operands,
+/// so the runtime feeds each input through a plain GEMM instead of
+/// assembling a concatenated activation:
+///
+/// * Qwen3.5/3.6/3.8 MTP head: `mtp.fc.weight` ([dim, 2*dim], the
+///   projection of `concat(norm(embed(t+1)), norm(h_t))`) →
+///   `mtp.fc_embed.weight` + `mtp.fc_hidden.weight` ([dim, dim] each).
+/// * Block drafters (DFlash / DSpark sidecars): `fc.weight`
+///   ([dim, n_taps * dim], the projection of the concatenated target taps)
+///   → `fc.{i}.weight` per tap, [dim, dim] each, in target_layer_ids order.
+///
+/// Values are copied column-wise from the bf16 source; every part stays
+/// f16 like the rest of the speculator / drafter tensors.
+struct FcSplitProvider<'a> {
+    inner: &'a dyn TensorProvider,
+    /// virtual name -> (fused source name, column block index, block count)
+    splits: std::collections::BTreeMap<String, (String, usize, usize)>,
+    rewritten: Vec<String>,
+}
+impl<'a> FcSplitProvider<'a> {
+    fn build(
+        inner: &'a dyn TensorProvider,
+        source_names: &[String],
+        canonical_arch: &str,
+        expected_taps: Option<usize>,
+    ) -> Result<Self> {
+        let mut splits = std::collections::BTreeMap::new();
+        let mut rewritten = Vec::with_capacity(source_names.len());
+        let mtp = canonical_arch.starts_with("qwen35");
+        let eagle3 = base_arch::dflash::is_eagle3_arch(canonical_arch);
+        let drafter = base_arch::dflash::is_block_drafter_arch(canonical_arch) || eagle3;
+        for n in source_names {
+            // EAGLE-3: q/k/v project from [normed embedding ; normed feature]
+            // (2·dim columns) — split into the embedding half and the
+            // feature half so the runtime runs two GEMMs over its two inputs.
+            // (`layers.0.` is the speculators packaging's name for the midlayer.)
+            if eagle3
+                && (n.starts_with("midlayer.self_attn.") || n.starts_with("layers.0.self_attn."))
+                && n.ends_with("_proj.weight")
+                && !n.contains("o_proj")
+            {
+                let shape = inner.source_shape(n)?;
+                if shape.len() != 2 || shape[1] % 2 != 0 {
+                    bail!("{n}: expected a [out, 2*dim] EAGLE-3 projection, got {shape:?}");
+                }
+                let e = n.replace("_proj.weight", "_proj_emb.weight");
+                let h = n.replace("_proj.weight", "_proj_hid.weight");
+                splits.insert(e.clone(), (n.clone(), 0, 2));
+                splits.insert(h.clone(), (n.clone(), 1, 2));
+                rewritten.push(e);
+                rewritten.push(h);
+                continue;
+            }
+            if mtp && (n == "mtp.fc.weight" || n.ends_with(".mtp.fc.weight")) {
+                let e = n.replace("mtp.fc.weight", "mtp.fc_embed.weight");
+                let h = n.replace("mtp.fc.weight", "mtp.fc_hidden.weight");
+                splits.insert(e.clone(), (n.clone(), 0, 2));
+                splits.insert(h.clone(), (n.clone(), 1, 2));
+                rewritten.push(e);
+                rewritten.push(h);
+            } else if drafter && n == "fc.weight" {
+                let shape = inner.source_shape(n)?;
+                if shape.len() != 2
+                    || shape[0] == 0
+                    || shape[1] % shape[0] != 0
+                    || shape[1] / shape[0] > 8
+                {
+                    bail!(
+                        "{n}: expected a [dim, n_taps * dim] drafter fc (1..8 taps), got {shape:?}"
+                    );
+                }
+                let parts = (shape[1] / shape[0]) as usize;
+                // The runtime derives n_taps from the CONFIG and binds only
+                // fc.0..fc.{n_taps-1}. A checkpoint whose fc carries more
+                // blocks than the config declares taps would convert, load and
+                // draft — with the extra trained projections silently dropped,
+                // i.e. a different proposal model than the one that was
+                // trained. Fewer blocks than taps fails later at bind; catch
+                // both here, where the source is still in hand.
+                if let Some(taps) = expected_taps {
+                    if parts != taps {
+                        bail!(
+                            "{n}: the checkpoint splits into {parts} tap blocks but the config declares {taps} \
+                             taps — convert the drafter against the config it was trained with"
+                        );
+                    }
+                }
+                for i in 0..parts {
+                    let part = format!("fc.{i}.weight");
+                    splits.insert(part.clone(), (n.clone(), i, parts));
+                    rewritten.push(part);
+                }
+            } else {
+                rewritten.push(n.clone());
+            }
+        }
+        Ok(FcSplitProvider {
+            inner,
+            splits,
+            rewritten,
+        })
+    }
+    fn rewritten_names(&self) -> Vec<String> {
+        self.rewritten.clone()
+    }
+    fn part_shape(&self, src: &str, parts: usize) -> Result<(usize, usize)> {
+        let shape = self.inner.source_shape(src)?;
+        if shape.len() != 2 || shape[1] as usize % parts != 0 {
+            bail!("{src}: expected a [dim, {parts}*dim] fc, got {shape:?}");
+        }
+        Ok((shape[0] as usize, shape[1] as usize / parts))
+    }
+}
+impl TensorProvider for FcSplitProvider<'_> {
+    fn source_shape(&self, name: &str) -> Result<Vec<u64>> {
+        match self.splits.get(name) {
+            Some((src, _, parts)) => {
+                let (rows, cols) = self.part_shape(src, *parts)?;
+                Ok(vec![rows as u64, cols as u64])
+            }
+            None => self.inner.source_shape(name),
+        }
+    }
+    fn to_f32(&self, name: &str) -> Result<Vec<f32>> {
+        let Some((src, which, parts)) = self.splits.get(name) else {
+            return self.inner.to_f32(name);
+        };
+        let (rows, cols) = self.part_shape(src, *parts)?;
+        let data = self.inner.to_f32(src)?;
+        if data.len() != rows * parts * cols {
+            bail!(
+                "{src}: {} elements, expected {}",
+                data.len(),
+                rows * parts * cols
+            );
+        }
+        let mut out = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            let start = r * parts * cols + which * cols;
+            out.extend_from_slice(&data[start..start + cols]);
+        }
+        Ok(out)
+    }
+    fn packed_base_q4(&self, name: &str, group_size: u32) -> Result<Option<base_quant::Packed>> {
+        match self.splits.get(name) {
+            Some(_) => Ok(None),
+            None => self.inner.packed_base_q4(name, group_size),
+        }
+    }
+    fn packed_nvfp4(&self, name: &str) -> Result<Option<base_quant::Packed>> {
+        match self.splits.get(name) {
+            Some(_) => Ok(None),
+            None => self.inner.packed_nvfp4(name),
+        }
+    }
+    fn source_is_quantized(&self, name: &str) -> bool {
+        match self.splits.get(name) {
+            Some(_) => false,
+            None => self.inner.source_is_quantized(name),
+        }
+    }
+}
+
+/// Tensors the runtime reads at f16 rather than through a quant GEMM
+/// route, so a quantized source must dequantize them rather than hand
+/// them to the quantized transplant: the MoE router (`mlp.router` /
+/// HF `mlp.gate`, canonical names the runtime aliases to
+/// `ffn_gate_inp`), the Qwen3.5-MoE per-token shared-expert gate
+/// (`ffn_shexp_gate`, a [1, dim] row) and the GLM MLA absorb
+/// projections. `mlp.gate_proj` (a dense FFN) does not match.
+fn f16_consumer(canonical: &str) -> bool {
+    canonical.ends_with(".mlp.router.weight")
+        || canonical.ends_with(".mlp.gate.weight")
+        || canonical.ends_with(".mlp.shared_expert_gate.weight")
+        || canonical.ends_with(".k_b_proj.weight")
+        || canonical.ends_with(".v_b_proj.weight")
+}
+
+/// Whether a tensor the source stores quantized is dequantized and
+/// stored as f16 rather than handed to the quantized transplant: an
+/// `f16_consumer` from an MLX source, whose affine tensors read back to
+/// f32 exactly. A modelopt NVFP4 source is quantized too, but its packed
+/// e2m1 codes have no f32 reader (`HfDir::tensor_to_f32` rejects U8), so
+/// forcing one of its tensors to f16 failed the whole conversion; its
+/// quantized tensors stay on the transplant.
+fn dequant_to_f16(source_format: &str, src_quantized: bool, canonical: &str) -> bool {
+    src_quantized && source_format == "mlx_safetensors" && f16_consumer(canonical)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn convert_generic(
     input: &std::path::Path,
@@ -3299,6 +3699,38 @@ fn convert_generic(
     let source_names = kvb.rewritten_names();
     let provider: &dyn TensorProvider = &kvb;
 
+    // Fused input projections split by input column so the runtime feeds
+    // each input through a plain GEMM: the Qwen3.5 MTP head's fc (two
+    // halves), a block drafter's fc (one block per target tap).
+    // How many tap blocks the config says the drafter has: EAGLE-3 is always
+    // three, a block drafter names them in `target_layer_ids`.
+    let expected_taps: Option<usize> = if base_arch::dflash::is_eagle3_arch(canonical_arch) {
+        Some(3)
+    } else if base_arch::dflash::is_block_drafter_arch(canonical_arch) {
+        config
+            .extra_config
+            .get("target_layer_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+    } else {
+        None
+    };
+    let fcs = FcSplitProvider::build(provider, &source_names, canonical_arch, expected_taps)?;
+    if !fcs.splits.is_empty() {
+        if base_arch::dflash::is_block_drafter_arch(canonical_arch)
+            || base_arch::dflash::is_eagle3_arch(canonical_arch)
+        {
+            eprintln!(
+                "  drafter: split fused projections into {} column blocks (f16)",
+                fcs.splits.len()
+            );
+        } else {
+            eprintln!("  mtp:     split mtp.fc.weight into fc_embed / fc_hidden (f16)");
+        }
+    }
+    let source_names = fcs.rewritten_names();
+    let provider: &dyn TensorProvider = &fcs;
+
     // Map source names → canonical. Use the same llama-style map that
     // GGUF uses for blk.N.* tensors, plus a HF-style pass-through for
     // `model.layers.N.*` already-canonical names. Multimodal towers
@@ -3306,20 +3738,73 @@ fn convert_generic(
     // whether to materialize them.
     let mut mapped: Vec<(String, String)> = Vec::new();
     let mut mmproj_mapped: Vec<(String, String)> = Vec::new();
+    let mut speculator_mapped: Vec<(String, String)> = Vec::new();
     let mut dropped_names: Vec<String> = Vec::new();
+    // A Gemma 4-backbone block drafter's decoder layers take the Gemma 4
+    // tensor names (four norms, layer_scalar, no v_proj on K=V layers);
+    // its fc / hidden_norm / heads keep the block-drafter names.
+    let gemma4_drafter = base_arch::dflash::is_block_drafter_arch(canonical_arch)
+        && config
+            .extra_config
+            .get("drafter_backbone")
+            .and_then(|v| v.as_str())
+            == Some("gemma4");
     for n in &source_names {
-        match to_canonical_name(n, canonical_arch) {
+        let canon = if gemma4_drafter && n.starts_with("layers.") {
+            to_canonical_name(&format!("model.{n}"), "gemma4")
+        } else {
+            to_canonical_name(n, canonical_arch)
+        };
+        match canon {
             Some(Canonical::Main(c)) => mapped.push((n.clone(), c)),
             Some(Canonical::Mmproj(c)) => mmproj_mapped.push((n.clone(), c)),
+            Some(Canonical::Speculator(c)) => speculator_mapped.push((n.clone(), c)),
             None => dropped_names.push(n.clone()),
         }
     }
+    // A llama-labelled block drafter is accepted by its config only because
+    // RedHat's Qwen-shaped heads carry that label; the runtime needs q/k
+    // norms on every layer, so check the tensors before writing a sidecar
+    // that could never load.
+    if base_arch::dflash::is_block_drafter_arch(canonical_arch) {
+        base_arch::dflash::check_block_drafter_qk_norms(
+            &config,
+            mapped.iter().map(|(_, c)| c.as_str()),
+        )?;
+    }
+    let plan = plan_tied_lm_head(
+        &mapped,
+        config.tie_word_embeddings,
+        canonical_arch,
+        ctx.synth_tied_head,
+    );
+    report_tied_head_plan(&plan, ctx, canonical_arch, TiedHeadCopy::Quantized);
+    if let TiedHeadPlan::Synthesize { src } = plan {
+        mapped.push((src, "lm_head.weight".to_string()));
+    }
+    // --speculator-lm-head: the MTP head's own lm_head, from the same
+    // source rows as the target's (the runtime's speculator view resolves
+    // `mtp.lm_head.weight` before falling through to the shared head).
+    if ctx.speculator_lm_head && !speculator_mapped.is_empty() {
+        if let Some((src, _)) = mapped.iter().find(|(_, c)| c == "lm_head.weight") {
+            eprintln!(
+                "  mtp:     own lm_head for the speculator head (mtp.lm_head.weight from {src})"
+            );
+            speculator_mapped.push((src.clone(), "mtp.lm_head.weight".to_string()));
+        } else {
+            eprintln!("  mtp:     --speculator-lm-head: no lm_head source found, head keeps the shared one");
+        }
+    }
     eprintln!(
-        "  mapped:  {} tensors kept, {} mmproj, {} dropped",
+        "  mapped:  {} tensors kept, {} mmproj, {} speculator, {} dropped",
         mapped.len(),
         mmproj_mapped.len(),
+        speculator_mapped.len(),
         dropped_names.len()
     );
+    if ctx.mtp_draft_ranking.is_some() && speculator_mapped.is_empty() {
+        bail!("--mtp-draft-ranking: this checkpoint has no MTP speculator head to draft with");
+    }
 
     let mut tok_fields = tokenizer_fields.clone();
     if !tok_fields.contains_key("tokenizer_type") {
@@ -3334,6 +3819,37 @@ fn convert_generic(
     // for the late layers — model output is garbage. Auto-derive from the
     // actual MLX/HF tensor shapes the source ships.
     let mut config = config;
+    // DeepSpec's DSpark trains with the target's embedding and head COPIED
+    // in and frozen: a sidecar whose embed_tokens and lm_head are the same
+    // bytes carries two copies of a tied target's embedding (Gemma 4 12B:
+    // 2 x 2 GB f16, the head streamed on every block step). Drop both and
+    // draft through the target's own (quantized, already resident) table —
+    // the tensors resolve through the sidecar's fallback to the target.
+    if base_arch::dflash::is_block_drafter_arch(canonical_arch)
+        && config
+            .extra_config
+            .get("speculator_kind")
+            .and_then(|v| v.as_str())
+            == Some("dspark")
+        && !config.extra_config.contains_key("drafter_head")
+    {
+        let src_of = |c: &str| mapped.iter().find(|(_, m)| m == c).map(|(s, _)| s.clone());
+        if let (Some(e), Some(h)) = (src_of("embed_tokens.weight"), src_of("lm_head.weight")) {
+            if provider.source_shape(&e)? == provider.source_shape(&h)?
+                && provider.to_f32(&e)? == provider.to_f32(&h)?
+            {
+                mapped.retain(|(_, c)| c != "embed_tokens.weight" && c != "lm_head.weight");
+                config
+                    .extra_config
+                    .insert("drafter_head".into(), serde_json::json!("target"));
+                config.tie_word_embeddings = true;
+                eprintln!(
+                    "  drafter: embed_tokens == lm_head (the target's frozen tied embedding) — \
+                     both dropped, drafting through the target's table"
+                );
+            }
+        }
+    }
     if config.per_layer_ffn.is_empty() && config.num_hidden_layers > 0 {
         let mut per_layer_ffn = vec![0u32; config.num_hidden_layers as usize];
         let mut found_any = false;
@@ -3422,6 +3938,7 @@ fn convert_generic(
         layers: layer_descriptors_from_config(&config),
         tensors: vec![],
         mmproj: None,
+        speculator: None,
         calibration: None,
         provenance: None,
         sig: None,
@@ -3430,6 +3947,8 @@ fn convert_generic(
     if config.tie_word_embeddings {
         header.flags |= HeaderFlags::TIED_EMBEDDINGS;
     }
+    // (HAS_SPECULATOR is raised by the writer when the speculator section
+    // is installed.)
     let has_moe = source_names
         .iter()
         .any(|n| n.contains("experts") || n.contains("_exps") || n.contains("_shexp"));
@@ -3469,7 +3988,80 @@ fn convert_generic(
     let mut n_carried = 0usize;
     let mut prov_tensors: std::collections::BTreeMap<String, base_format::TensorProvenance> =
         Default::default();
+    // Speculator tensors ride the same per-tensor pipeline (norm shift,
+    // stacked experts, provenance) after every LM tensor, but stay f16 and
+    // land in the speculator sub-bundle: the head's acceptance rate is what
+    // the whole scheme buys, and a quantized MTP head measured near-zero
+    // acceptance on MoE targets.
+    let spec_names: std::collections::HashSet<String> =
+        speculator_mapped.iter().map(|(_, c)| c.clone()).collect();
+    if !speculator_mapped.is_empty() {
+        writer.set_speculator_arch(format!("{canonical_arch}-mtp"));
+        let mut n_spec_layers = 0u64;
+        for (_, c) in &speculator_mapped {
+            if let Some(r) = c.strip_prefix("mtp.layers.") {
+                if let Some((i, _)) = r.split_once('.') {
+                    if let Ok(i) = i.parse::<u64>() {
+                        n_spec_layers = n_spec_layers.max(i + 1);
+                    }
+                }
+            }
+        }
+        let spec_moe = speculator_mapped
+            .iter()
+            .any(|(_, c)| c.contains("_exps") || c.contains(".experts."));
+        let mut spec_cfg = std::collections::BTreeMap::new();
+        spec_cfg.insert("kind".to_string(), serde_json::json!("mtp"));
+        spec_cfg.insert("num_layers".to_string(), serde_json::json!(n_spec_layers));
+        spec_cfg.insert("moe".to_string(), serde_json::json!(spec_moe));
+        spec_cfg.insert("shared_embeddings".to_string(), serde_json::json!(true));
+        // `--speculator-lm-head` gave the head its own `mtp.lm_head.weight`:
+        // say so, or a reader of this field falls back to the target's head.
+        let private_lm_head = speculator_mapped
+            .iter()
+            .any(|(_, c)| c == "mtp.lm_head.weight");
+        spec_cfg.insert(
+            "shared_lm_head".to_string(),
+            serde_json::json!(!private_lm_head),
+        );
+        spec_cfg.insert(
+            "fc_inputs".to_string(),
+            serde_json::json!(["embedding", "hidden"]),
+        );
+        if let (Some(_), Some(k)) = (&ctx.mtp_draft_ranking, ctx.mtp_draft_vocab) {
+            spec_cfg.insert("draft_vocab_size".to_string(), serde_json::json!(k));
+        }
+        writer.set_speculator_config(spec_cfg);
+        pb.set_length((mapped.len() + speculator_mapped.len()) as u64);
+    }
+    let mapped: Vec<(String, String)> = mapped
+        .iter()
+        .cloned()
+        .chain(speculator_mapped.iter().cloned())
+        .collect();
+    // Block-drafter sidecars stay f16 end to end (acceptance rate is what
+    // the scheme buys; the block step is small next to the target's verify).
+    let is_drafter_arch = base_arch::dflash::is_block_drafter_arch(canonical_arch)
+        || base_arch::dflash::is_eagle3_arch(canonical_arch);
     for (src_name, canonical) in &mapped {
+        // --quantize-drafter: the drafter's transformer layers follow
+        // --target; everything else in the sidecar (fc taps, norms, heads,
+        // d2t) stays f16.
+        // DFlash 2's conv `base_kernel` ([2, K, D]) is read as raw halves,
+        // not a projection — it stays f16 (its kernel_projection quantizes).
+        let drafter_f16 = is_drafter_arch
+            && !(ctx.quantize_drafter
+                && canonical.starts_with("layers.")
+                && !canonical.ends_with(".base_kernel"));
+        let is_spec = spec_names.contains(canonical);
+        // --quantize-drafter also quantizes an in-bundle speculator's transformer
+        // layer (`mtp.layers.*`): a Qwen3.8-27B MTP head is ~700 MB f16 and
+        // streams on every chained draft; its fc / norms stay f16. The head's
+        // own lm_head (--speculator-lm-head) is quantized too — the whole
+        // point of the copy is a cheaper head stream than the target's.
+        let spec_quantized = ctx.quantize_drafter
+            && is_spec
+            && (canonical.starts_with("mtp.layers.") || canonical == "mtp.lm_head.weight");
         pb.set_message(canonical.clone());
         let src_shape = provider.source_shape(src_name)?;
         // The reduction dim is the source's last (HF C-order [out, in]);
@@ -3514,18 +4106,32 @@ fn convert_generic(
         // NVFP4 sidecars: the per-tensor global scale and the calibrated
         // activation scale. Always f32 — they parameterize the dequant
         // itself, and the verify gate compares them value-exactly.
-        let is_sidecar =
-            canonical.ends_with(".weight_scale_2") || canonical.ends_with(".input_scale");
+        // (EAGLE-3's `d2t` offset table rides the same f32 path: token ids
+        // are exact in f32, not in f16.)
+        let is_sidecar = canonical.ends_with(".weight_scale_2")
+            || canonical.ends_with(".input_scale")
+            || canonical == "d2t";
         // See GGUF path above for rationale on the f16/GPU route. Qwen3.5 GDN
         // conv1d + per-head gate projections also route here (f16 on GPU).
         let is_norm_like = !is_sidecar && (shape.len() == 1 || is_gdn_f16(canonical));
         let is_embedding = canonical == "embed_tokens.weight" || canonical == "lm_head.weight";
         // GLM MLA k_b/v_b projections and router weights are raw-f16
         // consumers and must never enter the quantized transplant path.
-        let force_f16 = canonical_arch == "glm_dsa"
-            && (canonical.ends_with(".k_b_proj.weight")
-                || canonical.ends_with(".v_b_proj.weight")
-                || canonical.ends_with(".mlp.router.weight"));
+        // Under the mirror policy the same holds for every tensor the
+        // runtime reads at f16 that a quantized source keeps at a scheme
+        // the transplant cannot carry: mlx-community stores the Qwen3.6-MoE
+        // router and shared-expert gate at 8-bit inside a 4-bit checkpoint,
+        // and requantizing them to base-q4 is neither bit-identical nor
+        // what `--mlx-passthrough` promises — they dequantize exactly and
+        // store as f16 (BAS-960). See `dequant_to_f16` for why MLX only.
+        let src_quantized = mirror && provider.source_is_quantized(src_name);
+        let force_f16 = (is_spec && !spec_quantized)
+            || drafter_f16
+            || (canonical_arch == "glm_dsa"
+                && (canonical.ends_with(".k_b_proj.weight")
+                    || canonical.ends_with(".v_b_proj.weight")
+                    || canonical.ends_with(".mlp.router.weight")))
+            || dequant_to_f16(source_format, src_quantized, canonical);
         // Mirror policy: this tensor is unquantized in the (quantized)
         // source checkpoint, so it must stay unquantized in the bundle.
         let src_unquantized = mirror && !provider.source_is_quantized(src_name);
@@ -3907,7 +4513,11 @@ fn convert_generic(
             (entry, data)
         };
 
-        writer.add_tensor(TensorPayload { entry, data });
+        if is_spec {
+            writer.add_speculator_tensor(TensorPayload { entry, data });
+        } else {
+            writer.add_tensor(TensorPayload { entry, data });
+        }
 
         // Record where this tensor came from and what was done to it, so
         // verification tooling can check the bundle against the source
@@ -3928,6 +4538,13 @@ fn convert_generic(
         if let Some(spec) = splitting.splits.get(src_name) {
             rec.src = vec![spec.src.clone()];
             rec.rows = Some([spec.row_off, spec.row_cnt]);
+        } else if let Some((fc_src, block, parts)) = fcs.splits.get(src_name) {
+            // A column block of a fused projection: the checkpoint holds
+            // only the fused source (the split name is virtual), so record
+            // the real source and which input columns this block took.
+            let (_, width) = fcs.part_shape(fc_src, *parts)?;
+            rec.src = vec![fc_src.clone()];
+            rec.cols = Some([(*block * width) as u64, width as u64]);
         } else if let Some(parts) = stacking.stacks.get(src_name) {
             rec.stack = Some(base_format::StackRef {
                 pattern: src_name.replace(".experts.", ".experts.{e}."),
@@ -3940,6 +4557,49 @@ fn convert_generic(
         pb.inc(1);
     }
     pb.finish_and_clear();
+    // --mtp-draft-ranking: the ranked ids as `mtp.draft_rank` (f32 — ids are
+    // exact in f32, the same encoding as an EAGLE-3 d2t table), after every
+    // other speculator tensor.
+    if let Some(ranked) = &ctx.mtp_draft_ranking {
+        let vocab = config.vocab_size as u64;
+        if let Some(bad) = ranked.iter().find(|&&id| id as u64 >= vocab) {
+            bail!("--mtp-draft-ranking: token {bad} is outside the {vocab}-token vocabulary");
+        }
+        let data: Vec<u8> = ranked
+            .iter()
+            .flat_map(|&id| (id as f32).to_le_bytes())
+            .collect();
+        let entry = base_format::TensorEntry {
+            name: "mtp.draft_rank".to_string(),
+            dtype: TensorDtype::F32,
+            shape: vec![ranked.len() as u64],
+            offset: 0,
+            length: data.len() as u64,
+            scale_offset: None,
+            scale_length: None,
+            bias_offset: None,
+            bias_length: None,
+            awq_scale_offset: None,
+            awq_scale_length: None,
+            group_size: None,
+            layout: None,
+            residency: Some(base_format::ResidencyHint::Cold),
+            compute_region: ComputeRegion::Cpu,
+            scale_dtype: None,
+            symmetric: false,
+            flags: TensorFlags::empty(),
+            checksum_xxh64: None,
+            source_ggml_type: None,
+        };
+        writer.add_speculator_tensor(TensorPayload { entry, data });
+        eprintln!(
+            "  mtp:     drafting ranking of {} ids (mtp.draft_rank){}",
+            ranked.len(),
+            ctx.mtp_draft_vocab
+                .map(|k| format!(", default K {k}"))
+                .unwrap_or_default()
+        );
+    }
     if n_passthrough > 0 || n_carried > 0 {
         eprintln!(
             "  quantized {} tensors ({} transplanted from the source's identical \
@@ -3952,11 +4612,29 @@ fn convert_generic(
     } else {
         eprintln!("  quantized {} tensors", mapped.len());
     }
+    // The source-tensor lists name checkpoint tensors: a virtual fc-split
+    // name (mtp.fc_embed.weight, fc.0.weight, ...) maps back to the fused
+    // source it came from, once.
+    let real_sources = |names: &[(String, String)]| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (s, _) in names {
+            let real = fcs
+                .splits
+                .get(s)
+                .map(|(src, _, _)| src.clone())
+                .unwrap_or_else(|| s.clone());
+            if !out.contains(&real) {
+                out.push(real);
+            }
+        }
+        out
+    };
     writer.set_provenance(base_format::Provenance {
         schema: 1,
         mirror,
         dropped: dropped_names,
-        mmproj: mmproj_mapped.iter().map(|(s, _)| s.clone()).collect(),
+        mmproj: real_sources(&mmproj_mapped),
+        speculator: real_sources(&speculator_mapped),
         tensors: prov_tensors,
     });
 
@@ -4150,6 +4828,216 @@ fn convert_generic(
     Ok(())
 }
 
+/// Decide whether to materialize a standalone `lm_head.weight` for a
+/// tie_word_embeddings model, returning the (source, canonical) pair to append
+/// to the tensor work-list.
+///
+/// A tied checkpoint ships one matrix, used both to look up token embeddings
+/// and — transposed — as the output projection. The quant profiles pin
+/// `embed_tokens.weight` to f16 because a quantized lookup table costs quality
+/// for no speed (a lookup touches one row per token). But under tying that same
+/// f16 rule silently sets the precision of the LOGIT PROJECTION, which streams
+/// the WHOLE table on every decode step: on Llama-3.2-1B that is 128256x2048 f16
+/// = 525 MB/token, measured at 34% of decode GPU time in a rocprofv3 trace even
+/// though the kernel itself runs at 189 GB/s (~73% of a Radeon 8060S's peak).
+///
+/// Emitting a second, quantized copy under `lm_head.weight` lets the profile's
+/// existing `lm_head.weight` rule apply to it. The runtimes that consume it
+/// (see `runtime_reads_output_weight`) prefer `output.weight` — the runtime
+/// name of `lm_head.weight` — whenever it resolves and fall back to the
+/// embedding otherwise, so the decode path picks up the quantized copy while
+/// the embedding lookup keeps its f16 fidelity. Costs disk: +148 MB at base_q4
+/// for a 128k x 2048 vocab.
+///
+/// Nothing is planned when the model is untied, or when the source already
+/// carries an explicit head — some repackaged repos untie and ship
+/// `lm_head.weight`, and duplicating it would write the tensor twice.
+/// `RuntimeIgnoresHead` covers the archs whose runtime never looks the head up
+/// (a synthesized copy there is dead weight), and `OptedOut` is
+/// `--no-synth-tied-head`. Pure: the convert-time line is printed by
+/// `report_tied_head_plan` at the call site, which knows how the copy will be
+/// packed.
+fn plan_tied_lm_head(
+    mapped: &[(String, String)],
+    tied: bool,
+    canonical_arch: &str,
+    synth_enabled: bool,
+) -> TiedHeadPlan {
+    if !tied {
+        return TiedHeadPlan::Nothing;
+    }
+    if mapped
+        .iter()
+        .any(|(_, c)| c == "lm_head.weight" || c == "output.weight")
+    {
+        return TiedHeadPlan::Nothing;
+    }
+    if !runtime_reads_output_weight(canonical_arch) {
+        return TiedHeadPlan::RuntimeIgnoresHead;
+    }
+    if !synth_enabled {
+        return TiedHeadPlan::OptedOut;
+    }
+    match mapped.iter().find(|(_, c)| c == "embed_tokens.weight") {
+        Some((src, _)) => TiedHeadPlan::Synthesize { src: src.clone() },
+        None => TiedHeadPlan::Nothing,
+    }
+}
+
+/// Outcome of `plan_tied_lm_head`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TiedHeadPlan {
+    /// Append `lm_head.weight` as a second copy of this source tensor.
+    Synthesize { src: String },
+    /// Tied, but this arch's runtime never resolves `output.weight`.
+    RuntimeIgnoresHead,
+    /// Tied, but `--no-synth-tied-head` was passed.
+    OptedOut,
+    /// Untied, the source already ships a head, or it has no embedding.
+    Nothing,
+}
+
+/// Whether the runtime that will execute `canonical_arch` resolves its logit
+/// projection through `output.weight` — the runtime name of `lm_head.weight`
+/// (`kBaseTopRules` in src/weight/base_weight_store.cpp). Only those archs
+/// can consume a synthesized head; for the others it is bytes on disk the
+/// runtime never touches.
+///
+/// Derived from the per-model prefill encoders, which are the only readers of
+/// the logit tensor (prefill.cpp dispatches on descriptor flags and falls
+/// through to `encode_prefill_llama`):
+///
+/// - `llama.cpp` (llama, qwen2/3, qwen MoE, mistral, phi — the fallthrough)
+///   and `qwen3_5.cpp` (qwen35, qwen35moe) call
+///   `weights.get_tensor("output.weight")` FIRST and only fall back to
+///   `token_embedding.weight` when it is absent. Consumers.
+/// - `muse_glimmer.cpp` keys on `arch.tie_embeddings`, which
+///   `arch_muse_glimmer()` hardcodes false: it reads `output.weight`
+///   unconditionally. Consumer (a tied Muse checkpoint would NEED the copy).
+/// - `gemma.cpp` and `gemma4.cpp` key on `arch.tie_embeddings`, which
+///   `arch_gemma()` / `arch_gemma4()` hardcode TRUE
+///   (src/core/arch_descriptor.h): the logit name is always
+///   `token_embedding.weight` and `output.weight` is never looked up. A
+///   synthesized head is dead weight — ~335 MB at base_q4 for gemma-3-4b's
+///   262k-row vocab. Not consumers.
+/// - `bert.cpp` has no logit projection; whisper converts on its own path
+///   (`convert_whisper`) and never reaches `plan_tied_lm_head`. Not consumers.
+fn runtime_reads_output_weight(canonical_arch: &str) -> bool {
+    match canonical_arch {
+        "llama" | "qwen" | "qwen_moe" | "qwen3_moe" | "qwen35" | "qwen35moe" | "muse_glimmer" => {
+            true
+        }
+        "gemma3" | "gemma4" | "nomic-bert" | "whisper" => false,
+        // The runtime's arch_from_config matches these families by
+        // substring, so a new "gemma*"/"*bert*" mapper lands on the same
+        // encoders as above; anything else falls through to the llama
+        // encoder, which reads output.weight.
+        other => !other.starts_with("gemma") && !other.contains("bert"),
+    }
+}
+
+/// GGUF carries no `tie_word_embeddings` key, so `config_from_gguf` leaves it
+/// false and the header would claim an untied model (and drop the
+/// TIED_EMBEDDINGS flag) for e.g. Llama-3.2, which IS tied. Infer it the way
+/// llama.cpp does: a causal LM must have an output projection, so a source
+/// with no head tensor is necessarily reusing its embedding as one. Skipped
+/// for embedding-only archs (BERT), which legitimately have no head and must
+/// not get a synthesized one. A config that already says tied stays tied.
+fn infer_gguf_tied_embeddings<'a>(
+    mapper: &dyn base_arch::GgufMapper,
+    config_tied: bool,
+    tensor_names: impl Iterator<Item = &'a str>,
+) -> bool {
+    if config_tied || mapper.canonical_arch().contains("bert") {
+        return config_tied;
+    }
+    let has_head = tensor_names.into_iter().any(|n| {
+        matches!(
+            mapper.map_tensor_name(n).as_deref(),
+            Some("lm_head.weight") | Some("output.weight")
+        )
+    });
+    !has_head
+}
+
+/// How a synthesized head will physically be written, for the convert-time
+/// line: dequantized and re-packed by the profile / `--target` like any other
+/// tensor, or (GGUF `--kquant-passthrough` on a k-quant embedding) copied
+/// verbatim, in which case no profile rule touches it.
+enum TiedHeadCopy {
+    Quantized,
+    Verbatim { ggml_type: &'static str },
+}
+
+/// The first profile rule matching `name` — what `QuantProfile::resolve`
+/// applies, with the pattern kept so the decision can be shown.
+fn profile_rule_for<'a>(
+    profile: &'a base_quant::QuantProfile,
+    name: &str,
+) -> Option<&'a base_quant::RuleEntry> {
+    profile
+        .rules
+        .iter()
+        .find(|r| base_quant::profile::pattern_matches(&r.pattern, name))
+}
+
+/// One line saying what happened to the tied head and why, so a precision
+/// change on reconvert is visible in the log rather than only in the bundle.
+fn report_tied_head_plan(
+    plan: &TiedHeadPlan,
+    ctx: &QuantContext,
+    canonical_arch: &str,
+    copy: TiedHeadCopy,
+) {
+    let describe = |name: &str| -> String {
+        match &ctx.profile {
+            Some(p) => match profile_rule_for(p, name) {
+                Some(r) => {
+                    let resolved = p.resolve(name).expect("rule matched");
+                    // gs is meaningless for the float dtypes (resolves to 1).
+                    let gs = if resolved.group_size > 1 {
+                        format!(" gs={}", resolved.group_size)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "profile {:?} rule `{}` -> {:?}{gs}",
+                        p.name, r.pattern, resolved.dtype
+                    )
+                }
+                None => format!("profile {:?} has NO rule for {name}", p.name),
+            },
+            None => format!("--target {:?}", ctx.target),
+        }
+    };
+    match plan {
+        TiedHeadPlan::Synthesize { src } => match copy {
+            TiedHeadCopy::Quantized => eprintln!(
+                "  tied:    materializing lm_head.weight from {src}: {}; \
+                 embed_tokens.weight keeps {}. Logits now project at the head's \
+                 precision (--no-synth-tied-head keeps them at the embedding's).",
+                describe("lm_head.weight"),
+                describe("embed_tokens.weight"),
+            ),
+            TiedHeadCopy::Verbatim { ggml_type } => eprintln!(
+                "  tied:    materializing lm_head.weight from {src} as a VERBATIM \
+                 {ggml_type} copy (--kquant-passthrough): no profile rule applies, \
+                 so logits project at the embedding's own precision."
+            ),
+        },
+        TiedHeadPlan::RuntimeIgnoresHead => eprintln!(
+            "  tied:    no lm_head.weight synthesized — the {canonical_arch} runtime \
+             projects logits through embed_tokens.weight and never reads output.weight."
+        ),
+        TiedHeadPlan::OptedOut => eprintln!(
+            "  tied:    --no-synth-tied-head: logits project through embed_tokens.weight \
+             at its own precision ({}).",
+            describe("embed_tokens.weight"),
+        ),
+        TiedHeadPlan::Nothing => {}
+    }
+}
+
 /// Routing decision for an HF/MLX tensor name.
 #[derive(Debug, Clone)]
 enum Canonical {
@@ -4160,6 +5048,91 @@ enum Canonical {
     /// for now we keep the HF prefix verbatim so the future runtime can
     /// dispatch on the canonical multimodal layout.
     Mmproj(String),
+    /// Goes into the speculator sub-bundle (header.speculator.tensors):
+    /// the checkpoint's own MTP head, named `mtp.<canonical>`.
+    Speculator(String),
+}
+
+/// EAGLE-3 head sidecar tensor → canonical name: `midlayer.*` is the one
+/// decoder layer (`layers.0.*` through the llama main-layer rules; the
+/// split q/k/v parts and `hidden_norm` pass through under it), `norm` is
+/// the head's output norm, `d2t` the draft→target offset table (f32), `t2d`
+/// is derivable and dropped; `fc.weight` is split into `fc.{i}.weight`
+/// before mapping; an `embed_tokens` copy and the reduced `lm_head` keep
+/// their names.
+fn eagle3_canonical(name: &str) -> Option<String> {
+    if name == "fc.weight" || name == "t2d" {
+        return None;
+    }
+    // SpecForge / AngelSlim call the one layer `midlayer`; RedHat's
+    // speculators packaging calls it `layers.0`.
+    if let Some(rest) = name
+        .strip_prefix("midlayer.")
+        .or_else(|| name.strip_prefix("layers.0."))
+    {
+        return match to_canonical_name(&format!("model.layers.0.{rest}"), "llama")? {
+            Canonical::Main(c) => Some(c),
+            _ => None,
+        };
+    }
+    Some(match name {
+        "norm.weight" => "final_norm.weight".to_string(),
+        // norm_before_fc's weight over the concatenated taps [n_taps * H]
+        // (RedHat's gpt-oss heads); a distinct name so no per-layer
+        // `input_norm` alias can claim it.
+        "input_norm.weight" => "fc_input_norm.weight".to_string(),
+        other => other.to_string(),
+    })
+}
+
+/// Block-drafter (DFlash / DSpark) sidecar tensor → canonical name. The
+/// decoder layer goes through the qwen3 main-layer rules (so the runtime's
+/// per-layer aliases apply as for the target's own layers); `norm.weight`
+/// is the drafter's output norm (`final_norm.weight`, like an HF LM's);
+/// DSpark's Markov / confidence heads get short canonical names; the fc
+/// per-tap halves, hidden_norm, an own embed_tokens / lm_head, and DFlash
+/// 2's conv / selector tensors keep their names. The fused `fc.weight` is
+/// never written: FcSplitProvider splits it into `fc.{i}.weight` first.
+fn block_drafter_canonical(name: &str) -> Option<String> {
+    // `t2d` (a reduced-vocabulary head's target→draft mask) is derivable
+    // from `d2t`, which keeps its name.
+    if name == "fc.weight" || name == "t2d" {
+        return None;
+    }
+    if let Some(rest) = name.strip_prefix("layers.") {
+        return match to_canonical_name(&format!("model.layers.{rest}"), "qwen")? {
+            Canonical::Main(c) => Some(c),
+            _ => None,
+        };
+    }
+    Some(match name {
+        "norm.weight" => "final_norm.weight".to_string(),
+        "markov_head.markov_w1.weight" => "markov.w1.weight".to_string(),
+        "markov_head.markov_w2.weight" => "markov.w2.weight".to_string(),
+        "confidence_head.proj.weight" => "confidence.proj.weight".to_string(),
+        "confidence_head.proj.bias" => "confidence.proj.bias".to_string(),
+        other => other.to_string(),
+    })
+}
+
+/// Qwen3.5/3.6/3.8 MTP head tensor → speculator name. The head is one
+/// decoder layer of the target's geometry (`mtp.layers.0.*`) plus `fc`,
+/// the two pre-fc norms and its own output norm. The decoder layer goes
+/// through the main-layer rules (HF renames, expert stacking canonical
+/// forms) so the runtime's per-layer aliases apply under the `mtp.` prefix
+/// unchanged; the head's own tensors keep their HF names under the prefix
+/// (`mtp.norm.weight` stays — it is the head's output norm, not the model's
+/// final norm).
+fn mtp_speculator_name(rest: &str, arch: &str) -> Option<Canonical> {
+    let inner = if rest.starts_with("layers.") {
+        match to_canonical_name(&format!("model.{rest}"), arch)? {
+            Canonical::Main(c) => c,
+            _ => return None,
+        }
+    } else {
+        rest.to_string()
+    };
+    Some(Canonical::Speculator(format!("mtp.{inner}")))
 }
 
 /// nomic-bert HF safetensors → canonical `.base` names. Targets the
@@ -4233,13 +5206,27 @@ fn is_gdn_f16(canonical: &str) -> bool {
 /// mostly strip the `model.` prefix. For anything not in HF convention,
 /// fall back to the llama-style GGUF mapper.
 fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
-    // Qwen3.5/3.6 checkpoints ship a Multi-Token-Prediction head (`mtp.*` —
-    // one extra decoder layer + fc/norms, its own experts on the MoE
-    // variants). It's a speculative-decoding auxiliary the runtime doesn't
-    // execute; keeping it would bloat the .base (256 extra expert stacks on
-    // 35B-A3B) and land unknown-named tensors in the main bundle. Drop it.
-    if arch.starts_with("qwen35") && (name == "mtp" || name.starts_with("mtp.")) {
-        return None;
+    // Block-drafter sidecars (DFlash / DSpark): bare HF names (no `model.`
+    // wrapper), a qwen3 decoder under `layers.N.*`, and the drafter's own
+    // fc / hidden_norm / heads. Everything is a main tensor of the sidecar.
+    if base_arch::dflash::is_block_drafter_arch(arch) {
+        return block_drafter_canonical(name).map(Canonical::Main);
+    }
+    if base_arch::dflash::is_eagle3_arch(arch) {
+        return eagle3_canonical(name).map(Canonical::Main);
+    }
+    // Qwen3.5/3.6/3.8 checkpoints ship a Multi-Token-Prediction head (`mtp.*`
+    // — one extra decoder layer + fc / pre-fc norms / output norm, its own
+    // experts on the MoE variants). It is the bundle's speculator: routed
+    // into the speculator sub-bundle (kept f16, skipped by a runtime that
+    // does not speculate) under `mtp.<canonical>`.
+    if arch.starts_with("qwen35") {
+        if name == "mtp" {
+            return None;
+        }
+        if let Some(rest) = name.strip_prefix("mtp.") {
+            return mtp_speculator_name(rest, arch);
+        }
     }
     // Multimodal wrappers (Gemma-4) put the LLM under `language_model.model.*`
     // and the audio/vision towers under siblings. The towers ship in
@@ -4320,11 +5307,15 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
         .unwrap_or(name);
 
     // MTP can also arrive wrapped (`model.mtp.*`, or `model.language_model.
-    // mtp.*` on VL-style checkpoints); the bare-prefix drop at the top of
-    // this function runs before wrapper stripping and misses those, which
-    // would canonicalize the dead MTP decoder/expert stacks into the bundle.
-    if arch.starts_with("qwen35") && (stripped == "mtp" || stripped.starts_with("mtp.")) {
-        return None;
+    // mtp.*` on VL-style checkpoints); the bare-prefix route at the top of
+    // this function runs before wrapper stripping and misses those.
+    if arch.starts_with("qwen35") {
+        if stripped == "mtp" {
+            return None;
+        }
+        if let Some(rest) = stripped.strip_prefix("mtp.") {
+            return mtp_speculator_name(rest, arch);
+        }
     }
 
     // GLM 5.2 (glm_dsa) MLX/HF checkpoints — dedicated rename table so the
@@ -4686,6 +5677,7 @@ fn convert_synthetic_with_ctx(output: &std::path::Path, ctx: &QuantContext) -> R
             .collect(),
         tensors: vec![],
         mmproj: None,
+        speculator: None,
         calibration: None,
         provenance: None,
         sig: None,
@@ -4958,6 +5950,7 @@ fn convert_synthetic(output: &std::path::Path, target: TargetScheme) -> Result<(
             .collect(),
         tensors: vec![],
         mmproj: None,
+        speculator: None,
         calibration: None,
         provenance: None,
         sig: None,
@@ -5185,9 +6178,64 @@ fn pack_bf16(weights: &[f32]) -> base_quant::Packed {
 ///
 /// Holds the loaded profile + optional AWQ sidecar; produces
 /// per-tensor packed bytes for canonical-quant bundles.
+/// A drafting-vocabulary ranking JSON (tools/mtp_draft_ranking.py): the
+/// `ranked_ids` array, most frequent first. Duplicates are refused — the
+/// runtime takes the first K distinct ids, and a repeated id would quietly
+/// shrink every K.
+fn read_draft_ranking(path: &std::path::Path) -> Result<Vec<u32>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading --mtp-draft-ranking {}", path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("--mtp-draft-ranking {} is not JSON", path.display()))?;
+    let arr = v
+        .get("ranked_ids")
+        .and_then(|a| a.as_array())
+        .with_context(|| {
+            format!(
+                "--mtp-draft-ranking {}: no `ranked_ids` array",
+                path.display()
+            )
+        })?;
+    let mut ids = Vec::with_capacity(arr.len());
+    let mut seen = std::collections::HashSet::with_capacity(arr.len());
+    for x in arr {
+        let id = x
+            .as_u64()
+            .filter(|&i| i <= u32::MAX as u64)
+            .with_context(|| {
+                format!(
+                    "--mtp-draft-ranking {}: `{x}` is not a token id",
+                    path.display()
+                )
+            })? as u32;
+        if !seen.insert(id) {
+            bail!(
+                "--mtp-draft-ranking {}: token {id} is ranked twice",
+                path.display()
+            );
+        }
+        ids.push(id);
+    }
+    if ids.is_empty() {
+        bail!(
+            "--mtp-draft-ranking {}: `ranked_ids` is empty",
+            path.display()
+        );
+    }
+    Ok(ids)
+}
+
 struct QuantContext {
     profile: Option<base_quant::QuantProfile>,
     awq_profile: Option<base_awq::AwqProfile>,
+    /// Tensors AWQ actually rotated; 0 with a sidecar present means the run
+    /// silently degraded to plain RTN — `awq_shape_skipped` says why.
+    awq_applied: std::sync::atomic::AtomicUsize,
+    /// Tensors whose sidecar lookup HIT but was skipped because the absmax
+    /// length did not match the tensor's in_features. Distinguishes "the
+    /// names do not correspond to this model" (0 hits) from "the names
+    /// correspond but the stats were captured at another geometry".
+    awq_shape_skipped: std::sync::atomic::AtomicUsize,
     awq_config: base_awq::AwqConfig,
     /// Fallback target when no profile is set.
     target: TargetScheme,
@@ -5196,8 +6244,19 @@ struct QuantContext {
     /// Transplant MLX affine-q4 tensors into `base_q4` verbatim instead
     /// of requantizing them through f32.
     q4_passthrough: bool,
+    /// --quantize-drafter (sidecars): drafter `layers.*` follow the target scheme.
+    quantize_drafter: bool,
+    /// `--speculator-lm-head`: the MTP head gets its own `mtp.lm_head.weight`.
+    speculator_lm_head: bool,
+    /// `--mtp-draft-ranking`: ranked token ids for the MTP head's drafting
+    /// vocabulary (`mtp.draft_rank`), and `--mtp-draft-vocab`, its default K.
+    mtp_draft_ranking: Option<Vec<u32>>,
+    mtp_draft_vocab: Option<u32>,
     /// Copy GGUF Q4_K/Q5_K/Q6_K super-blocks through verbatim.
     kquant_passthrough: bool,
+    /// Materialize `lm_head.weight` for tied models (`plan_tied_lm_head`);
+    /// false under `--no-synth-tied-head`.
+    synth_tied_head: bool,
     /// MLX sources only: reuse the source's packed q4 payloads
     /// verbatim instead of dequant→requant (see `--mlx-passthrough`).
     mlx_passthrough: bool,
@@ -5249,14 +6308,25 @@ impl QuantContext {
         if args.imatrix && args.awq_profile.is_none() {
             bail!("--imatrix requires --awq-profile <sidecar> (the calibration absmax supplies the channel weights)");
         }
+        let mtp_draft_ranking = match &args.mtp_draft_ranking {
+            Some(p) => Some(read_draft_ranking(p)?),
+            None => None,
+        };
         Ok(Self {
             profile,
             awq_profile,
+            awq_applied: std::sync::atomic::AtomicUsize::new(0),
+            awq_shape_skipped: std::sync::atomic::AtomicUsize::new(0),
             awq_config: base_awq::AwqConfig::default(),
             target: args.target,
             allow_quant_from_quant: args.allow_quant_from_quant,
             q4_passthrough: !args.no_mlx_passthrough,
+            quantize_drafter: args.quantize_drafter,
+            speculator_lm_head: args.speculator_lm_head,
+            mtp_draft_ranking,
+            mtp_draft_vocab: args.mtp_draft_vocab,
             kquant_passthrough: args.kquant_passthrough,
+            synth_tied_head: !args.no_synth_tied_head,
             mlx_passthrough: args.mlx_passthrough,
             validate: args.validate,
             direct_write: args.direct_write,
@@ -5443,6 +6513,8 @@ impl QuantContext {
                         // tensor in the `.base` header so the runtime can
                         // recover the original output.
                         eprintln!("    awq: {name} α={:.2} mse={:.4e}", plan.alpha, plan.mse);
+                        self.awq_applied
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         base_awq::awq_apply(weights, in_feat, &plan.scales)
                     } else {
                         eprintln!(
@@ -5450,6 +6522,8 @@ impl QuantContext {
                             absmax.len(),
                             in_feat
                         );
+                        self.awq_shape_skipped
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         weights.to_vec()
                     }
                 } else {
@@ -5532,6 +6606,18 @@ fn cmd_inspect(args: InspectArgs) -> Result<()> {
         println!("  {dtype:<8} {count:4} tensors  {bytes:>12} bytes");
     }
 
+    if let Some(spec) = &h.speculator {
+        println!(
+            "speculator:    {} ({} tensors)",
+            spec.arch,
+            spec.tensors.len()
+        );
+        for (k, v) in &spec.config {
+            println!("  {k} = {v}");
+        }
+        let spec_bytes: u64 = spec.tensors.iter().map(|t| t.length).sum();
+        println!("  bytes = {spec_bytes}");
+    }
     let slots = reader.slots()?;
     println!("n_slots:       {}", slots.len());
     for s in &slots {
@@ -5545,18 +6631,22 @@ fn cmd_inspect(args: InspectArgs) -> Result<()> {
 
     if args.verify_checksums {
         eprintln!("verifying all tensor checksums...");
-        for t in h.tensors.iter() {
+        // The sub-bundles (mmproj towers, the speculator head) carry
+        // checksums from the same writer: verify them too.
+        let mut n = 0usize;
+        for t in reader.all_entries() {
             reader
                 .verify_tensor(&t.name)
                 .with_context(|| format!("verifying {:?}", t.name))?;
+            n += 1;
         }
-        eprintln!("all checksums OK");
+        eprintln!("all checksums OK ({n} tensors incl. sub-bundles)");
     }
     Ok(())
 }
 
 /// Minimal "current timestamp" without pulling in chrono. ISO 8601 UTC.
-fn chrono_now() -> String {
+pub(crate) fn chrono_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5572,14 +6662,33 @@ mod canonical_name_tests {
     fn main_canon(name: &str, arch: &str) -> Option<String> {
         match to_canonical_name(name, arch)? {
             Canonical::Main(s) => Some(s),
-            Canonical::Mmproj(_) => None,
+            Canonical::Mmproj(_) | Canonical::Speculator(_) => None,
+        }
+    }
+
+    #[test]
+    fn block_drafter_qk_norm_check_sees_the_mapped_names() {
+        // check_block_drafter_qk_norms looks for these exact canonical names;
+        // if the drafter mapping renamed them, every sidecar (RedHat's
+        // llama-labelled Qwen heads included) would be refused.
+        for n in ["q_norm", "k_norm"] {
+            let src = format!("layers.3.self_attn.{n}.weight");
+            assert_eq!(main_canon(&src, "dflash"), Some(src.clone()));
+            assert_eq!(main_canon(&src, "dspark"), Some(src));
         }
     }
 
     fn mmproj_canon(name: &str, arch: &str) -> Option<String> {
         match to_canonical_name(name, arch)? {
             Canonical::Mmproj(s) => Some(s),
-            Canonical::Main(_) => None,
+            Canonical::Main(_) | Canonical::Speculator(_) => None,
+        }
+    }
+
+    fn spec_canon(name: &str, arch: &str) -> Option<String> {
+        match to_canonical_name(name, arch)? {
+            Canonical::Speculator(s) => Some(s),
+            Canonical::Main(_) | Canonical::Mmproj(_) => None,
         }
     }
 
@@ -5718,6 +6827,48 @@ mod canonical_name_tests {
     // MLX Qwen3-MoE: `model.layers.N.mlp.switch_mlp.X_proj.weight`
     // (per-expert stack) must canonicalize to `layers.N.ffn_X_exps.weight`
     // without doubling the `.weight` suffix.
+    /// A quantized source hands these to the dequant → f16 path rather
+    /// than the quantized transplant (BAS-960: mlx-community keeps the
+    /// Qwen3.6-MoE router and shared-expert gate at 8-bit in a 4-bit
+    /// checkpoint). The dense FFN gate is not a router.
+    #[test]
+    fn f16_consumers_are_the_router_shared_gate_and_mla_absorb() {
+        for n in [
+            "layers.3.mlp.router.weight",
+            "layers.3.mlp.gate.weight",
+            "layers.3.mlp.shared_expert_gate.weight",
+            "layers.3.self_attn.k_b_proj.weight",
+            "layers.3.self_attn.v_b_proj.weight",
+        ] {
+            assert!(super::f16_consumer(n), "{n}");
+        }
+        for n in [
+            "layers.3.mlp.gate_proj.weight",
+            "layers.3.ffn_gate_exps.weight",
+            "layers.3.mlp.shared_expert.gate_proj.weight",
+            "layers.3.mlp.gate.e_score_correction_bias",
+            "layers.3.mlp.router.bias",
+        ] {
+            assert!(!super::f16_consumer(n), "{n}");
+        }
+    }
+
+    /// Only an MLX source dequantizes them: an NVFP4 source's packed codes
+    /// have no f32 reader, so its router stays on the transplant.
+    #[test]
+    fn only_mlx_sources_dequantize_f16_consumers() {
+        let router = "layers.3.mlp.gate.weight";
+        assert!(super::dequant_to_f16("mlx_safetensors", true, router));
+        assert!(!super::dequant_to_f16("nvfp4_safetensors", true, router));
+        assert!(!super::dequant_to_f16("hf_safetensors", true, router));
+        assert!(!super::dequant_to_f16("mlx_safetensors", false, router));
+        assert!(!super::dequant_to_f16(
+            "mlx_safetensors",
+            true,
+            "layers.3.mlp.gate_proj.weight"
+        ));
+    }
+
     #[test]
     fn mlx_qwen3_moe_split_experts_no_double_weight() {
         assert_eq!(
@@ -5867,41 +7018,168 @@ mod canonical_name_tests {
     }
 
     // The shared-expert path (Qwen2-MoE / some Qwen3 variants) uses
-    // Qwen3.5/3.6 MTP (multi-token-prediction) head tensors must be DROPPED
-    // (`mtp.*` — an auxiliary decoder layer the runtime never executes; on
-    // 35B-A3B it carries 256 extra expert stacks that would bloat the .base).
+    // Block-drafter sidecars: bare HF names, the qwen3 layer through the
+    // main-layer rules, the drafter's own tensors under short canonical names.
     #[test]
-    fn qwen35_mtp_tensors_dropped() {
-        for n in [
-            "mtp.fc.weight",
-            "mtp.norm.weight",
-            "mtp.pre_fc_norm_embedding.weight",
-            "mtp.layers.0.mlp.experts.gate_up_proj",
-            "mtp.layers.0.self_attn.q_proj.weight",
+    fn block_drafter_names_are_main_tensors() {
+        for arch in ["dflash", "dspark"] {
+            for (src, want) in [
+                ("fc.0.weight", "fc.0.weight"),
+                ("fc.4.weight", "fc.4.weight"),
+                ("hidden_norm.weight", "hidden_norm.weight"),
+                ("norm.weight", "final_norm.weight"),
+                ("embed_tokens.weight", "embed_tokens.weight"),
+                ("lm_head.weight", "lm_head.weight"),
+                ("markov_head.markov_w1.weight", "markov.w1.weight"),
+                ("markov_head.markov_w2.weight", "markov.w2.weight"),
+                ("confidence_head.proj.bias", "confidence.proj.bias"),
+                (
+                    "layers.0.self_attn.q_proj.weight",
+                    "layers.0.self_attn.q_proj.weight",
+                ),
+                (
+                    "layers.0.self_attn.k_norm.weight",
+                    "layers.0.self_attn.k_norm.weight",
+                ),
+                (
+                    "layers.2.input_layernorm.weight",
+                    "layers.2.input_norm.weight",
+                ),
+                (
+                    "layers.2.mlp.gate_proj.weight",
+                    "layers.2.mlp.gate_proj.weight",
+                ),
+                // DFlash 2 extras ride along untouched for the runtime that reads them.
+                (
+                    "layers.1.attention_conv.kernel_projection.weight",
+                    "layers.1.attention_conv.kernel_projection.weight",
+                ),
+            ] {
+                assert_eq!(
+                    main_canon(src, arch).as_deref(),
+                    Some(want),
+                    "{arch}: {src}"
+                );
+            }
+            // The fused fc is split before mapping; a leftover is dropped, not written.
+            assert!(main_canon("fc.weight", arch).is_none());
+        }
+    }
+
+    #[test]
+    fn eagle3_names_are_main_tensors() {
+        for (src, want) in [
+            ("fc.0.weight", "fc.0.weight"),
+            ("fc.2.weight", "fc.2.weight"),
+            ("d2t", "d2t"),
+            ("norm.weight", "final_norm.weight"),
+            ("lm_head.weight", "lm_head.weight"),
+            ("embed_tokens.weight", "embed_tokens.weight"),
+            ("midlayer.hidden_norm.weight", "layers.0.hidden_norm.weight"),
+            (
+                "midlayer.input_layernorm.weight",
+                "layers.0.input_norm.weight",
+            ),
+            (
+                "midlayer.self_attn.q_proj_emb.weight",
+                "layers.0.self_attn.q_proj_emb.weight",
+            ),
+            (
+                "midlayer.self_attn.k_proj_hid.weight",
+                "layers.0.self_attn.k_proj_hid.weight",
+            ),
+            (
+                "midlayer.self_attn.o_proj.weight",
+                "layers.0.self_attn.o_proj.weight",
+            ),
+            (
+                "midlayer.mlp.gate_proj.weight",
+                "layers.0.mlp.gate_proj.weight",
+            ),
         ] {
-            assert!(
-                to_canonical_name(n, "qwen35moe").is_none(),
-                "should drop: {n}"
+            assert_eq!(
+                main_canon(src, "eagle3").as_deref(),
+                Some(want),
+                "eagle3: {src}"
             );
-            assert!(to_canonical_name(n, "qwen35").is_none(), "should drop: {n}");
+        }
+        assert!(main_canon("t2d", "eagle3").is_none(), "t2d is derivable");
+        assert!(
+            main_canon("fc.weight", "eagle3").is_none(),
+            "the fused fc is split first"
+        );
+    }
+
+    // Qwen3.5/3.6/3.8 MTP (multi-token-prediction) head tensors route into
+    // the speculator sub-bundle as `mtp.<canonical>`: the decoder layer takes
+    // the main-layer canonical forms (so the runtime's per-layer aliases
+    // apply under the prefix), the head's own fc / norms keep their names.
+    #[test]
+    fn qwen35_mtp_tensors_route_to_speculator() {
+        for (src, want) in [
+            ("mtp.fc.weight", "mtp.fc.weight"),
+            ("mtp.fc_embed.weight", "mtp.fc_embed.weight"),
+            ("mtp.fc_hidden.weight", "mtp.fc_hidden.weight"),
+            ("mtp.norm.weight", "mtp.norm.weight"),
+            (
+                "mtp.pre_fc_norm_embedding.weight",
+                "mtp.pre_fc_norm_embedding.weight",
+            ),
+            (
+                "mtp.pre_fc_norm_hidden.weight",
+                "mtp.pre_fc_norm_hidden.weight",
+            ),
+            (
+                "mtp.layers.0.self_attn.q_proj.weight",
+                "mtp.layers.0.self_attn.q_proj.weight",
+            ),
+            // `input_layernorm` takes the main layers' `input_norm` rename.
+            (
+                "mtp.layers.0.input_layernorm.weight",
+                "mtp.layers.0.input_norm.weight",
+            ),
+            (
+                "mtp.layers.0.mlp.experts.gate_up_proj",
+                "mtp.layers.0.ffn_gate_up_exps.weight",
+            ),
+        ] {
+            assert_eq!(
+                spec_canon(src, "qwen35moe").as_deref(),
+                Some(want),
+                "speculator route: {src}"
+            );
+            assert_eq!(
+                spec_canon(src, "qwen35").as_deref(),
+                Some(want),
+                "speculator route: {src}"
+            );
+            assert!(
+                main_canon(src, "qwen35").is_none(),
+                "never the main bundle: {src}"
+            );
         }
         // Wrapped variants (`model.mtp.*`, VL-style `model.language_model.
-        // mtp.*`) must be dropped too — the drop re-applies after wrapper
+        // mtp.*`) route the same way — the route re-applies after wrapper
         // prefix stripping.
-        for n in [
-            "model.mtp.fc.weight",
-            "model.mtp.layers.0.mlp.experts.gate_up_proj",
-            "model.language_model.mtp.fc.weight",
-            "language_model.mtp.norm.weight",
+        for (src, want) in [
+            ("model.mtp.fc.weight", "mtp.fc.weight"),
+            (
+                "model.mtp.layers.0.mlp.experts.gate_up_proj",
+                "mtp.layers.0.ffn_gate_up_exps.weight",
+            ),
+            ("model.language_model.mtp.fc.weight", "mtp.fc.weight"),
+            ("language_model.mtp.norm.weight", "mtp.norm.weight"),
         ] {
-            assert!(
-                to_canonical_name(n, "qwen35moe").is_none(),
-                "should drop wrapped: {n}"
+            assert_eq!(
+                spec_canon(src, "qwen35moe").as_deref(),
+                Some(want),
+                "wrapped: {src}"
             );
         }
         // Non-qwen35 arches keep their behavior for names that merely start
-        // with "mtp" — the drop is arch-gated.
+        // with "mtp" — the route is arch-gated.
         assert!(to_canonical_name("model.layers.0.mlp.gate_proj.weight", "qwen35moe").is_some());
+        assert!(spec_canon("mtp.fc.weight", "llama").is_none());
     }
 
     // `mlp.shared_expert.X_proj.weight`. The experts-rename rules must NOT
@@ -6235,6 +7513,38 @@ fn rope_permute_rows(f32s: &[f32], rows: usize, cols: usize, n_heads: u32) -> Ve
 }
 
 #[cfg(test)]
+mod draft_ranking_tests {
+    use super::read_draft_ranking;
+
+    fn ranking(text: &str) -> anyhow::Result<Vec<u32>> {
+        let dir = std::env::temp_dir().join(format!("draft-rank-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(format!("r{}.json", text.len()));
+        std::fs::write(&p, text).unwrap();
+        let r = read_draft_ranking(&p);
+        let _ = std::fs::remove_file(&p);
+        r
+    }
+
+    #[test]
+    fn reads_ranked_ids_in_order() {
+        let ids =
+            ranking(r#"{"kind":"mtp_draft_ranking","ranked_ids":[13,0,271,248046]}"#).unwrap();
+        assert_eq!(ids, vec![13, 0, 271, 248046]);
+    }
+
+    /// A repeated id would silently shrink every K the runtime takes.
+    #[test]
+    fn refuses_duplicates_and_non_ids() {
+        assert!(ranking(r#"{"ranked_ids":[5,6,5]}"#).is_err());
+        assert!(ranking(r#"{"ranked_ids":[5,-1]}"#).is_err());
+        assert!(ranking(r#"{"ranked_ids":[5,1.5]}"#).is_err());
+        assert!(ranking(r#"{"ranked_ids":[]}"#).is_err());
+        assert!(ranking(r#"{"ids":[1,2]}"#).is_err());
+    }
+}
+
+#[cfg(test)]
 mod rope_permute_tests {
     use super::rope_permute_rows;
 
@@ -6431,5 +7741,181 @@ mod gguf_passthrough_tests {
                 kquant_passthrough_entry(&info(256, 4, GgmlType::Q6K), &[0u8; 8], name.into());
             assert_eq!(entry.compute_region, ComputeRegion::Gpu, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tied_head_tests {
+    use super::{
+        infer_gguf_tied_embeddings, plan_tied_lm_head, runtime_reads_output_weight, TiedHeadPlan,
+    };
+    use base_arch::source_mapper_for_gguf;
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(s, c)| (s.to_string(), c.to_string()))
+            .collect()
+    }
+
+    /// HF-style tied checkpoint: one matrix, no head.
+    fn tied_hf() -> Vec<(String, String)> {
+        pairs(&[
+            ("model.embed_tokens.weight", "embed_tokens.weight"),
+            ("model.norm.weight", "final_norm.weight"),
+        ])
+    }
+
+    // ── GGUF `has_head` inference ──────────────────────────────────────
+
+    #[test]
+    fn gguf_with_output_weight_is_untied() {
+        let m = source_mapper_for_gguf("llama").unwrap();
+        let names = ["token_embd.weight", "output.weight", "output_norm.weight"];
+        assert!(!infer_gguf_tied_embeddings(m, false, names.into_iter()));
+        // And the mapped list carries the head, so nothing is synthesized
+        // even if a caller claimed tied.
+        let mapped = pairs(&[
+            ("token_embd.weight", "embed_tokens.weight"),
+            ("output.weight", "lm_head.weight"),
+        ]);
+        assert_eq!(
+            plan_tied_lm_head(&mapped, true, "llama", true),
+            TiedHeadPlan::Nothing
+        );
+    }
+
+    #[test]
+    fn gguf_without_head_is_tied() {
+        let m = source_mapper_for_gguf("llama").unwrap();
+        let names = [
+            "token_embd.weight",
+            "output_norm.weight",
+            "blk.0.attn_q.weight",
+        ];
+        assert!(infer_gguf_tied_embeddings(m, false, names.into_iter()));
+        let mapped = pairs(&[
+            ("token_embd.weight", "embed_tokens.weight"),
+            ("output_norm.weight", "final_norm.weight"),
+        ]);
+        assert_eq!(
+            plan_tied_lm_head(&mapped, true, "llama", true),
+            TiedHeadPlan::Synthesize {
+                src: "token_embd.weight".into()
+            }
+        );
+    }
+
+    #[test]
+    fn gguf_config_that_says_tied_stays_tied() {
+        let m = source_mapper_for_gguf("qwen3").unwrap();
+        let names = ["token_embd.weight", "output.weight"];
+        assert!(infer_gguf_tied_embeddings(m, true, names.into_iter()));
+    }
+
+    #[test]
+    fn nomic_bert_gguf_without_head_is_not_tied() {
+        let m = source_mapper_for_gguf("nomic-bert").unwrap();
+        let names = [
+            "token_embd.weight",
+            "token_embd_norm.weight",
+            "blk.0.attn_qkv.weight",
+        ];
+        assert!(!infer_gguf_tied_embeddings(m, false, names.into_iter()));
+        assert!(!runtime_reads_output_weight("nomic-bert"));
+    }
+
+    // ── plan_tied_lm_head ──────────────────────────────────────────────
+
+    #[test]
+    fn hf_checkpoint_that_ties_and_ships_lm_head_is_not_duplicated() {
+        let mut mapped = tied_hf();
+        mapped.push(("lm_head.weight".into(), "lm_head.weight".into()));
+        assert_eq!(
+            plan_tied_lm_head(&mapped, true, "llama", true),
+            TiedHeadPlan::Nothing
+        );
+        assert_eq!(
+            plan_tied_lm_head(&mapped, true, "qwen", true),
+            TiedHeadPlan::Nothing
+        );
+    }
+
+    #[test]
+    fn untied_or_embeddingless_plans_nothing() {
+        assert_eq!(
+            plan_tied_lm_head(&tied_hf(), false, "llama", true),
+            TiedHeadPlan::Nothing
+        );
+        let no_embed = pairs(&[("model.norm.weight", "final_norm.weight")]);
+        assert_eq!(
+            plan_tied_lm_head(&no_embed, true, "llama", true),
+            TiedHeadPlan::Nothing
+        );
+    }
+
+    /// The arch gate mirrors the runtime: gemma.cpp / gemma4.cpp select the
+    /// logit tensor by arch.tie_embeddings (hardcoded true) and never look
+    /// output.weight up, so a synthesized head is dead weight there.
+    #[test]
+    fn gemma_runtime_never_reads_output_weight() {
+        for arch in ["gemma3", "gemma4"] {
+            assert!(!runtime_reads_output_weight(arch), "{arch}");
+            assert_eq!(
+                plan_tied_lm_head(&tied_hf(), true, arch, true),
+                TiedHeadPlan::RuntimeIgnoresHead,
+                "{arch}"
+            );
+            // The opt-out flag is moot there; the arch gate reports first.
+            assert_eq!(
+                plan_tied_lm_head(&tied_hf(), true, arch, false),
+                TiedHeadPlan::RuntimeIgnoresHead,
+                "{arch}"
+            );
+        }
+        // A hypothetical new gemma variant lands on the same encoders.
+        assert!(!runtime_reads_output_weight("gemma5"));
+    }
+
+    /// llama.cpp / qwen3_5.cpp prefer output.weight when it resolves;
+    /// muse_glimmer.cpp reads it unconditionally.
+    #[test]
+    fn head_consumers_get_a_synthesized_head() {
+        for arch in [
+            "llama",
+            "qwen",
+            "qwen_moe",
+            "qwen3_moe",
+            "qwen35",
+            "qwen35moe",
+            "muse_glimmer",
+        ] {
+            assert!(runtime_reads_output_weight(arch), "{arch}");
+            assert_eq!(
+                plan_tied_lm_head(&tied_hf(), true, arch, true),
+                TiedHeadPlan::Synthesize {
+                    src: "model.embed_tokens.weight".into()
+                },
+                "{arch}"
+            );
+        }
+        // Unknown archs fall through to encode_prefill_llama in the runtime.
+        assert!(runtime_reads_output_weight("mistral"));
+    }
+
+    #[test]
+    fn no_synth_tied_head_opts_out() {
+        assert_eq!(
+            plan_tied_lm_head(&tied_hf(), true, "llama", false),
+            TiedHeadPlan::OptedOut
+        );
+        assert_eq!(
+            plan_tied_lm_head(&tied_hf(), true, "qwen35", false),
+            TiedHeadPlan::OptedOut
+        );
+        // Opt-out never invents a head for an untied model either.
+        assert_eq!(
+            plan_tied_lm_head(&tied_hf(), false, "llama", false),
+            TiedHeadPlan::Nothing
+        );
     }
 }

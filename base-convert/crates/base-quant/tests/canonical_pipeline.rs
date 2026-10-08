@@ -78,6 +78,7 @@ fn make_header() -> Header {
         layers: vec![],
         tensors: vec![],
         mmproj: None,
+        speculator: None,
         calibration: None,
         provenance: None,
         sig: None,

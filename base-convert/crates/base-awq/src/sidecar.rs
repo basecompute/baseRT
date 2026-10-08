@@ -35,10 +35,37 @@ impl AwqProfile {
     /// Lookup the per-input-channel absmax vector for a tensor name.
     /// Returns None if the profile lacks an entry — callers fall back
     /// to plain RTN for that tensor.
+    ///
+    /// The calibrate tool records RUNTIME tensor names
+    /// (`layers.N.attention.q.weight`, `layers.N.ffn.down.weight`) while
+    /// the converter looks up CANONICAL names
+    /// (`layers.N.self_attn.q_proj.weight`, `layers.N.mlp.down_proj.weight`),
+    /// so an exact miss falls back to the canonical→runtime translation.
+    /// `ffn.gate` serves BOTH `gate_proj` and `up_proj`: the runtime
+    /// captures one absmax per matmul INPUT, and gate/up consume the same
+    /// post-norm hidden state.
     pub fn absmax(&self, tensor_name: &str) -> Option<&[f32]> {
-        self.per_tensor_absmax
-            .get(tensor_name)
-            .map(|v| v.as_slice())
+        if let Some(v) = self.per_tensor_absmax.get(tensor_name) {
+            return Some(v.as_slice());
+        }
+        const MAP: [(&str, &str); 7] = [
+            (".self_attn.q_proj.weight", ".attention.q.weight"),
+            (".self_attn.k_proj.weight", ".attention.k.weight"),
+            (".self_attn.v_proj.weight", ".attention.v.weight"),
+            (".self_attn.o_proj.weight", ".attention.output.weight"),
+            (".mlp.down_proj.weight", ".ffn.down.weight"),
+            (".mlp.gate_proj.weight", ".ffn.gate.weight"),
+            (".mlp.up_proj.weight", ".ffn.gate.weight"),
+        ];
+        for (canon, runtime) in MAP {
+            if let Some(prefix) = tensor_name.strip_suffix(canon) {
+                let alt = format!("{prefix}{runtime}");
+                if let Some(v) = self.per_tensor_absmax.get(&alt) {
+                    return Some(v.as_slice());
+                }
+            }
+        }
+        None
     }
 
     /// Validate the profile against an expected source fingerprint

@@ -32,6 +32,7 @@ fn make_header() -> Header {
         layers: vec![],
         tensors: vec![],
         mmproj: None,
+        speculator: None,
         calibration: None,
         provenance: None,
         sig: None,
@@ -495,4 +496,51 @@ fn target_backend_stamped_from_content() {
     writer.finish().unwrap();
     let reader = BaseReader::open(tmp2.path()).unwrap();
     assert_eq!(reader.header().target_backend, TargetBackend::Metal);
+}
+
+/// The speculator sub-bundle rides the same blob after the LM tensors and
+/// is listed under `header.speculator`; the LM list, the flag, the config
+/// and the byte payloads all round-trip, and the slot scan walks past it.
+#[test]
+fn roundtrip_speculator_section() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    let mut writer = BaseWriter::create(&path, make_header()).unwrap();
+    let lm: Vec<u8> = (0..64u8).collect();
+    let head: Vec<u8> = (0..96u8).map(|b| 255 - b).collect();
+    writer.add_tensor(TensorPayload {
+        entry: entry("layers.0.self_attn.q_proj.weight", vec![16]),
+        data: lm.clone(),
+    });
+    writer.set_speculator_arch("test-mtp");
+    let mut cfg = BTreeMap::new();
+    cfg.insert("kind".to_string(), serde_json::json!("mtp"));
+    cfg.insert("num_layers".to_string(), serde_json::json!(1));
+    writer.set_speculator_config(cfg);
+    writer.add_speculator_tensor(TensorPayload {
+        entry: entry("mtp.fc.weight", vec![24]),
+        data: head.clone(),
+    });
+    writer.add_slot(Slot::new(SlotKind::Custom, vec![1, 2, 3]));
+    writer.finish().unwrap();
+
+    let reader = BaseReader::open(&path).unwrap();
+    let h = reader.header();
+    assert_eq!(h.tensors.len(), 1, "the LM list holds only LM tensors");
+    assert!(h.flags.contains(HeaderFlags::HAS_SPECULATOR));
+    let spec = h.speculator.as_ref().expect("speculator section");
+    assert_eq!(spec.arch, "test-mtp");
+    assert_eq!(spec.config["kind"], serde_json::json!("mtp"));
+    assert_eq!(spec.tensors.len(), 1);
+    assert_eq!(spec.tensors[0].name, "mtp.fc.weight");
+    // Payload sits past the LM tensor in the shared blob.
+    let lm_e = &h.tensors[0];
+    assert!(spec.tensors[0].offset >= lm_e.offset + lm_e.length);
+    let off = (reader.blob_offset() + spec.tensors[0].offset) as usize;
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[off..off + head.len()], head.as_slice());
+    // The slot scan starts after the speculator payload, not inside it.
+    let slots = reader.slots().unwrap();
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].payload, vec![1, 2, 3]);
 }

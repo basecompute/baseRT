@@ -92,6 +92,23 @@ pub fn entry_from_base(path: &Path, id: &str, hf_repo: &str) -> Result<CatalogEn
 /// present locally derives the SAME row: [`crate::scan`] reads the header over
 /// two ranged requests and takes size/sha256 from the Hub's own listing, and
 /// must not invent a second interpretation of the same bytes.
+/// A drafter sidecar's (DFlash / DSpark / EAGLE-3) own storage width. Its
+/// header's scheme and profile name the target it was converted beside, so an
+/// f16 sidecar and its `--quantize-drafter` twin both read `base_q4` and would
+/// claim one catalog identity; the transformer layers' dtype tells them apart
+/// (`f16` vs `q4`, the names the hand-kept rows used). `None` for any other
+/// arch, or a sidecar with no layer weights to read.
+fn sidecar_bits(header: &base_format::Header) -> Option<String> {
+    if !matches!(header.arch.as_str(), "dflash" | "dspark" | "eagle3") {
+        return None;
+    }
+    let layer = header.tensors.iter().find(|t| {
+        t.name.starts_with("layers.") && t.name.ends_with(".weight") && t.shape.len() == 2
+    })?;
+    let tag = format!("{:?}", layer.dtype).to_ascii_lowercase();
+    Some(tag.strip_prefix("base").map(str::to_string).unwrap_or(tag))
+}
+
 pub fn entry_from_header(
     header: &base_format::Header,
     id: &str,
@@ -101,9 +118,11 @@ pub fn entry_from_header(
     sha256: String,
 ) -> Result<CatalogEntry> {
     let backend = backend_tag(header.target_backend)?;
-    let bits = crate::registry::quant_bits(&header.quant_profile)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{:?}", header.quant_scheme).to_ascii_lowercase());
+    let bits = sidecar_bits(header).unwrap_or_else(|| {
+        crate::registry::quant_bits(&header.quant_profile)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{:?}", header.quant_scheme).to_ascii_lowercase())
+    });
     let quant = match &backend {
         Some(b) => format!("{b}-{bits}"),
         None => format!("default-{bits}"),
@@ -120,6 +139,25 @@ pub fn entry_from_header(
         sha256: Some(sha256),
         parts_sha256: None,
         backend,
+        // The selectable strategy kind: a target's in-bundle head says so in
+        // `speculator.config.kind` ("mtp"; its `arch` is model-specific, e.g.
+        // qwen35-mtp), a sidecar IS the drafter, so its own architecture is
+        // the kind (dflash / dspark / eagle3).
+        speculator: header
+            .speculator
+            .as_ref()
+            .and_then(|s| {
+                s.config
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .or_else(|| match header.arch.as_str() {
+                "dflash" | "dspark" | "eagle3" => Some(header.arch.clone()),
+                _ => None,
+            }),
+        speculator_for: None,
+        speculator_rank: None,
     })
 }
 

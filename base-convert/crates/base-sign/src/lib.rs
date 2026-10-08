@@ -131,6 +131,21 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
 /// This is intentionally a post-process step: keeps `BaseWriter`
 /// streaming-friendly (no memory-buffered blob) while centralizing
 /// signing logic here.
+/// End of the weights blob relative to its start: max(offset + length) over
+/// EVERY tensor list — the main tensors and the sub-bundles that share the
+/// blob (mmproj towers, the speculator head). Scanning only `header.tensors`
+/// would leave every speculator payload out of the signed digest, so a
+/// modified MTP head still verified.
+fn blob_end_rel(h: &base_format::Header) -> u64 {
+    h.tensors
+        .iter()
+        .chain(h.mmproj.iter().flat_map(|m| m.tensors.iter()))
+        .chain(h.speculator.iter().flat_map(|m| m.tensors.iter()))
+        .map(|t| t.offset + t.length)
+        .max()
+        .unwrap_or(0)
+}
+
 pub fn sign_base_file<P: AsRef<std::path::Path>>(
     input: P,
     output: P,
@@ -145,13 +160,7 @@ pub fn sign_base_file<P: AsRef<std::path::Path>>(
         .with_context(|| format!("opening {:?}", input.as_ref()))?;
 
     // Compute end-of-blob as max(offset + length) over all tensors.
-    let blob_end_rel = reader
-        .header()
-        .tensors
-        .iter()
-        .map(|t| t.offset + t.length)
-        .max()
-        .unwrap_or(0);
+    let blob_end_rel = blob_end_rel(reader.header());
     let blob_start = reader.blob_offset();
     let blob_bytes: Vec<u8> = {
         let file_bytes = std::fs::read(input.as_ref())?;
@@ -242,13 +251,7 @@ pub fn verify_base_file<P: AsRef<std::path::Path>>(path: P, key: &VerifyingKey) 
     sig_arr.copy_from_slice(&sig_bytes);
     let sig = Signature::from_bytes(&sig_arr);
 
-    let blob_end_rel = reader
-        .header()
-        .tensors
-        .iter()
-        .map(|t| t.offset + t.length)
-        .max()
-        .unwrap_or(0);
+    let blob_end_rel = blob_end_rel(reader.header());
     let blob_start = reader.blob_offset();
     let file_bytes = std::fs::read(path.as_ref())?;
     let blob_bytes = &file_bytes[blob_start as usize..(blob_start + blob_end_rel) as usize];

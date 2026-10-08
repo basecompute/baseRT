@@ -83,6 +83,25 @@ pub struct CatalogEntry {
     /// not at load after 30 GB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// Speculative-decoding role. On a target bundle: the in-bundle
+    /// speculator it carries (`"mtp"` — `basertd --speculate mtp-head`
+    /// works out of the box). On a drafter sidecar row: its kind
+    /// (`"dflash"` / `"dspark"` / `"eagle3"`), served with
+    /// `--speculate <kind>:<pulled path>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculator: Option<String>,
+    /// Sidecar rows only: the catalog id of the target the drafter was
+    /// trained for (it shares that target's embedding / lm_head and taps
+    /// its hidden states). `basertd --speculate auto` pairs an installed
+    /// drafter with its target through this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculator_for: Option<String>,
+    /// Sidecar rows only: this drafter's preference among the sidecars of
+    /// the same target, lower first. `--speculate auto` takes the
+    /// lowest-ranked installed one; unranked sidecars follow, in strategy
+    /// order (dspark, dflash, eagle3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculator_rank: Option<u32>,
 }
 
 fn default_file() -> String {

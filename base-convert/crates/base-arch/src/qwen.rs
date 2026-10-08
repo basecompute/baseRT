@@ -34,6 +34,10 @@ fn qwen35_config_from_hf(c: &serde_json::Value) -> Result<crate::ArchConfig> {
     // nested object when present.
     let tc = c.get("text_config").unwrap_or(c);
     let mut config = crate::llama::hf_generic_config(tc)?;
+    // Multimodal wrappers keep bos/eos at the wrapper level (see
+    // backfill_wrapper_token_ids — this is the bug that silently dropped
+    // gemma-3-4b's BOS).
+    crate::backfill_wrapper_token_ids(&mut config, c);
 
     let u32_v =
         |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_u64()).map(|n| n as u32);
@@ -88,12 +92,30 @@ fn qwen35_config_from_hf(c: &serde_json::Value) -> Result<crate::ArchConfig> {
 /// (`linear_attn.norm.weight`), which is a Qwen3NextRMSNormGated and uses plain
 /// `weight` with no offset.
 fn qwen35_norm_shift(canonical: &str) -> f32 {
-    if canonical.ends_with("norm.weight") && !canonical.ends_with(".linear_attn.norm.weight") {
+    // The MTP head's two pre-fc norms are Qwen3NextRMSNorm too (zero-centered
+    // gamma, HF values near 0) but their names end in `_embedding` /
+    // `_hidden`, not `norm.weight`.
+    let mtp_pre_fc = canonical.ends_with("pre_fc_norm_embedding.weight")
+        || canonical.ends_with("pre_fc_norm_hidden.weight");
+    if mtp_pre_fc
+        || (canonical.ends_with("norm.weight") && !canonical.ends_with(".linear_attn.norm.weight"))
+    {
         1.0
     } else {
         0.0
     }
 }
+
+/// MLX sources of Qwen3.5 / 3.6 / 3.8 carry NO norm shift: mlx-lm's
+/// `qwen3_next` converter already stores every Qwen3NextRMSNorm as
+/// `1 + weight` so its runtime can use the plain `nn.RMSNorm` (measured on
+/// `mlx-community/Qwen3.8-27B-4bit`: `input_layernorm` mean 0.97,
+/// `q_norm` 1.36, `model.norm` 1.94 — and `linear_attn.norm`, plain in HF
+/// too, 0.87). Those are exactly the values the `.base` runtime wants, so
+/// the HF +1 above must not be applied again (BAS-959: it was, every norm
+/// sat near 2, the bundle decoded garbage and the MTP head accepted
+/// nothing).
+const QWEN35_MLX_NORM_SHIFT: f32 = 0.0;
 
 impl crate::HfMapper for Qwen35HfMapper {
     fn canonical_arch(&self) -> &'static str {
@@ -105,6 +127,9 @@ impl crate::HfMapper for Qwen35HfMapper {
     fn norm_shift(&self, canonical: &str) -> f32 {
         qwen35_norm_shift(canonical)
     }
+    fn mlx_norm_shift(&self, _canonical: &str) -> f32 {
+        QWEN35_MLX_NORM_SHIFT
+    }
 }
 
 impl crate::HfMapper for Qwen35MoeHfMapper {
@@ -113,6 +138,9 @@ impl crate::HfMapper for Qwen35MoeHfMapper {
     }
     fn norm_shift(&self, canonical: &str) -> f32 {
         qwen35_norm_shift(canonical)
+    }
+    fn mlx_norm_shift(&self, _canonical: &str) -> f32 {
+        QWEN35_MLX_NORM_SHIFT
     }
     fn config_from_hf(&self, c: &serde_json::Value) -> Result<crate::ArchConfig> {
         // The real Qwen3.5/3.6-MoE text_config carries NO `intermediate_size`
@@ -464,6 +492,11 @@ mod tests {
             "layers.3.self_attn.q_norm.weight",
             "layers.3.self_attn.k_norm.weight",
             "final_norm.weight",
+            // The MTP head's norms, under the speculator prefix.
+            "mtp.layers.0.input_norm.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
         ] {
             assert_eq!(qwen35_norm_shift(s), 1.0, "should shift: {s}");
         }
@@ -473,8 +506,45 @@ mod tests {
             "layers.0.linear_attn.in_proj_qkv.weight",
             "layers.0.mlp.gate_proj.weight",
             "embed_tokens.weight",
+            "mtp.fc_embed.weight",
+            "mtp.fc_hidden.weight",
         ] {
             assert_eq!(qwen35_norm_shift(s), 0.0, "should not shift: {s}");
+        }
+    }
+
+    /// An MLX source already stores `1 + weight` (mlx-lm bakes the offset),
+    /// so the MLX rule is "never shift" for every tensor the HF rule shifts
+    /// — dense and MoE mappers alike (BAS-959).
+    #[test]
+    fn qwen35_mlx_sources_are_never_shifted() {
+        use crate::HfMapper;
+        let shifted_by_hf = [
+            "layers.0.input_norm.weight",
+            "layers.3.post_attn_norm.weight",
+            "layers.3.self_attn.q_norm.weight",
+            "layers.3.self_attn.k_norm.weight",
+            "final_norm.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "layers.0.linear_attn.norm.weight",
+            "embed_tokens.weight",
+        ];
+        for m in [
+            &Qwen35HfMapper as &dyn HfMapper,
+            &Qwen35MoeHfMapper as &dyn HfMapper,
+        ] {
+            for s in shifted_by_hf {
+                assert_eq!(
+                    m.mlx_norm_shift(s),
+                    0.0,
+                    "{}: MLX source must not shift {s}",
+                    m.canonical_arch()
+                );
+            }
+            // The HF rule is untouched.
+            assert_eq!(m.norm_shift("layers.0.input_norm.weight"), 1.0);
         }
     }
 

@@ -108,8 +108,15 @@ pub struct AwqPlan {
 impl AwqConfig {
     /// AWQ alpha search per the original paper. Iterates alpha_grid,
     /// for each α scales weights by `absmax^α`, RTN-quantizes,
-    /// dequantizes, undoes the scale, and measures reconstruction
-    /// MSE. Returns the best α + its scale vector.
+    /// dequantizes, undoes the scale, and measures the
+    /// ACTIVATION-WEIGHTED reconstruction error — each channel's error
+    /// counts in proportion to its calibration absmax, i.e.
+    /// ‖(Q(W·s)·s⁻¹ − W)·diag(a)‖². Returns the best α + its scales.
+    ///
+    /// The weighting is the point of AWQ: with plain (unweighted) MSE
+    /// the α=0 identity always wins, because RTN already minimizes
+    /// per-group weight-space MSE — which is exactly the bug this
+    /// implementation shipped with (α=0.00 on every real tensor).
     ///
     /// `weights` is row-major `[out, in]`. `absmax_per_input_channel`
     /// has length = in_features and contains the per-channel max
@@ -152,6 +159,7 @@ impl AwqConfig {
                 in_features,
                 out_features,
                 &inverse_scales,
+                absmax_per_input_channel,
                 bits,
                 group_size,
                 symmetric,
@@ -218,7 +226,11 @@ fn scale_columns(weights: &[f32], in_features: usize, scales: &[f32]) -> Vec<f32
 }
 
 /// Quantize-dequantize `rotated`, undo the rotation by `inverse_scales`,
-/// compare against `original`. Returns mean-squared error.
+/// compare against `original`. Returns the ACTIVATION-WEIGHTED
+/// mean-squared error: each channel's error is scaled by its calibration
+/// absmax (eps-floored), matching the AWQ objective
+/// ‖(Q(W·s)·s⁻¹ − W)·diag(a)‖². Pass uniform absmax for the unweighted
+/// behaviour.
 #[allow(clippy::too_many_arguments)]
 fn rtn_reconstruction_mse(
     original: &[f32],
@@ -226,6 +238,7 @@ fn rtn_reconstruction_mse(
     in_features: usize,
     out_features: usize,
     inverse_scales: &[f32],
+    absmax: &[f32],
     bits: u32,
     group_size: u32,
     symmetric: bool,
@@ -250,9 +263,12 @@ fn rtn_reconstruction_mse(
         let dequant = unpack_rtn(&packed, in_features, cfg);
         let orig_row = &original[i * in_features..(i + 1) * in_features];
         for (k, q) in dequant.iter().enumerate() {
-            // Undo the scale before comparing.
+            // Undo the scale before comparing, then weight the error by the
+            // channel's activation magnitude — a weight error on a channel
+            // that never fires costs (almost) nothing; one on a hot channel
+            // is what actually perturbs the layer output.
             let recon = q * inverse_scales[k];
-            let err = recon - orig_row[k];
+            let err = (recon - orig_row[k]) * absmax[k].max(1e-5);
             sse += (err as f64) * (err as f64);
             n += 1;
         }
@@ -281,8 +297,9 @@ mod tests {
 
         let plan = AwqConfig::default().search(&weights, n_in, &absmax, 4, 64, false);
         let identity: Vec<f32> = vec![1.0; n_in];
-        let plain_mse =
-            rtn_reconstruction_mse(&weights, &weights, n_in, n_out, &identity, 4, 64, false);
+        let plain_mse = rtn_reconstruction_mse(
+            &weights, &weights, n_in, n_out, &identity, &absmax, 4, 64, false,
+        );
         // Tiny tolerance for floating-point order-of-ops.
         assert!(
             plan.mse <= plain_mse * 1.0001,
@@ -313,8 +330,9 @@ mod tests {
         let plan = AwqConfig::default().search(&weights, n_in, &absmax, 2, 32, false);
 
         let identity: Vec<f32> = vec![1.0; n_in];
-        let plain_mse =
-            rtn_reconstruction_mse(&weights, &weights, n_in, n_out, &identity, 2, 32, false);
+        let plain_mse = rtn_reconstruction_mse(
+            &weights, &weights, n_in, n_out, &identity, &absmax, 2, 32, false,
+        );
         assert!(
             plan.mse < plain_mse,
             "AWQ should help: awq={} plain={}",

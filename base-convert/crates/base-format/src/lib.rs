@@ -12,8 +12,8 @@ pub use error::{Error, Result};
 pub use header::{
     AlignmentConfig, CalibrationInfo, ComputeRegion, Header, HeaderFlags, LayerDescriptor,
     LayerKind, LayerPrecision, Layout, ModelConfig, Provenance, QuantScheme, ResidencyHint,
-    ScaleDtype, Signature, SourceInfo, StackRef, TargetBackend, TensorDtype, TensorEntry,
-    TensorFlags, TensorProvenance, TokenizerBlob,
+    ScaleDtype, Signature, SourceInfo, SpeculatorBundle, StackRef, TargetBackend, TensorDtype,
+    TensorEntry, TensorFlags, TensorProvenance, TokenizerBlob,
 };
 pub use reader::BaseReader;
 pub use slots::{read_slots, write_slots, Slot, SlotFlags, SlotKind};
