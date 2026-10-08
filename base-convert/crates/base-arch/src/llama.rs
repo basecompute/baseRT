@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 
 pub struct LlamaMapper;
 pub struct LlamaHfMapper;
+pub struct Phi3HfMapper;
 
 impl crate::HfMapper for LlamaHfMapper {
     fn canonical_arch(&self) -> &'static str {
@@ -41,6 +42,40 @@ impl crate::HfMapper for LlamaHfMapper {
         } else {
             None
         }
+    }
+}
+
+/// Phi-3 through the Llama mapper, minus the variants the engine cannot
+/// run. HF ships every Phi-3 generation under the same `model_type:
+/// "phi3"`, but only the standard-RoPE checkpoints (Phi-3-mini-4k) are
+/// Llama-shaped at runtime: the 128k-context and all Phi-3.5 checkpoints
+/// carry `rope_scaling.type = "longrope"` (per-frequency short/long factor
+/// arrays), which the engine does not implement. Converting one anyway
+/// would produce a bundle that loads and generates with the wrong rotary
+/// scaling — so any `rope_scaling` on a phi3 config fails the conversion
+/// instead of falling through to the generic parse.
+impl crate::HfMapper for Phi3HfMapper {
+    fn canonical_arch(&self) -> &'static str {
+        LlamaHfMapper.canonical_arch()
+    }
+    fn config_from_hf(&self, c: &serde_json::Value) -> Result<crate::ArchConfig> {
+        if let Some(rs) = c.get("rope_scaling").filter(|v| !v.is_null()) {
+            let ty = rs
+                .get("rope_type")
+                .or_else(|| rs.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unnamed>");
+            anyhow::bail!(
+                "phi3 checkpoint declares rope_scaling type {ty:?}: this is a Phi-3.5 / \
+                 long-context variant (LongRoPE), which the engine does not implement — \
+                 converting it would run with incorrect rotary scaling. Only standard-RoPE \
+                 Phi-3 checkpoints (e.g. microsoft/Phi-3-mini-4k-instruct) are supported."
+            );
+        }
+        LlamaHfMapper.config_from_hf(c)
+    }
+    fn rope_permute_heads(&self, canonical: &str, cfg: &crate::ArchConfig) -> Option<u32> {
+        LlamaHfMapper.rope_permute_heads(canonical, cfg)
     }
 }
 
@@ -78,8 +113,31 @@ pub(crate) fn hf_generic_config(c: &serde_json::Value) -> Result<crate::ArchConf
     };
     let vocab_size = u32_key("vocab_size")?;
     let head_dim = u32_key("head_dim").unwrap_or(hidden_size / num_attention_heads);
-    let rope_theta = f32_key("rope_theta").unwrap_or(10_000.0);
-    let rope_scaling = c.get("rope_scaling");
+    // transformers v5 writes RoPE as one flat `rope_parameters` block
+    // (`{"rope_theta": 1e7, "rope_type": "default" | "yarn", "factor": ..}`)
+    // instead of top-level `rope_theta` + `rope_scaling`. Reading only the
+    // top level fell back to theta 10000 on those configs: a Qwen3 drafter
+    // saved by v5 roped at 1/1000th of its trained base. The nested
+    // per-attention-type form (gemma) has no flat `rope_theta` and is left to
+    // the arch mappers that parse it.
+    let rope_params = c
+        .get("rope_parameters")
+        .filter(|p| p.get("rope_theta").is_some_and(|v| v.is_number()));
+    let rope_theta = f32_key("rope_theta")
+        .or_else(|| {
+            rope_params
+                .and_then(|p| p.get("rope_theta"))
+                .and_then(|v| v.as_f64())
+                .map(|f| f as f32)
+        })
+        .unwrap_or(10_000.0);
+    let rope_scaling = c.get("rope_scaling").filter(|v| !v.is_null()).or_else(|| {
+        rope_params.filter(|p| {
+            p.get("rope_type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| t != "default")
+        })
+    });
     let rope_scale = rope_scaling
         .and_then(|v| v.get("factor"))
         .and_then(|v| v.as_f64())
@@ -105,6 +163,29 @@ pub(crate) fn hf_generic_config(c: &serde_json::Value) -> Result<crate::ArchConf
         .and_then(|v| v.as_u64())
         .map(|n| n as u32)
         .unwrap_or(0);
+    // YaRN's ramp (HF `_compute_yarn_parameters` defaults): read for every
+    // arch, not only gpt-oss — a YaRN-trained drafter (Qwen3.8-27B-DSpark,
+    // gpt-oss-20b-DFlash) ropes with it too.
+    let is_yarn = rope_scaling_type == "yarn";
+    let rope_yarn_beta_fast = if is_yarn {
+        Some(rs_f32("beta_fast"))
+            .filter(|v| *v > 0.0)
+            .unwrap_or(32.0)
+    } else {
+        0.0
+    };
+    let rope_yarn_beta_slow = if is_yarn {
+        Some(rs_f32("beta_slow"))
+            .filter(|v| *v > 0.0)
+            .unwrap_or(1.0)
+    } else {
+        0.0
+    };
+    let rope_yarn_truncate = is_yarn
+        && rope_scaling
+            .and_then(|v| v.get("truncate"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
     let rms_norm_eps = f32_key("rms_norm_eps").unwrap_or(1e-6);
     let tie_word_embeddings = bool_key("tie_word_embeddings").unwrap_or(false);
 
@@ -153,6 +234,9 @@ pub(crate) fn hf_generic_config(c: &serde_json::Value) -> Result<crate::ArchConf
         rope_low_freq_factor,
         rope_high_freq_factor,
         rope_original_max_pos,
+        rope_yarn_beta_fast,
+        rope_yarn_beta_slow,
+        rope_yarn_truncate,
         rms_norm_eps,
         tie_word_embeddings,
         max_position_embeddings,
@@ -359,6 +443,33 @@ mod tests {
         );
     }
 
+    /// transformers v5 configs carry RoPE only under a flat
+    /// `rope_parameters` block. Reading the top level alone defaulted theta
+    /// to 10000 (the Qwen3.5-35B-A3B DFlash drafter's 6% acceptance).
+    #[test]
+    fn rope_parameters_block_supplies_theta_and_scaling() {
+        let mut cfg = serde_json::json!({
+            "hidden_size": 2560, "num_hidden_layers": 5, "num_attention_heads": 32,
+            "intermediate_size": 9728, "vocab_size": 151936,
+            "rope_parameters": {"rope_theta": 10_000_000, "rope_type": "default"},
+        });
+        let c = hf_generic_config(&cfg).unwrap();
+        assert_eq!(c.rope_theta, 1.0e7);
+        assert_eq!(c.rope_scale, 1.0, "a default rope_type is not a scaling");
+        cfg["rope_parameters"] = serde_json::json!({
+            "rope_theta": 1_000_000, "rope_type": "yarn", "factor": 4.0,
+            "original_max_position_embeddings": 32768
+        });
+        let c = hf_generic_config(&cfg).unwrap();
+        assert_eq!(c.rope_theta, 1.0e6);
+        assert_eq!(c.rope_scale, 4.0);
+        assert_eq!(c.rope_scaling_type, "yarn");
+        assert_eq!(c.rope_original_max_pos, 32768);
+        // Top-level keys still win where both exist.
+        cfg["rope_theta"] = serde_json::json!(500_000.0);
+        assert_eq!(hf_generic_config(&cfg).unwrap().rope_theta, 5.0e5);
+    }
+
     /// Llama-3 instruct: `eos_token_id: [128001, 128008, 128009]`. Primary
     /// `<|end_of_text|>` lands in `eos_token_id`; `<|eom_id|>` and
     /// `<|eot_id|>` go into `eos_token_ids` for runtime multi-EOS.
@@ -380,6 +491,65 @@ mod tests {
         assert_eq!(c.bos_token_id, 128000);
         assert_eq!(c.eos_token_id, 128001);
         assert_eq!(c.eos_token_ids, vec![128008u32, 128009u32]);
+    }
+
+    /// Phi-3.5 (and Phi-3-*-128k) share `model_type: "phi3"` with the
+    /// supported 4k checkpoints but declare LongRoPE via `rope_scaling`.
+    /// The guarded mapper must reject them at conversion time — the
+    /// generic parse would otherwise emit a bundle that generates with
+    /// incorrect rotary scaling.
+    #[test]
+    fn phi35_longrope_fails_closed() {
+        let cfg = serde_json::json!({
+            "hidden_size": 3072,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 32,
+            "intermediate_size": 8192,
+            "vocab_size": 32064,
+            "rope_theta": 10_000.0,
+            "rms_norm_eps": 1e-5,
+            "bos_token_id": 1,
+            "eos_token_id": 32000,
+            "rope_scaling": {
+                "type": "longrope",
+                "short_factor": [1.0, 1.03, 1.05],
+                "long_factor": [1.0, 1.5, 2.0],
+            },
+        });
+        let err = crate::HfMapper::config_from_hf(&Phi3HfMapper, &cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("longrope"), "error names the variant: {msg}");
+        // Older configs spell the key `type`; current HF uses `rope_type`.
+        let mut cfg2 = cfg.clone();
+        cfg2["rope_scaling"] = serde_json::json!({"rope_type": "longrope", "factor": 4.0});
+        assert!(crate::HfMapper::config_from_hf(&Phi3HfMapper, &cfg2).is_err());
+        // Even an unnamed scaling block fails closed rather than parsing.
+        cfg2["rope_scaling"] = serde_json::json!({"factor": 4.0});
+        assert!(crate::HfMapper::config_from_hf(&Phi3HfMapper, &cfg2).is_err());
+    }
+
+    /// Phi-3-mini-4k (`rope_scaling: null`) still converts through the
+    /// guarded mapper exactly as it did through the plain Llama mapper.
+    #[test]
+    fn phi3_mini_4k_still_converts() {
+        let cfg = serde_json::json!({
+            "hidden_size": 3072,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 32,
+            "intermediate_size": 8192,
+            "vocab_size": 32064,
+            "rope_theta": 10_000.0,
+            "rms_norm_eps": 1e-5,
+            "bos_token_id": 1,
+            "eos_token_id": 32000,
+            "rope_scaling": serde_json::Value::Null,
+        });
+        let c = crate::HfMapper::config_from_hf(&Phi3HfMapper, &cfg).unwrap();
+        assert_eq!(c.hidden_size, 3072);
+        assert_eq!(c.eos_token_id, 32000);
+        assert_eq!(c.rope_scaling_type, "", "no scaling recorded");
     }
 
     #[test]

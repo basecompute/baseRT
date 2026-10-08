@@ -18,7 +18,9 @@ bitflags! {
         const HAS_HYBRID        = 1 << 3;
         /// Extension slots contain LoRA delta weights.
         const HAS_LORA          = 1 << 4;
-        /// Extension slots contain a paired speculator model.
+        /// The bundle carries a speculator sub-bundle (`header.speculator`):
+        /// a drafter that conditions on this model's hidden states — an
+        /// in-checkpoint MTP head, or a converted EAGLE / DFlash drafter.
         const HAS_SPECULATOR    = 1 << 5;
         /// Extension slots contain precompiled compute graphs.
         const HAS_COMPUTE_GRAPH = 1 << 6;
@@ -525,6 +527,9 @@ pub struct Provenance {
     /// Source tensors routed into the mmproj sub-bundle.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mmproj: Vec<String>,
+    /// Source tensors routed into the speculator sub-bundle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speculator: Vec<String>,
     /// Bundle tensor name -> provenance record.
     pub tensors: BTreeMap<String, TensorProvenance>,
 }
@@ -557,6 +562,11 @@ pub struct TensorProvenance {
     /// qkv_proj / gate_up_proj splits).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<[u64; 2]>,
+    /// `[col_offset, col_count]` input-column block of the source tensor
+    /// (the MTP head's `mtp.fc` split into fc_embed / fc_hidden, a block
+    /// drafter's per-tap `fc.{i}`, EAGLE-3's `*_proj_emb` / `*_proj_hid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<[u64; 2]>,
     /// Stacked from `count` per-expert source tensors; `pattern`
     /// contains `{e}` where the expert index goes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -626,6 +636,8 @@ pub struct Header {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub mmproj: Option<MmprojBundle>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub speculator: Option<SpeculatorBundle>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub calibration: Option<CalibrationInfo>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sig: Option<Signature>,
@@ -658,6 +670,29 @@ pub struct MmprojBundle {
     /// etc.) that the runtime needs to wire image/audio prefill. Empty
     /// when the source had no multimodal config (e.g. text-only with a
     /// stray tower checkpoint — unusual).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, serde_json::Value>,
+    pub tensors: Vec<TensorEntry>,
+}
+
+/// Speculator sub-bundle: a drafter the runtime runs alongside the main
+/// model for speculative decoding. Same layout convention as `mmproj` —
+/// its tensors live in the same weights blob, listed here so a runtime
+/// without speculation skips them. Kinds so far:
+///   * `<arch>-mtp`: the checkpoint's own Multi-Token-Prediction head
+///     (Qwen3.5/3.6/3.8 `mtp.*`, GLM `nextn`): one decoder layer of the
+///     target's geometry plus `fc` / pre-fc norms / final norm, sharing the
+///     target's embeddings and lm_head. Tensors are named `mtp.<canonical>`
+///     (the decoder layer as `mtp.layers.0.*`, canonicalized exactly like a
+///     main layer, norm shifts baked). Kept unquantized (f16): the head's
+///     acceptance rate is what the whole scheme buys, and quantizing it
+///     measured near-zero acceptance on MoE targets.
+///
+/// `config` is open-namespace: `kind`, `num_layers`, `moe`,
+/// `shared_embeddings`, drafter-specific keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeculatorBundle {
+    pub arch: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config: BTreeMap<String, serde_json::Value>,
     pub tensors: Vec<TensorEntry>,

@@ -63,8 +63,8 @@ extern "C" {
 // === Versioning ===
 
 #define BASERT_VERSION_MAJOR 0
-#define BASERT_VERSION_MINOR 2
-#define BASERT_VERSION_PATCH 6
+#define BASERT_VERSION_MINOR 3
+#define BASERT_VERSION_PATCH 0
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
@@ -84,8 +84,11 @@ typedef void *baseRT_model_t;
 /// Other source formats (GGUF, HF safetensors, MLX safetensors) must be
 /// converted offline first via `basert convert`.
 /// kernel_library_path: path to the compiled GPU kernel library (on the Metal
-///   backend, baseRT.metallib), or NULL to auto-detect. Auto-detect order: a
-///   kernel library next to the build, then a copy embedded in the loaded
+///   backend, baseRT.metallib; on CUDA, baseRT_cuda_kernels.fatbin; on ROCm,
+///   baseRT_rocm_kernels.hsaco), or NULL to auto-detect. Auto-detect order:
+///   $BASERT_KERNEL_LIB (a file, or a directory holding the artifact), a
+///   kernel library next to the build, next to the
+///   executable, the current directory, then a copy embedded in the loaded
 ///   binary itself (single-file distributions ship the shared library with the
 ///   kernels linked in, so NULL just works). Named generically so non-Metal
 ///   backends (CUDA/ROCm, future) can reuse the same parameter.
@@ -96,6 +99,17 @@ typedef void *baseRT_model_t;
 ///   budget, or a number the operator chose.
 /// Returns NULL on failure.
 baseRT_model_t baseRT_load_model(const char *model_path, const char *kernel_library_path, int max_context);
+
+/// Load ONLY the bundle's tokenizer: metadata parse + vocab/merges, no
+/// tensor upload, no KV/scratch allocation (a serving daemon tokenizes in
+/// its own process while a worker owns the GPU state — basertd §3's codec
+/// placement). The returned handle supports exactly the tokenizer surface:
+/// baseRT_encode, baseRT_decode_token / _static / _raw, baseRT_token_count,
+/// baseRT_eos_token_id, baseRT_bos_id / baseRT_bos_token / baseRT_eos_token,
+/// baseRT_get_config, and baseRT_free_model. Calling generation or
+/// sequence APIs on it is undefined. NULL on failure (see
+/// baseRT_get_error).
+baseRT_model_t baseRT_load_tokenizer_only(const char *model_path);
 
 /// Load a model with per-call options instead of the process-wide
 /// baseRT_set_* pre-load setters. `opts` may be NULL (identical to
@@ -138,7 +152,26 @@ uint32_t baseRT_capabilities(baseRT_model_t model);
 /// Returns BASERT_OK, or an error code (leaves the model on the OLD library on
 /// load failure). Not supported for whisper models. NOT thread-safe against
 /// in-flight inference — serialize the caller.
+///
+/// INVALIDATES ALL DECODED STATE. Everything in a KV or recurrent slab was
+/// produced by the old kernels, so resuming on it would mix kernel versions —
+/// the one thing a tuning comparison must not do. On success the default
+/// sequence's KV, recurrent state and prefix cache are reset for you (position
+/// returns to 0). Caller-owned sequences (baseRT_sequence_create) are NOT
+/// reachable from here and must be destroyed and recreated; using one across a
+/// reload is undefined.
 int baseRT_reload_metallib(baseRT_model_t model, const char *metallib_path);
+
+/// A JSON capability descriptor for this loaded model (schema field
+/// `descriptor_version`): workload, modalities, serving, state, adaptation,
+/// and tick-op support, each capability either `true` or a stable reason
+/// string explaining why it is unavailable on this architecture + backend +
+/// load-options triple. Computed once at load (verdicts frozen, like the
+/// multi-row overcommit verdict) — immutable, race-free, never touches the
+/// error state. The pointer is owned by the model handle and valid until
+/// baseRT_free_model. Supersedes the five-bit mask above for every question
+/// it cannot answer; the mask stays for cheap scheduler branching.
+const char *baseRT_capability_descriptor(baseRT_model_t model);
 
 /// Override the KV cache element width for the next baseRT_load_model call.
 ///   bits = 0  → auto (per-model default; Q8_0 when head_dim%32==0)
@@ -147,6 +180,16 @@ int baseRT_reload_metallib(baseRT_model_t model, const char *metallib_path);
 /// Process-wide; persists across loads. Must be called before
 /// baseRT_load_model. Other values are ignored.
 void baseRT_set_kv_bits(int bits);
+
+/// The KV cache's element width as ACTUALLY allocated for `model`, in the
+/// `baseRT_set_kv_bits` encoding: 16 (f16), 8 (Q8_0), 4 (Q4_0), 84 (K at
+/// Q8_0, V at Q4_0), or 0 for a model with no KV cache. Differs from what
+/// was set whenever the loader overrode it — hybrid GDN / SSM, gpt-oss and
+/// MLA models force f16; a paged pool is uniform (84 → 8); a head_dim that
+/// is not a multiple of 32 cannot take the quantized blocks — and the load
+/// printed one `[baseRT] <path>: --kv-bits N requested, ...` line saying
+/// why. Serve this rather than the setting when reporting KV precision.
+int baseRT_kv_bits_effective(baseRT_model_t model);
 
 /// Enable engine diagnostics (RoPE/tokenizer/GPU/architecture dumps, the
 /// per-token dispatch-command count, "Warming up"). Off by default so end
@@ -244,14 +287,19 @@ size_t baseRT_model_config_sizeof(void);
 /// Get total GPU memory used by model (bytes).
 size_t baseRT_model_memory(baseRT_model_t model);
 
-/// The device memory budget the engine allocates within, in bytes, without
-/// needing a loaded model. NOT installed RAM: on Metal this is the unified-
-/// memory working set the OS recommends (~75% of physical RAM), on CUDA the
-/// device's total memory. 0 when no supported device is present.
+/// The device memory budget automatic context sizing plans within, in bytes,
+/// without needing a loaded model. NOT installed RAM: on Metal this is 85% of
+/// the unified-memory working set the OS recommends (itself a fraction of RAM
+/// the OS picks per machine, roughly two thirds to three quarters) — the share
+/// the engine keeps its pinned weights within, since past it Metal evicts from
+/// the pinned set and reads slow down or go corrupt; on CUDA the device's total
+/// memory. 0 when no supported device is present.
 ///
-/// This is the number that matters for sizing decisions — it is what the load
-/// path compares the model's working set against before warning that the OS
-/// will start paging weights.
+/// This is the number `baseRT_suggest_max_context*` and
+/// `baseRT_context_window_fits` size against. It is a planning line, not a
+/// hard limit: a load whose working set lands between it and the full working
+/// set still succeeds, with the tail of its weights left to page-cache LRU (and
+/// the load warns once the working set passes the full budget).
 size_t baseRT_device_memory_budget(void);
 
 /// Floor on a window derived by `baseRT_suggest_max_context`. Policy, not a
@@ -298,6 +346,29 @@ int baseRT_suggest_max_context(const char *model_path, int max_batch, int kv_bit
 int baseRT_suggest_max_context_multi(const char *const *model_paths, int n_models, int max_batch, int kv_bits,
                                      int paged_kv);
 
+/// As `baseRT_suggest_max_context_multi`, plus the speculators that will load
+/// beside those models. A drafter runs at its target's window and lane count
+/// with its own paged KV pool, so it spends the same budget: leaving it out
+/// sizes the targets' pools into memory the drafter then cannot get.
+/// `speculator_embedded[i]` non-zero marks speculator i as its target
+/// bundle's own embedded head (header.speculator, e.g. MTP): its KV pool only,
+/// its weights being part of the bundle. Zero — or a null array — is a
+/// separately loaded bundle (a DFlash / DSpark / EAGLE-3 sidecar or a draft
+/// model): its weights and its KV pool, even if the same file is also one of
+/// `model_paths` (a draft model is loaded again beside the served copy).
+/// `speculator_target[i]` >= 0 marks speculator i as a sidecar loaded with
+/// `baseRT_load_drafter` against `model_paths[speculator_target[i]]`: that
+/// loader reopens the target's bundle for its token embedding / lm_head, and a
+/// backend that copies wrapped weights (CUDA's UMA path) holds those rows a
+/// second time, so they are charged too. -1 — or a null array — is a
+/// speculator with no such view (a draft model loads on its own); it is
+/// ignored for an embedded head, whose view of its own bundle is always charged.
+/// Speculators never cap the window, one that cannot be read is skipped, and
+/// none is charged unless `paged_kv` (their loaders require a paged target).
+int baseRT_suggest_max_context_spec(const char *const *model_paths, int n_models, const char *const *speculator_paths,
+                                    const int *speculator_embedded, const int *speculator_target, int n_speculators,
+                                    int max_batch, int kv_bits, int paged_kv);
+
 /// Does `window` fit `model_paths` co-resident on this device, under the same
 /// budget the suggestion above derives from? 1 = yes, 0 = no, -1 = cannot tell
 /// (a bundle would not open, no trained window, unknown budget).
@@ -325,6 +396,11 @@ typedef struct BaseRTMemoryStats {
     uint64_t kv_cache_used_bytes;
     uint64_t kv_cache_blocks_total;
     uint64_t kv_cache_blocks_used;
+    /// Tokens resident in the KV. Exact on a contiguous cache. On a PAGED cache
+    /// this is block-granular — `kv_cache_blocks_used * page_size`, so each
+    /// sequence's partially-filled last block counts whole — because the pool
+    /// tracks blocks, not per-sequence lengths, and the default lane's own
+    /// length reads 0 whenever batched sequences own the live state.
     uint64_t kv_cache_tokens_used;
     BaseRTKVCacheLayout kv_cache_layout;
     uint32_t reserved;
@@ -352,7 +428,36 @@ const char *baseRT_strerror(BaseRTErrorCode code);
 // === Tokenization ===
 
 /// Encode text to token IDs. Returns number of tokens written.
+///
+/// A substring equal to one of the model's special tokens (`<|im_end|>`,
+/// `<think>`, `<tool_call>`, …) becomes that single control id — what a
+/// rendered chat prompt needs, since its framing IS those markers.
 int baseRT_encode(baseRT_model_t model, const char *text, uint32_t *out_tokens, int max_tokens);
+
+/// Encode text with special-token strings treated as ordinary text.
+///
+/// The same substrings tokenize to their BPE pieces instead of control ids,
+/// so a message body, tool result or document that QUOTES a marker cannot
+/// forge a turn boundary or open a reasoning block. Use this for client
+/// content and `baseRT_encode` for a dialect's own framing. No automatic
+/// BOS-dedup either: a leading BOS string here is content. Returns number
+/// of tokens written.
+int baseRT_encode_plain(baseRT_model_t model, const char *text, uint32_t *out_tokens, int max_tokens);
+
+/// Encode a sequence of text pieces as ONE text.
+///
+/// Piece `i` is framing when `plain[i]` is zero (marker strings parse to
+/// control ids, as in `baseRT_encode`) and client content otherwise (they
+/// stay ordinary text, as in `baseRT_encode_plain`). Unlike encoding the
+/// pieces one by one, the pre-tokenizer and BPE see the concatenation, so a
+/// boundary between two pieces tokenizes exactly as it does in a whole-text
+/// encode of the same characters (a content piece starting with a newline
+/// after a framing newline still merges into the `\n\n` token) and the
+/// automatic BOS is handled once at the front. A chat codec renders a turn
+/// with this: the role line and the wire around a message are framing, the
+/// message is content. Returns number of tokens written.
+int baseRT_encode_pieces(baseRT_model_t model, const char *const *texts, const int *plain, int n_pieces,
+                         uint32_t *out_tokens, int max_tokens);
 
 /// Decode a single token ID to text. Returns static string (do not free).
 ///
@@ -375,16 +480,21 @@ const char *baseRT_decode_token_static(baseRT_model_t model, uint32_t token_id);
 typedef struct baseRT_decode_stream *baseRT_decode_stream_t;
 baseRT_decode_stream_t baseRT_decode_stream_create(baseRT_model_t model);
 void baseRT_decode_stream_reset(baseRT_decode_stream_t stream);
+
+/// Reset a stream for a lane whose generation resumes after `prompt`, deriving
+/// the channel resume state from its last framing token. Prefer this over
+/// `baseRT_decode_stream_reset` on any lane that may carry a RAW (unframed)
+/// prompt: the plain reset assumes a chat prompt, which ends inside a
+/// `<|start|>assistant` header, and on a Muse vocabulary an unframed prompt
+/// left in that state has every generated token buffered as protocol until a
+/// 128-byte valve trips — a short completion returns nothing at all. Harmony
+/// has its own fail-open path and is unaffected either way. `prompt` NULL or
+/// `n_prompt` 0 behaves exactly like `baseRT_decode_stream_reset`.
+void baseRT_decode_stream_reset_for_prompt(baseRT_decode_stream_t stream, const uint32_t *prompt, int n_prompt);
 /// Returns a pointer into the stream's own buffer, valid until the next
 /// call on the same stream.
 const char *baseRT_decode_stream_token(baseRT_decode_stream_t stream, uint32_t token_id);
 void baseRT_decode_stream_free(baseRT_decode_stream_t stream);
-
-/// 1 when `token_id` ends the assistant turn: the bundle's eos_token_id OR
-/// any of its extra end-of-turn ids (Llama 3's <|eot_id|>, gpt-oss's
-/// <|call|> and <|endoftext|>, …). `baseRT_eos_token_id` reports only the
-/// first; a lane that compares against that alone runs past the others.
-int baseRT_is_eos_token(baseRT_model_t model, uint32_t token_id);
 
 /// Length-preserving variant of `baseRT_decode_token_static` for callers
 /// that need the token's EXACT raw bytes. Byte-level BPE / byte-fallback
@@ -588,7 +698,19 @@ int baseRT_max_prefill_chunk(baseRT_model_t model);
 /// Roll a sequence's KV state back to `length` tokens, returning any blocks
 /// past that point to the pool. `length` must be <= the current length; 0
 /// resets the sequence to empty. Used by the serving engine's shape-padding
-/// dummy lanes (their KV is discarded after every tick).
+/// dummy lanes (their KV is discarded after every tick) and by speculative
+/// verification (drop the rejected drafts). Recurrent-state models: a
+/// hybrid-GDN lane rolls back only to a length inside its last
+/// baseRT_batch_step_fused_logits_rows feed (the recurrence is rebuilt from
+/// that feed's captured rows — deterministic, and bit-identical to a feed
+/// that stopped there under bit-exact routing (BASERT_SPEC_BITEXACT=1);
+/// the default speculative routing picks its small-M GEMM kernel by row
+/// count, so the replayed prefix carries the longer feed's last-ulp
+/// rounding instead); `length == current` is a no-op commit on EVERY
+/// lane (it drops a hybrid-GDN lane's capture); any shorter target on a
+/// Mamba-2 lane, or outside the captured feed on a hybrid-GDN lane,
+/// returns BASERT_ERR_UNSUPPORTED — a no-op rollback is not a probe of
+/// rollback support.
 int baseRT_sequence_rollback(baseRT_sequence_t seq, int length);
 
 /// Multi-step autoregressive driver for baseRT_batch_step_fused. Step 0
@@ -619,10 +741,289 @@ int baseRT_batch_step_fused_loop(baseRT_model_t model, baseRT_sequence_t *seqs, 
 int baseRT_batch_step_fused_logits(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs, const uint32_t *in_tokens,
                                    const int *in_token_counts);
 
-/// Read back the [n_seqs, vocab] f16 logits left by the most recent
-/// baseRT_batch_step_fused_logits into `out_logits_f16` (n_seqs * vocab halves,
-/// row-major). Pure UMA copy, no dispatch. Returns vocab_size, or <0 on error.
-/// `n_seqs` must match the batch of the preceding step and be <= max_batch_size.
+/// Per-row sampling spec for baseRT_batch_step_fused_sample. temperature <= 0
+/// samples greedily (argmax) for that row; otherwise Gumbel-max over the
+/// top-k / top-p / min-p survivors with `seed` driving the noise stream
+/// (same seed + same logits = same token).
+///
+/// Penalties ARE applied for a sampled row, over `history` — the caller's
+/// recent-token window for that row — with the model's penalty-exemption mask
+/// honoured, so a sampled row no longer has to leave the fused path to get
+/// one. Logit bias and grammar still take the host logits path.
+typedef struct BaseRTRowSampling {
+    float temperature;
+    float top_p;              ///< 1.0 = disabled
+    float min_p;              ///< 0.0 = disabled
+    int32_t top_k;            ///< <= 0 = disabled
+    uint32_t seed;            ///< Gumbel noise seed for this row
+    float repeat_penalty;     ///< 1.0 (or 0.0) = disabled
+    float presence_penalty;   ///< 0.0 = disabled
+    float frequency_penalty;  ///< 0.0 = disabled
+    /// Recent tokens this row's penalties are computed over, most recent last.
+    /// NULL / 0 disables the penalties for the row regardless of the values
+    /// above: with no history there is nothing to penalize.
+    const uint32_t *history;
+    uint32_t history_count;
+} BaseRTRowSampling;
+
+/// Fused batch step that samples every output row ON THE GPU per `rows[i]`
+/// (greedy rows argmax, sampled rows Gumbel-max) and returns one token per
+/// seq in `out_tokens` — no full-vocab logits readback and no per-row host
+/// sampling. Same forward as baseRT_batch_step_fused_logits (so every
+/// architecture that serves host logits serves this), followed by one
+/// gumbel_topk_f16 dispatch per sampled row and one batched argmax.
+/// Returns BASERT_ERR_UNSUPPORTED when the backend lacks the sampling
+/// kernels (caller falls back to the logits path).
+int baseRT_batch_step_fused_sample(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs, const uint32_t *in_tokens,
+                                   const int *in_token_counts, const BaseRTRowSampling *rows, uint32_t *out_tokens);
+
+/// The sampling pass of baseRT_batch_step_fused_sample on its own: samples
+/// logits rows [first_row, first_row + n_rows) that the last fused forward
+/// left in the host logits buffer (baseRT_batch_step_fused_logits_rows /
+/// _rows_taps — a speculative verify's rows), `rows[i]` driving row
+/// first_row + i, one token per row into `out_tokens`. The pass noises the
+/// rows in place: read them back first (baseRT_read_batch_logits) if the raw
+/// values are still needed. BASERT_ERR_UNSUPPORTED when the backend lacks the
+/// sampling kernels or the penalty windows do not fit — the rows are untouched
+/// then and the caller samples them on the host.
+int baseRT_sample_logits_rows(baseRT_model_t model, int first_row, int n_rows, const BaseRTRowSampling *rows,
+                              uint32_t *out_tokens);
+
+/// Multi-row variant for speculative verification (basertd P2.4): seq i
+/// contributes in_token_counts[i] input rows and leaves its LAST
+/// out_rows[i] rows' logits (1 <= out_rows[i] <= in_token_counts[i]) in the
+/// host logits buffer, ascending, seqs in order — sum(out_rows) rows total,
+/// read back with baseRT_read_batch_logits(sum(out_rows)). The host checks
+/// each drafted position against the target's logits from ONE forward and
+/// rolls the sequence back to the accepted length. Served on the fused
+/// VARLEN path and on the staged decomposition (MoE, hybrid GDN, residency
+/// overcommit) alike; Mamba-2 hybrids return BASERT_ERR_UNSUPPORTED (no
+/// per-lane SSM rollback). On the staged route a lane's rows must fit in
+/// its last prefill chunk; a hybrid-GDN lane's whole feed must be one
+/// chunk of at most 31 tokens, and the lane's next call must be either
+/// baseRT_sequence_rollback (to any length inside the feed) or a plain step
+/// (which commits the feed).
+/// sum(out_rows) is bounded by the logits scratch (max_batch_size × 8).
+int baseRT_batch_step_fused_logits_rows(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs,
+                                        const uint32_t *in_tokens, const int *in_token_counts, const int *out_rows);
+
+/// Hidden-state taps for speculative drafters (MTP heads, EAGLE-3, DFlash
+/// condition on the target's residual stream). Same step as
+/// baseRT_batch_step_fused_logits_rows, plus: for each of the `n_tap_layers`
+/// requested hidden_states indices in `tap_layers` (0 = embedding output,
+/// k = residual stream after decoder layer k-1, n_layers = final pre-norm
+/// hidden), the LAST tap_rows[i] fed rows of lane i are copied into the
+/// engine's tap buffer, rows in lane order, one contiguous [rows, dim] f16
+/// block per tap (read back with baseRT_read_tap_rows, or consumed on the
+/// device by an in-engine drafter). At most 8 distinct tap layers and
+/// baseRT_tap_rows_capacity() tapped rows per call; a lane's tapped rows
+/// must fit in its last prefill chunk. A 1-token lane with tap_rows 1 runs
+/// its step serially (the batched decode tables cannot tap). tap_rows may
+/// name 0 rows for lanes that need no taps. Taps are emitted by the llama
+/// family, Gemma 4, Qwen3.5, gpt-oss and GLM-DSA encoders; a tapped step on any other
+/// architecture returns BASERT_ERR_UNSUPPORTED (BASERT_ERR_OUT_OF_MEMORY
+/// when the tap buffer cannot be allocated).
+/// Greedy speculative verification without a logits readback: the same
+/// multi-row forward as baseRT_batch_step_fused_logits_rows_taps (taps
+/// optional: n_tap_layers = 0), every requested row argmaxed on the GPU;
+/// `out_tokens` receives sum(out_rows) tokens in lane order. Row i of a
+/// lane is the target's greedy choice after the lane's i-th fed token —
+/// accept draft i while it equals row i. BASERT_ERR_UNSUPPORTED on bundles
+/// that verify through host logits (MoE / hybrid / non-llama output
+/// stages): fall back to the logits variant.
+int baseRT_batch_step_fused_rows_argmax(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs,
+                                        const uint32_t *in_tokens, const int *in_token_counts, const int *out_rows,
+                                        const int *tap_layers, int n_tap_layers, const int *tap_rows,
+                                        uint32_t *out_tokens);
+
+int baseRT_batch_step_fused_logits_rows_taps(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs,
+                                             const uint32_t *in_tokens, const int *in_token_counts, const int *out_rows,
+                                             const int *tap_layers, int n_tap_layers, const int *tap_rows);
+
+/// Rows one tapped call may cover (min(max_prefill_chunk, 1024)); <0 on a
+/// null model.
+int baseRT_tap_rows_capacity(baseRT_model_t model);
+
+/// Tapped step with an INPUT OVERRIDE: `input_f16` ([sum(in_token_counts),
+/// dim] f16, rows in feed order) replaces the embedding lookup — the
+/// drafters' input is a projection of the target's hidden state, not a
+/// token. Token ids still drive positions and KV. Rows are bounded by
+/// baseRT_tap_rows_capacity(). Feeding a step's own tap-0 rows back through
+/// this call reproduces its logits bit for bit.
+int baseRT_batch_step_fused_logits_rows_taps_input(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs,
+                                                   const uint32_t *in_tokens, const int *in_token_counts,
+                                                   const int *out_rows, const int *tap_layers, int n_tap_layers,
+                                                   const int *tap_rows, const void *input_f16);
+
+// ── Speculator heads (bundle `header.speculator`) ──────────────────────
+
+/// 1 when the loaded bundle carries a speculator sub-bundle (an MTP head or
+/// a converted drafter), 0 otherwise.
+int baseRT_has_speculator(baseRT_model_t model);
+
+/// The speculator's `kind` ("mtp", ...) into `out`; returns its length, 0
+/// when the bundle has no speculator, <0 on error.
+int baseRT_speculator_kind(baseRT_model_t model, char *out, int cap);
+
+/// Whether a loaded speculator head can actually run the MTP prologue: the
+/// prologue is an encoder's embedding stage — the Qwen3.5 hybrid encoder's
+/// (`qwen35_mtp_prologue`) or GLM-DSA's nextn one (`glm_mtp_prologue`) — so
+/// `baseRT_mtp_chain` and the per-step path both refuse a head on any other
+/// architecture. A scheduler should ask this
+/// before granting an MTP strategy rather than registering one whose every
+/// proposal then falls back. 1 = supported, 0 = not, <0 = not a head.
+int baseRT_speculator_head_supported(baseRT_model_t head);
+
+/// Whether this bundle's encoder can emit hidden-state taps. Every block
+/// drafter and EAGLE-3 sidecar consumes target taps, so a scheduler should
+/// ask before granting one of those strategies: without taps the first
+/// tapped forward fails with BASERT_ERR_UNSUPPORTED, which the tick reports
+/// as a generation failure rather than falling back to plain decoding.
+/// 1 = taps available, 0 = not, <0 = bad argument.
+int baseRT_model_supports_taps(baseRT_model_t model);
+
+/// Load the bundle's speculator head as its own model handle: the head's
+/// decoder layer(s) and norms from the speculator section, the target's
+/// embeddings and lm_head shared. It is a paged model of the target's
+/// context with its own sequences (baseRT_sequence_create), stepped with
+/// the tapped/override steps above; free it with baseRT_free_model before
+/// the target. NULL (with an error) when the bundle has no loadable head.
+baseRT_model_t baseRT_load_speculator_head(baseRT_model_t target);
+
+/// MTP head input rows (host convenience for tests and drivers): out[r] =
+/// fc_embed · rmsnorm(embed(next_tokens[r])) + fc_hidden · rmsnorm(hidden[r])
+/// (GLM-DSA nextn heads: eh_proj · [enorm(embed) | hnorm(output_norm(hidden))])
+/// — `hidden_f16` the target's final pre-norm hidden ([rows, dim], tap
+/// n_layers) at each row's position, `out_f16` [rows, dim] to feed the head
+/// as its input override. The head predicts the token AFTER next_tokens[r].
+int baseRT_mtp_prologue(baseRT_model_t head, const uint32_t *next_tokens, int rows, const void *hidden_f16,
+                        void *out_f16);
+
+/// The whole MTP-head proposal of `n_seqs` head lanes in ONE encoding (a
+/// GLM-DSA head runs it as staged per-step forwards, same contract):
+/// each lane's committed rows (`counts[i]` of them, 1..15; `tokens` the
+/// NEXT token of every row packed lane by lane, `hidden_f16` the target's
+/// final pre-norm hidden of every row, [sum counts][dim] f16) go through
+/// the prologue and one head forward, then `n_draft - 1` chained steps of
+/// one row per lane draft from the head's own output hidden and previous
+/// draft, without a host round trip between steps. `out_drafts` receives
+/// n_seqs * n_draft ids, lane-major (`out_drafts[i * n_draft + s]` = lane
+/// i's draft s; draft 0 is the head's prediction after the last committed
+/// row). Each lane's head sequence ends `counts[i] + n_draft - 1`
+/// positions longer; roll the chained positions back before the next
+/// commit. Requires the head's --paged-kv context; n_draft 1..15.
+int baseRT_mtp_chain(baseRT_model_t head, baseRT_sequence_t *seqs, int n_seqs, const uint32_t *tokens,
+                     const int *counts, const void *hidden_f16, int n_draft, uint32_t *out_drafts);
+
+/// Copy tap `tap_index` (its position in the call's tap_layers) of the most
+/// recent tapped step into `out_f16`: n_rows * dim halves, row-major, rows
+/// in lane order as fed. Bounded by that step: `tap_index` below its tap
+/// count and `n_rows` at most its tapped rows (BASERT_ERR_INVALID_ARGUMENT
+/// otherwise). Returns dim, or <0 on error.
+int baseRT_read_tap_rows(baseRT_model_t model, int tap_index, int n_rows, void *out_f16);
+
+/// Block drafters (DFlash / DSpark): load a drafter SIDECAR bundle (arch
+/// "dflash" / "dspark", converted from the drafter checkpoint) against
+/// `target`. The drafter shares the target's token embedding and lm_head
+/// (resolved from the target's bundle when the sidecar lacks them), runs at
+/// the target's paged/lane shape, and is stepped with baseRT_drafter_step
+/// on its own sequences (baseRT_sequence_create). Free it with
+/// baseRT_free_model before the target. NULL with an error when the sidecar
+/// does not fit the target (dim / vocab / taps).
+baseRT_model_t baseRT_load_drafter(baseRT_model_t target, const char *path);
+
+/// Drafter geometry: `kind` ("dflash" | "dspark"), the block width, the
+/// mask token the block is padded with, the first block row whose logits
+/// are a draft (DFlash 1: row 0 is the anchor; DSpark 0), and the TARGET
+/// hidden_states indices to tap (target_layer_ids + 1) in the order the
+/// drafter's context expects them. Returns the tap count, or <0.
+int baseRT_drafter_info(baseRT_model_t drafter, char *kind, int kind_cap, int *block_size, uint32_t *mask_token_id,
+                        int *logits_start, int *tap_layers, int tap_cap);
+
+/// One drafter step on `seq`: append `n_ctx` context rows — the target's
+/// tapped hidden rows at the next `n_ctx` positions, `ctx_taps_f16` laid
+/// out [n_taps][n_ctx][dim] (tap-major, the baseRT_drafter_info order;
+/// each tap block is exactly what baseRT_read_tap_rows returns) — then,
+/// when `block_len > 0`, run the block `block[0..block_len)` (the last
+/// committed token followed by mask tokens) after the context with
+/// bidirectional block attention and leave its `block_len` logits rows for
+/// baseRT_read_batch_logits (row j = block position j; drafts are rows
+/// logits_start.. — the argmax of row j predicts the token at block
+/// position j for DSpark, or the token replacing mask j for DFlash). The
+/// block's KV is dropped; the sequence ends at its context length. Either
+/// half may be empty (context-only ingestion of a prompt slice, or a block
+/// on an up-to-date context). n_ctx <= baseRT_tap_rows_capacity(drafter);
+/// `block_len` is 0 or exactly the block width (the drafters are trained
+/// on a fixed-width bidirectional block — a narrower block is refused).
+int baseRT_drafter_step(baseRT_model_t drafter, baseRT_sequence_t seq, const void *ctx_taps_f16, int n_ctx,
+                        const uint32_t *block, int block_len);
+
+/// DSpark heads carried by the sidecar: `markov_rank` (0 = no Markov head)
+/// and whether a confidence head is present.
+int baseRT_drafter_heads(baseRT_model_t drafter, int *markov_rank, int *has_confidence);
+
+/// DSpark Markov head, one block row: add `markov.w2 · markov.w1[prev]` to
+/// row `row` of the last block step's logits (in place) and return its
+/// argmax in `out_token` — the draft for that row given the token before
+/// it (`prev` = the pending token for the first drafted row, then the
+/// previous draft). Sequential: call per row in order after
+/// baseRT_drafter_step.
+int baseRT_drafter_markov_argmax(baseRT_model_t drafter, int row, uint32_t prev, uint32_t *out_token);
+
+/// DSpark confidence head over the last block step's rows 0..rows: the
+/// probability that block row r's draft survives verification, given the
+/// token before it (`prev_tokens[r]`). Adaptive block length keeps drafts
+/// while the running product stays above a threshold. Returns `rows`, or
+/// <0 (BASERT_ERR_UNSUPPORTED without a confidence head).
+int baseRT_drafter_confidence(baseRT_model_t drafter, const uint32_t *prev_tokens, int rows, float *out_conf);
+
+/// EAGLE-3 heads (a sidecar of arch "eagle3", loaded with baseRT_load_drafter):
+/// one llama layer drafting the next token from (the current token, a
+/// feature of the target's hidden states at three layers). `tap_layers`
+/// are the TARGET hidden_states indices to tap (3), `draft_vocab` the
+/// reduced vocabulary the head predicts over. Returns the tap count.
+int baseRT_eagle3_info(baseRT_model_t head, int *draft_vocab, int *tap_layers, int tap_cap);
+
+/// One head step over `rows` positions from the sequence's length:
+/// `tokens[r]` is the token that FOLLOWED position r (the token the row
+/// conditions on), and exactly one of `taps_f16` ([3][rows][dim], the
+/// target's tapped rows at those positions, baseRT_read_tap_rows layout) or
+/// `hidden_f16` ([rows][dim], the head's own output hidden — chaining) is
+/// the feature. Afterwards baseRT_eagle3_draft gives row r's draft (the
+/// argmax over the draft vocabulary mapped to a target id) and
+/// baseRT_eagle3_read the raw rows.
+int baseRT_eagle3_step(baseRT_model_t head, baseRT_sequence_t seq, const uint32_t *tokens, int rows,
+                       const void *taps_f16, const void *hidden_f16);
+int baseRT_eagle3_read(baseRT_model_t head, int rows, void *logits_f16, void *hidden_f16);
+int baseRT_eagle3_draft(baseRT_model_t head, int row, uint32_t *out_target_token);
+
+/// The whole proposal of `n_seqs` head sequences in one call: each lane's
+/// `counts[i]` committed rows (tokens packed lane by lane; `taps_f16` the
+/// target's tapped rows for ALL packed rows, [3][sum rows][dim]) as one
+/// forward, then `n_draft - 1` chained one-row steps per lane on the
+/// device (the previous draft is the token, the head's own output hidden
+/// the feature) with no host round trip between them. `out_drafts[i *
+/// n_draft + s]` is lane i's draft s (target ids). The head sequences end
+/// `counts[i] + n_draft - 1` positions longer; roll back to drop the
+/// chained positions. n_draft in 1..15.
+int baseRT_eagle3_chain(baseRT_model_t head, baseRT_sequence_t *seqs, int n_seqs, const uint32_t *tokens,
+                        const int *counts, const void *taps_f16, int n_draft, uint32_t *out_drafts);
+
+/// Media variant (basertd P2.7): the packed prompt's `image_token_id`
+/// placeholders (exactly `n_rows` of them, in order) take rows from the
+/// engine-owned features buffer produced by the media tower (`feats_buffer`
+/// is a `baseRT::Buffer*` obtained through the tick media surface). Fused
+/// VARLEN live path only (hybrid/MoE/overcommit return UNSUPPORTED). Host
+/// sampled: read the logits back with baseRT_read_batch_logits.
+int baseRT_batch_step_fused_logits_media(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs,
+                                         const uint32_t *in_tokens, const int *in_token_counts, void *feats_buffer,
+                                         int n_rows, uint32_t image_token_id, int grid_h, int grid_w);
+
+/// Read back the [n_rows, vocab] f16 logits left by the most recent
+/// baseRT_batch_step_fused_logits(_rows) into `out_logits_f16` (n_rows * vocab
+/// halves, row-major). Pure UMA copy, no dispatch. Returns vocab_size, or <0
+/// on error. `n_rows` is the preceding step's batch (one row per seq) or its
+/// sum(out_rows), bounded by the logits scratch (max_batch_size × 8 rows).
 int baseRT_read_batch_logits(baseRT_model_t model, int n_seqs, void *out_logits_f16);
 
 // === Host-side logits-row operations ===
@@ -749,6 +1150,14 @@ void baseRT_prefix_unlock(baseRT_model_t model, uint64_t handle);
 /// to seed it (e.g. a boundary mismatch). No-op for handle==0.
 void baseRT_prefix_release(baseRT_model_t model, uint64_t handle);
 
+/// Drop a baseRT_prefix_match taken only to LOOK at what the cache holds (a
+/// metadata probe, e.g. basertd's space_match): releases the pin like
+/// baseRT_prefix_release but settles nothing, so the probe counts as neither
+/// a hit nor a miss in baseRT_prefix_cache_stats. A match that was a reuse
+/// decision and was declined belongs in baseRT_prefix_release. No-op for
+/// handle==0.
+void baseRT_prefix_discard(baseRT_model_t model, uint64_t handle);
+
 /// Evict least-recently-used UNLOCKED cached prefixes until at least `n_blocks`
 /// block-frees have been performed back to the pool. Returns the number freed
 /// (may be < n_blocks if the remaining prefixes are all locked by live
@@ -772,12 +1181,49 @@ int baseRT_prefix_cache_save(baseRT_model_t model, const char *path);
 /// (no outstanding matches). Returns BASERT_OK or an error code.
 int baseRT_prefix_cache_load(baseRT_model_t model, const char *path);
 
-/// Lifetime prefix-cache stats (any out-pointer may be NULL). `hits`/`misses`
-/// count baseRT_prefix_match calls that did / didn't reuse >=1 block;
-/// `reused_tokens` is the running total of prompt tokens served from cache;
+/// Lifetime prefix-cache stats (any out-pointer may be NULL), all monotonic.
+/// A baseRT_prefix_match that found nothing counts as a miss at once; one that
+/// found blocks settles later, as a hit at baseRT_prefix_unlock (its blocks
+/// were seeded) or as a miss at baseRT_prefix_release (abandoned); one
+/// dropped by baseRT_prefix_discard (a probe) is in neither, as is an
+/// outstanding match. `reused_tokens` is the running total of
+/// prompt tokens served from cache by settled hits;
 /// `blocks_cached` is the current number of blocks held by the trie.
 void baseRT_prefix_cache_stats(baseRT_model_t model, uint64_t *out_hits, uint64_t *out_misses,
                                uint64_t *out_reused_tokens, int *out_blocks_cached);
+
+// === Boundary-snapshot blobs (hybrid GDN prefix reuse) ===
+//
+// A hybrid (Gated-DeltaNet) model's cached KV blocks are only half of the
+// state a warm seed needs: the recurrence at the SAME position is the other
+// half. These calls attach an opaque per-boundary blob (a
+// baseRT_sequence_gdn_capture snapshot) to a cached prefix at an exact
+// block-aligned depth, discover the deepest attached boundary along a
+// prompt's match path, and fetch the blob back for a
+// baseRT_sequence_gdn_restore after seeding the KV. The cache stores bytes;
+// validity-at-position is the caller's contract. Attachments ride node
+// eviction (a dropped prefix drops its blobs), live under their own byte
+// budget (BASERT_PREFIX_BLOB_BUDGET_MB, default 512, oldest evicted first),
+// and are NOT persisted by baseRT_prefix_cache_save.
+
+/// Attach `blob` at exactly the block-aligned depth `n_tokens` of a prefix
+/// already published with baseRT_prefix_insert (insert first, then attach).
+/// Replaces an existing attachment at that depth. Best-effort: a disabled
+/// cache, an uncovered/misaligned path, or a blob over budget is a no-op.
+/// Returns BASERT_OK (attached or clean no-op) or an argument error.
+int baseRT_prefix_attach_blob(baseRT_model_t model, const uint32_t *tokens, int n_tokens, const void *blob,
+                              int blob_len);
+
+/// The deepest attached-blob depth (in tokens) along the exact-match path of
+/// `tokens`, capped at `n_tokens`. 0 = none / cache disabled. Read-only (no
+/// lock, no LRU update): use it to cap a hybrid match at a boundary a seed
+/// can actually restore.
+int baseRT_prefix_blob_match(baseRT_model_t model, const uint32_t *tokens, int n_tokens);
+
+/// Copy the blob attached at exactly depth `n_tokens` into `out` (capacity
+/// `cap`). Returns the blob's byte length, or -1 when no blob is attached at
+/// that exact depth / the buffer is too small / the cache is disabled.
+int baseRT_prefix_blob_fetch(baseRT_model_t model, const uint32_t *tokens, int n_tokens, void *out, int cap);
 
 // === Grammar-constrained decoding ===
 
@@ -792,6 +1238,19 @@ baseRT_grammar_t baseRT_grammar_create(baseRT_model_t model, const char *gbnf);
 /// Converts the schema to GBNF internally.
 /// Returns NULL on error.
 baseRT_grammar_t baseRT_grammar_create_from_schema(baseRT_model_t model, const char *json_schema);
+
+/// Create a grammar from an xgrammar STRUCTURAL TAG (a JSON document, not a
+/// grammar string).
+///
+/// A structural tag constrains only the parts of the output that matter: free
+/// text until a trigger appears, then the matching tag's schema until its end
+/// tag, then free text again. This is what lets a model choose whether to call
+/// a tool while guaranteeing any call it makes is well-formed and delimited —
+/// which a whole-output schema grammar cannot express.
+///
+/// Returns NULL on error (malformed tag, or a schema inside it that cannot be
+/// compiled); the caller should decode unconstrained rather than fail.
+baseRT_grammar_t baseRT_grammar_create_from_structural_tag(baseRT_model_t model, const char *tag_json);
 
 /// Create a grammar for generic JSON output (any valid JSON object/array).
 baseRT_grammar_t baseRT_grammar_create_json(baseRT_model_t model);
@@ -812,12 +1271,20 @@ void baseRT_grammar_reset(baseRT_grammar_t grammar);
 ///   baseRT_grammar_bitmask_size : packed int32 words in the token bitmask
 ///     (0 = not an xgrammar grammar; use the serial decode path instead).
 ///   baseRT_grammar_fill_bitmask : fill `out_bitmask` (bitmask_size words) for
-///     the CURRENT grammar state; a set bit = allowed token. 1 on success.
+///     the CURRENT grammar state; a set bit = allowed token. Returns 1 when
+///     the mask excludes some token and is to be applied, 0 when there is
+///     nothing to apply: every token may follow (free text in a structural
+///     tag, where the model's markers are text as they are unconstrained),
+///     or the grammar has no matcher. Not an error indicator.
 ///   baseRT_grammar_accept_token : advance the grammar by one token. 1 on ok.
 ///   baseRT_grammar_is_terminated: 1 once the grammar reaches an end state.
 ///   baseRT_grammar_is_completed : 1 once a full match is accepted (a
 ///     structured value is complete). Decoding should stop on terminated OR
-///     completed — matching the serial grammar loop.
+///     completed — matching the serial grammar loop. A STRUCTURAL-TAG
+///     grammar never reports completed: free text is admitted around (and,
+///     unless at_least_one, instead of) its tagged regions, so "could end
+///     here" holds at every free-text step and is no reason to stop — those
+///     lanes end on EOS (or terminated).
 int baseRT_grammar_bitmask_size(baseRT_grammar_t grammar);
 int baseRT_grammar_fill_bitmask(baseRT_grammar_t grammar, int32_t *out_bitmask);
 int baseRT_grammar_accept_token(baseRT_grammar_t grammar, uint32_t token_id);
@@ -836,6 +1303,13 @@ BaseRTGenerationStats baseRT_generate_grammar_continue(baseRT_model_t model, con
                                                        baseRT_grammar_t grammar, baseRT_token_callback callback,
                                                        void *user_data);
 
+/// `baseRT_generate_resume` with a grammar constraint (see there): prefill
+/// `[n_cached, n_prompt)` over the kept KV, seed history from the whole prompt.
+BaseRTGenerationStats baseRT_generate_grammar_resume(baseRT_model_t model, const uint32_t *prompt_tokens, int n_prompt,
+                                                     int n_cached, int max_tokens, BaseRTSamplingConfig sampling,
+                                                     baseRT_grammar_t grammar, baseRT_token_callback callback,
+                                                     void *user_data);
+
 // === GPU sampling ===
 
 /// Run a profiled decode step — returns per-layer GPU timing.
@@ -844,6 +1318,13 @@ BaseRTGenerationStats baseRT_generate_grammar_continue(baseRT_model_t model, con
 /// timing_out: array of (n_layers + 3) floats [embedding, norm, layer0..N-1, logit, argmax]
 /// Returns number of timing entries written, or -1 on a failed step
 /// (details via baseRT_get_error).
+/// Per-kernel profile of one baked BATCHED decode round (see the .cpp
+/// comment). Requires a prior baked batched round at this B. Labels via
+/// baseRT_profile_batched_label(model, n_seqs, index).
+int baseRT_profile_batched_decode(baseRT_model_t model, baseRT_sequence_t *seqs, int n_seqs, const uint32_t *in_tokens,
+                                  float *timing_out, int max_entries);
+const char *baseRT_profile_batched_label(baseRT_model_t model, int n_seqs, int index);
+
 int baseRT_profile_decode_step(baseRT_model_t model, uint32_t token_id, int position, float *timing_out,
                                int max_entries);
 
@@ -871,6 +1352,11 @@ uint32_t baseRT_tensor_dtype(baseRT_model_t model, int index);
 /// (e.g. "f16", "bf16", "f32", "base4", "base8", "base_q2"…"base_q8").
 /// Returns empty string out of range.
 const char *baseRT_tensor_raw_dtype(baseRT_model_t model, int index);
+
+/// Byte size of the tensor's storage blob at index (weights only — MLX
+/// companion `.scales`/`.biases` tensors are separate entries with their
+/// own sizes). Returns 0 out of range.
+size_t baseRT_tensor_nbytes(baseRT_model_t model, int index);
 
 /// Whether the loaded model carries an mmproj sub-bundle (vision/audio
 /// tower weights). Returns 0/1.
@@ -1014,12 +1500,18 @@ int baseRT_load_state(baseRT_model_t model, const char *path);
 /// every forward pass that runs a GEMM with a tensor_name registered in
 /// the adapter has a post-GEMM low-rank delta applied (`y += B @ A @ x`).
 ///
-/// While an adapter is active, single-sequence decode skips the baked
-/// dispatch-table replay (the table carries no delta dispatches) and takes
-/// the per-token immediate encode instead — correct output at reduced
-/// decode throughput. Speculative decode is likewise disabled for the
-/// duration. The batched multi-sequence API (`baseRT_batch_step*`) does
-/// NOT apply adapters.
+/// While an adapter is active, decode skips the baked dispatch-table replay
+/// (the table carries no delta dispatches, and one recorded WITH them would go
+/// stale on unload) and takes the immediate encode instead — correct output at
+/// reduced throughput. Speculative decode is likewise disabled for the
+/// duration.
+///
+/// The batched multi-sequence entry points DO apply the adapter:
+/// `baseRT_batch_decode_step`, `baseRT_batch_step` and the fused/logits
+/// variants each install it for the pass, bypass baked replay and command
+/// bucketing while it is active, and emit the delta GEMMs per layer. (This
+/// paragraph previously said the opposite, which would lead a caller to
+/// disable batching or write a serial fallback it does not need.)
 ///
 /// Calling `baseRT_lora_load` again replaces the active adapter (no
 /// stacking). Returns 0 on success, negative on failure (see
@@ -1120,6 +1612,20 @@ BaseRTGenerationStats baseRT_generate_continue(baseRT_model_t model, const uint3
                                                int max_tokens, BaseRTSamplingConfig sampling,
                                                baseRT_token_callback callback, void *user_data);
 
+/// Resume generation over a KV the caller kept: the KV holds exactly the first
+/// `n_cached` tokens of `prompt_tokens` (e.g. after baseRT_try_rollback to a
+/// shared prefix), and only `[n_cached, n_prompt)` is prefilled. Unlike
+/// `baseRT_generate_continue`, which sees only the tokens it is given, the
+/// channel decoder and the sampling history (repetition / presence /
+/// frequency penalties) are seeded from the WHOLE prompt, so the run samples
+/// as a cold `baseRT_generate(prompt_tokens, n_prompt)` would. When the KV
+/// length is not `n_cached`, or `n_cached` leaves no token to prefill, it runs
+/// the prompt cold instead. `prompt_tokens` in the returned stats counts the
+/// whole prompt.
+BaseRTGenerationStats baseRT_generate_resume(baseRT_model_t model, const uint32_t *prompt_tokens, int n_prompt,
+                                             int n_cached, int max_tokens, BaseRTSamplingConfig sampling,
+                                             baseRT_token_callback callback, void *user_data);
+
 // === Embeddings ===
 
 /// Compute text embeddings from token IDs using the model's hidden states.
@@ -1133,6 +1639,11 @@ int baseRT_embed_text(baseRT_model_t model, const char *text, float *out_embeddi
 
 /// Get the embedding dimension for a model.
 int baseRT_embedding_dim(baseRT_model_t model);
+
+/// True for a BERT-style encoder-only embedding model (no autoregressive
+/// decode, no paged KV) — the serving worker uses this to allow loading such a
+/// model despite it having no paged decode KV.
+bool baseRT_is_embedding_model(baseRT_model_t model);
 
 // === Chat templates ===
 
@@ -1150,6 +1661,18 @@ const char *baseRT_chat_template(baseRT_model_t model);
 /// Returned pointer valid until the next call on the same thread, or until
 /// the model is freed.
 const char *baseRT_chat_template_jinja(baseRT_model_t model);
+
+/// Number of added/special tokens the model declares (chat scaffold,
+/// reasoning/tool channel markers, etc.). Pairs with
+/// `baseRT_special_token` so a codec can learn a model's markers from the
+/// model itself rather than assuming a hardcoded dialect.
+int baseRT_special_token_count(baseRT_model_t model);
+
+/// The `index`-th special token's string; writes its token id (or
+/// UINT32_MAX if the string is not a single vocab entry) to `id_out`.
+/// Returns "" for an out-of-range index. Returned pointer valid until the
+/// next call on the same thread.
+const char *baseRT_special_token(baseRT_model_t model, int index, uint32_t *id_out);
 
 /// BOS / EOS token strings (what minja substitutes for `{{ bos_token }}`
 /// and `{{ eos_token }}` in HF chat templates).
@@ -1170,6 +1693,21 @@ const char *baseRT_eos_token(baseRT_model_t model);
 /// Primary end-of-sequence token id (the one the continuous-batching engine and
 /// other token-id consumers stop on). Returns 0 on a null handle.
 uint32_t baseRT_eos_token_id(baseRT_model_t model);
+
+/// Content-derived weights/bundle identity: FNV-1a-64 over the model
+/// file's first MiB, stamped at load (basertd §4 materialization
+/// identity input — two fine-tunes of one architecture never share a
+/// version_tag). 0 on a null handle or unidentified weights.
+uint64_t baseRT_weights_identity(baseRT_model_t model);
+
+/// Whether `token` is ANY of the model's stop tokens — the primary
+/// `eos_token_id` plus the extra ids the loader registers (`<|eot|>`,
+/// `<|eot_id|>`, `<end_of_turn>`, gpt-oss's `<|call|>` and `<|endoftext|>`,
+/// …). Multi-EOS models (Muse Glimmer:
+/// `<|eot|>` ends the turn while `eos_token_id` only ends the document)
+/// need this; comparing against `baseRT_eos_token_id` alone never
+/// terminates their chat turns. Returns 0 on a null handle.
+int32_t baseRT_is_eos_token(baseRT_model_t model, uint32_t token);
 
 // (baseRT_max_prefill_chunk is declared once, with the batched-decode API.)
 

@@ -41,9 +41,11 @@ impl crate::HfMapper for Gemma3HfMapper {
 
     fn config_from_hf(&self, c: &serde_json::Value) -> Result<crate::ArchConfig> {
         // Gemma HF often nests the text config under "text_config". Prefer
-        // that sub-object when present.
+        // that sub-object when present — but token ids stay at the wrapper
+        // level, so backfill them from the full config.
         let source = c.get("text_config").unwrap_or(c);
         let mut config = crate::llama::hf_generic_config(source)?;
+        crate::backfill_wrapper_token_ids(&mut config, c);
         config.tie_word_embeddings = source
             .get("tie_word_embeddings")
             .and_then(|v| v.as_bool())
@@ -92,9 +94,11 @@ impl crate::HfMapper for Gemma4HfMapper {
     fn config_from_hf(&self, c: &serde_json::Value) -> Result<crate::ArchConfig> {
         // Gemma-4 multimodal configs nest text under "text_config". For
         // the primary model weights we use that sub-config; audio/vision
-        // tower configs are siblings handled by the mmproj path.
+        // tower configs are siblings handled by the mmproj path. Token ids
+        // stay at the wrapper level — backfill from the full config.
         let source = c.get("text_config").unwrap_or(c);
         let mut config = crate::llama::hf_generic_config(source)?;
+        crate::backfill_wrapper_token_ids(&mut config, c);
         config.tie_word_embeddings = source
             .get("tie_word_embeddings")
             .and_then(|v| v.as_bool())

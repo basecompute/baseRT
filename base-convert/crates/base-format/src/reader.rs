@@ -116,15 +116,31 @@ impl BaseReader {
     }
 
     /// Get a zero-copy slice of a tensor's raw bytes.
-    pub fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
-        let entry = self
-            .header
-            .tensors
-            .iter()
+    /// Resolve a tensor entry by name across the main list AND the
+    /// sub-bundles (`header.mmproj.tensors`, `header.speculator.tensors`):
+    /// they share the weights blob, so every byte-level accessor and the
+    /// checksum verifier must see them too — scanning only `header.tensors`
+    /// leaves a corrupted MTP payload reporting "all checksums OK".
+    pub fn find_entry(&self, name: &str) -> Result<&crate::header::TensorEntry> {
+        self.all_entries()
             .find(|t| t.name == name)
             .ok_or_else(|| Error::TensorNotFound {
                 name: name.to_string(),
-            })?;
+            })
+    }
+
+    /// Every tensor entry of the bundle: main list first, then the mmproj
+    /// tower(s), then the speculator head.
+    pub fn all_entries(&self) -> impl Iterator<Item = &crate::header::TensorEntry> {
+        self.header
+            .tensors
+            .iter()
+            .chain(self.header.mmproj.iter().flat_map(|m| m.tensors.iter()))
+            .chain(self.header.speculator.iter().flat_map(|m| m.tensors.iter()))
+    }
+
+    pub fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
+        let entry = self.find_entry(name)?;
 
         let abs_start = self.blob_offset + entry.offset;
         let abs_end = abs_start + entry.length;
@@ -145,14 +161,7 @@ impl BaseReader {
     /// constructing zero-copy buffers (MTLBuffer.makeBufferWithBytesNoCopy,
     /// cudaHostRegister, etc.) without holding a slice.
     pub fn tensor_file_offset(&self, name: &str) -> Result<u64> {
-        let entry = self
-            .header
-            .tensors
-            .iter()
-            .find(|t| t.name == name)
-            .ok_or_else(|| Error::TensorNotFound {
-                name: name.to_string(),
-            })?;
+        let entry = self.find_entry(name)?;
         Ok(self.blob_offset + entry.offset)
     }
 
@@ -162,14 +171,7 @@ impl BaseReader {
     /// invariant was violated and `makeBufferWithBytesNoCopy` would
     /// silently fall back to a copy.
     pub fn tensor_is_zero_copy_eligible(&self, name: &str) -> Result<bool> {
-        let entry = self
-            .header
-            .tensors
-            .iter()
-            .find(|t| t.name == name)
-            .ok_or_else(|| Error::TensorNotFound {
-                name: name.to_string(),
-            })?;
+        let entry = self.find_entry(name)?;
         let align = self.header.alignment.align_for(entry.compute_region);
         let abs = self.blob_offset + entry.offset;
         Ok(abs % align == 0)
@@ -217,7 +219,17 @@ impl BaseReader {
             .iter()
             .flat_map(|m| m.tensors.iter())
             .map(|t| self.blob_offset + t.offset + t.length);
-        let blob_end = main_end.chain(mmproj_end).max().unwrap_or(self.blob_offset);
+        let spec_end = self
+            .header
+            .speculator
+            .iter()
+            .flat_map(|m| m.tensors.iter())
+            .map(|t| self.blob_offset + t.offset + t.length);
+        let blob_end = main_end
+            .chain(mmproj_end)
+            .chain(spec_end)
+            .max()
+            .unwrap_or(self.blob_offset);
         (blob_end + 7) & !7u64
     }
 
@@ -227,14 +239,7 @@ impl BaseReader {
     /// Err(ChecksumMismatch) when the recorded checksum disagrees with
     /// the current bytes.
     pub fn verify_tensor(&self, name: &str) -> Result<()> {
-        let entry = self
-            .header
-            .tensors
-            .iter()
-            .find(|t| t.name == name)
-            .ok_or_else(|| Error::TensorNotFound {
-                name: name.to_string(),
-            })?;
+        let entry = self.find_entry(name)?;
         let Some(expected) = entry.checksum_xxh64 else {
             return Ok(());
         };

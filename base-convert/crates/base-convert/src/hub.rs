@@ -386,11 +386,31 @@ fn resolve_model_args(rest: &[String], default_variant: Option<&str>) -> Result<
                 Ok(resolve_hub_model(arg, default_variant)?
                     .to_string_lossy()
                     .into_owned())
+            } else if let Some((kind, id)) = speculate_drafter_id(arg) {
+                // `--speculate dflash:<id>` takes the SAME road as the model
+                // it drafts for: catalogue lookup, pull, convert-on-pull,
+                // variant selection, hub cache. A drafter was the one model a
+                // user had to fetch and convert by hand and then name by path.
+                let path = resolve_hub_model(id, default_variant)?;
+                Ok(format!("{kind}:{}", path.to_string_lossy()))
             } else {
                 Ok(arg.clone())
             }
         })
         .collect()
+}
+
+/// `<strategy>:<hub id>` for the strategies that take a drafter artifact —
+/// `dflash:basecompute/Qwen3-4B-DFlash`, `eagle3:org/head:default-q4`. Returns
+/// None for a path (`dflash:./x.base`, which keeps working unchanged), for a
+/// strategy that takes no artifact (`prompt-lookup`, `mtp-head`), and for
+/// anything that is not id-shaped.
+fn speculate_drafter_id(token: &str) -> Option<(&str, &str)> {
+    let (kind, rest) = token.split_once(':')?;
+    if !matches!(kind, "dflash" | "dspark" | "eagle3" | "draft-model") {
+        return None;
+    }
+    looks_like_hub_id(rest).then_some((kind, rest))
 }
 
 /// Pull a `--variant <v>` / `--variant=<v>` selector out of the forwarded args,
@@ -469,7 +489,8 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
     let is_computearena = cmd == "computearena";
     let (candidates, rest) = if is_computearena {
         // ComputeArena is independently distributed and owns runtime
-        // selection. Preserve its arguments and select the BaseRT adapter.
+        // selection. Preserve its arguments and select the BaseRT adapter —
+        // no variant resolution.
         let mut forwarded = Vec::with_capacity(rest.len() + 1);
         forwarded.push("basert".to_string());
         forwarded.extend_from_slice(rest);
@@ -826,9 +847,17 @@ fn pull_and_convert(
         awq_profile: None,
         allow_quant_from_quant: false,
         no_mlx_passthrough: false,
+        quantize_drafter: false,
+        speculator_lm_head: false,
+        mtp_draft_ranking: None,
+        mtp_draft_vocab: None,
         // Convert-on-pull always produces a canonical-quant bundle;
         // k-quant passthrough stays an explicit `convert` opt-in.
         kquant_passthrough: false,
+        // Convert-on-pull follows the converter default: a tied model gets
+        // its head materialized so the profile head rule sets logit
+        // precision (`plan_tied_lm_head`); the opt-out is a `convert` flag.
+        no_synth_tied_head: false,
         // Convert-on-pull sources HF checkpoints, where the perception
         // tower already lives in the same snapshot — the mmproj flags only
         // apply to GGUF sources, which ship the tower separately.
@@ -1834,6 +1863,27 @@ mod tests {
         assert!(!looks_like_hub_id("model.base"));
         assert!(!looks_like_hub_id("qwen"));
         assert!(!looks_like_hub_id(""));
+    }
+
+    #[test]
+    fn speculate_drafter_id_splits_ids_but_not_paths() {
+        assert_eq!(
+            speculate_drafter_id("dflash:basecompute/Qwen3-4B-DFlash"),
+            Some(("dflash", "basecompute/Qwen3-4B-DFlash"))
+        );
+        // An inline variant rides along: resolve_hub_model parses it.
+        assert_eq!(
+            speculate_drafter_id("eagle3:org/head:default-q4"),
+            Some(("eagle3", "org/head:default-q4"))
+        );
+        // Paths keep working: the artifact may be a local build.
+        assert_eq!(speculate_drafter_id("dflash:./drafters/x.base"), None);
+        assert_eq!(speculate_drafter_id("dspark:/abs/x.base"), None);
+        assert_eq!(speculate_drafter_id("dflash:x.base"), None);
+        // Strategies without an artifact, and unknown prefixes.
+        assert_eq!(speculate_drafter_id("prompt-lookup"), None);
+        assert_eq!(speculate_drafter_id("mtp-head"), None);
+        assert_eq!(speculate_drafter_id("nope:org/model"), None);
     }
 
     #[test]

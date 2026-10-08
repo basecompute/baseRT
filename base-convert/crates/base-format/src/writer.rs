@@ -1,4 +1,6 @@
-use crate::header::{Header, MmprojBundle, TensorDtype, TensorEntry};
+use crate::header::{
+    Header, HeaderFlags, MmprojBundle, SpeculatorBundle, TensorDtype, TensorEntry,
+};
 use crate::slots::{write_slots, Slot};
 use crate::{Error, Result, BLOB_ALIGNMENT, FORMAT_VERSION, MAGIC, PREFIX_LEN};
 use std::fs::File;
@@ -21,15 +23,52 @@ pub struct TensorPayload {
 /// serialized (all offsets/lengths/checksums are already known) and the
 /// temp blob is streamed into the final file after it. The on-disk format
 /// is byte-identical to the buffered path.
+/// Owns removal of the streamed-blob temp file. Held BY `BlobStream`, so the
+/// temp is removed on every exit path from the moment it is created: an
+/// `add_tensor` I/O error that makes `finish` return before it reaches
+/// `finish_streaming`, a `BaseWriter` dropped without `finish` at all, a panic,
+/// as well as the happy path. Previously the guard was constructed inside
+/// `finish_streaming`, so those earlier exits stranded a model-sized
+/// `.blobtmp` beside the failed output — worst of all for the expected
+/// disk-full failure, where the orphan eats the space the retry needs.
+struct TmpBlob(PathBuf);
+
+impl Drop for TmpBlob {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Which header tensor list a streamed payload belongs to.
+#[derive(Clone, Copy)]
+enum Section {
+    Lm,
+    Mmproj,
+    Speculator,
+}
+
 struct BlobStream {
     file: BufWriter<File>,
-    path: PathBuf,
+    /// The temp path, and the guard that removes it — `Some` ONLY on the
+    /// `create` path, which streams into a `.blobtmp` sibling. `create_direct`
+    /// streams into the FINAL file behind a reserved header region and has no
+    /// temp at all, so it leaves this `None`: arming the guard there would
+    /// delete the bundle the caller just wrote.
+    ///
+    /// `BlobStream` itself has no `Drop`, so `finish_streaming` can still move
+    /// `file` out of it by value; this field drops with whatever remains.
+    ///
+    /// Never read: it exists for its `Drop`. `expect` rather than `allow` so
+    /// the attribute itself warns if a later change does start reading it.
+    #[expect(dead_code)]
+    tmp: Option<TmpBlob>,
     /// Bytes written to the blob so far (blob-relative cursor). Tensor
     /// `entry.offset` values are relative to the blob start, matching the
     /// reader's `blob_offset + entry.offset` addressing.
     cursor: u64,
     lm_entries: Vec<TensorEntry>,
     mmproj_entries: Vec<TensorEntry>,
+    speculator_entries: Vec<TensorEntry>,
 }
 
 /// Writer for the `.base` single-file format.
@@ -64,6 +103,12 @@ pub struct BaseWriter<W: Write + Seek> {
     /// so the runtime can populate vision/audio fields without a
     /// separate config file.
     mmproj_config: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Speculator sub-bundle payloads / arch / config — same convention as
+    /// mmproj: the same blob, listed under `header.speculator`. Streamed
+    /// after every LM and mmproj tensor.
+    speculator_payloads: Vec<TensorPayload>,
+    speculator_arch: Option<String>,
+    speculator_config: std::collections::BTreeMap<String, serde_json::Value>,
     slots: Vec<Slot>,
     /// First error encountered while streaming a payload to the temp blob
     /// (add_tensor is infallible for API compatibility); reported at finish.
@@ -101,15 +146,19 @@ impl BaseWriter<BufWriter<File>> {
             header,
             stream: Some(BlobStream {
                 file: BufWriter::new(tmp),
-                path: tmp_path,
+                tmp: Some(TmpBlob(tmp_path)),
                 cursor: 0,
                 lm_entries: Vec::new(),
                 mmproj_entries: Vec::new(),
+                speculator_entries: Vec::new(),
             }),
             payloads: Vec::new(),
             mmproj_payloads: Vec::new(),
             mmproj_arch: None,
             mmproj_config: std::collections::BTreeMap::new(),
+            speculator_payloads: Vec::new(),
+            speculator_arch: None,
+            speculator_config: std::collections::BTreeMap::new(),
             slots: Vec::new(),
             stream_error: None,
             direct_reserve: None,
@@ -147,15 +196,19 @@ impl BaseWriter<BufWriter<File>> {
             header,
             stream: Some(BlobStream {
                 file: BufWriter::new(blob),
-                path: path.to_path_buf(),
+                tmp: None, // direct-write: the "stream" IS the final file
                 cursor: 0,
                 lm_entries: Vec::new(),
                 mmproj_entries: Vec::new(),
+                speculator_entries: Vec::new(),
             }),
             payloads: Vec::new(),
             mmproj_payloads: Vec::new(),
             mmproj_arch: None,
             mmproj_config: std::collections::BTreeMap::new(),
+            speculator_payloads: Vec::new(),
+            speculator_arch: None,
+            speculator_config: std::collections::BTreeMap::new(),
             slots: Vec::new(),
             stream_error: None,
             direct_reserve: Some(header_reserve),
@@ -173,6 +226,9 @@ impl<W: Write + Seek> BaseWriter<W> {
             mmproj_payloads: Vec::new(),
             mmproj_arch: None,
             mmproj_config: std::collections::BTreeMap::new(),
+            speculator_payloads: Vec::new(),
+            speculator_arch: None,
+            speculator_config: std::collections::BTreeMap::new(),
             slots: Vec::new(),
             stream_error: None,
             direct_reserve: None,
@@ -186,7 +242,7 @@ impl<W: Write + Seek> BaseWriter<W> {
         alignment: crate::header::AlignmentConfig,
         s: &mut BlobStream,
         payload: TensorPayload,
-        is_mmproj: bool,
+        section: Section,
     ) -> Result<()> {
         let align = alignment.align_for(payload.entry.compute_region);
         let aligned = align_up(s.cursor, align);
@@ -201,10 +257,10 @@ impl<W: Write + Seek> BaseWriter<W> {
         }
         s.file.write_all(&payload.data)?;
         s.cursor = aligned + payload.data.len() as u64;
-        if is_mmproj {
-            s.mmproj_entries.push(entry);
-        } else {
-            s.lm_entries.push(entry);
+        match section {
+            Section::Lm => s.lm_entries.push(entry),
+            Section::Mmproj => s.mmproj_entries.push(entry),
+            Section::Speculator => s.speculator_entries.push(entry),
         }
         Ok(())
     }
@@ -216,7 +272,7 @@ impl<W: Write + Seek> BaseWriter<W> {
             // a write error here is surfaced by re-checking at finish via
             // the BufWriter's retained error state on flush.)
             let alignment = self.header.alignment;
-            if let Err(e) = Self::stream_payload(alignment, s, payload, false) {
+            if let Err(e) = Self::stream_payload(alignment, s, payload, Section::Lm) {
                 // Stash the error to report at finish; keep the API simple.
                 self.stream_error.get_or_insert(e);
             }
@@ -235,12 +291,43 @@ impl<W: Write + Seek> BaseWriter<W> {
             // add every LM tensor before the first mmproj tensor, so the
             // streamed order matches the buffered path.
             let alignment = self.header.alignment;
-            if let Err(e) = Self::stream_payload(alignment, s, payload, true) {
+            if let Err(e) = Self::stream_payload(alignment, s, payload, Section::Mmproj) {
                 self.stream_error.get_or_insert(e);
             }
         } else {
             self.mmproj_payloads.push(payload);
         }
+    }
+
+    /// Add a tensor that belongs to the speculator sub-bundle (an MTP head
+    /// or a converted drafter). Same blob; its entry lands under
+    /// `header.speculator.tensors`. Callers add every LM and mmproj tensor
+    /// before the first speculator tensor so the streamed order matches
+    /// the buffered path.
+    pub fn add_speculator_tensor(&mut self, payload: TensorPayload) {
+        if let Some(s) = self.stream.as_mut() {
+            let alignment = self.header.alignment;
+            if let Err(e) = Self::stream_payload(alignment, s, payload, Section::Speculator) {
+                self.stream_error.get_or_insert(e);
+            }
+        } else {
+            self.speculator_payloads.push(payload);
+        }
+    }
+
+    /// Set the speculator sub-bundle arch tag (e.g. "qwen35-mtp").
+    /// Required when any `add_speculator_tensor` was called.
+    pub fn set_speculator_arch(&mut self, arch: impl Into<String>) {
+        self.speculator_arch = Some(arch.into());
+    }
+
+    /// Set the speculator sub-bundle config block (`kind`, `num_layers`,
+    /// `moe`, `shared_embeddings`, drafter-specific keys).
+    pub fn set_speculator_config(
+        &mut self,
+        cfg: std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        self.speculator_config = cfg;
     }
 
     /// Set the mmproj sub-bundle arch tag (e.g. "gemma4_vision_audio").
@@ -293,6 +380,21 @@ impl<W: Write + Seek> BaseWriter<W> {
         if q6_experts(&self.header.tensors) {
             self.header.target_backend = crate::header::TargetBackend::CudaSm121;
         }
+    }
+
+    /// Publish the speculator sub-bundle in the header (arch, config,
+    /// entries) and raise HAS_SPECULATOR.
+    fn install_speculator(&mut self, entries: Vec<TensorEntry>) {
+        let arch = self
+            .speculator_arch
+            .clone()
+            .unwrap_or_else(|| "speculator".to_string());
+        self.header.speculator = Some(SpeculatorBundle {
+            arch,
+            config: std::mem::take(&mut self.speculator_config),
+            tensors: entries,
+        });
+        self.header.flags |= HeaderFlags::HAS_SPECULATOR;
     }
 
     pub fn finish(mut self) -> Result<()> {
@@ -360,6 +462,24 @@ impl<W: Write + Seek> BaseWriter<W> {
                 tensors: mmproj_entries,
             });
         }
+        // Speculator sub-bundle entries continue past the mmproj tensors.
+        if !self.speculator_payloads.is_empty() {
+            let mut spec_entries: Vec<TensorEntry> =
+                Vec::with_capacity(self.speculator_payloads.len());
+            for p in &self.speculator_payloads {
+                let align = alignment.align_for(p.entry.compute_region);
+                let aligned = align_up(blob_cursor, align);
+                let mut entry = p.entry.clone();
+                entry.offset = aligned;
+                entry.length = p.data.len() as u64;
+                if entry.checksum_xxh64.is_none() {
+                    entry.checksum_xxh64 = Some(xxhash_rust::xxh64::xxh64(&p.data, 0));
+                }
+                spec_entries.push(entry);
+                blob_cursor = aligned + p.data.len() as u64;
+            }
+            self.install_speculator(spec_entries);
+        }
 
         // Serialize header (canonical JSON, sorted keys via BTreeMap).
         let header_json = self.header.to_canonical_json().map_err(Error::Json)?;
@@ -412,6 +532,19 @@ impl<W: Write + Seek> BaseWriter<W> {
                 blob_written += p.data.len() as u64;
             }
         }
+        // Speculator data continues past the mmproj tensors.
+        if let Some(spec) = &self.header.speculator {
+            for (p, e) in self.speculator_payloads.iter().zip(spec.tensors.iter()) {
+                if e.offset > blob_written {
+                    let pad = (e.offset - blob_written) as usize;
+                    let zeros = vec![0u8; pad];
+                    self.inner.write_all(&zeros)?;
+                    blob_written += pad as u64;
+                }
+                self.inner.write_all(&p.data)?;
+                blob_written += p.data.len() as u64;
+            }
+        }
 
         // Extension slots, if any. Pad to 8-byte boundary first so the
         // slots section starts aligned.
@@ -448,19 +581,14 @@ impl<W: Write + Seek> BaseWriter<W> {
                 tensors: std::mem::take(&mut s.mmproj_entries),
             });
         }
-
-        // Remove the temp blob on EVERY exit from here on, not just the happy
-        // path. A failure below (the destination filling mid-copy is the
-        // realistic one) used to return through `?` and strand a model-sized
-        // `.blobtmp` next to the partial output — hundreds of GB that the user
-        // has to find by hand, and that makes every retry fail for space.
-        struct TmpGuard(std::path::PathBuf);
-        impl Drop for TmpGuard {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-            }
+        if !s.speculator_entries.is_empty() {
+            let entries = std::mem::take(&mut s.speculator_entries);
+            self.install_speculator(entries);
         }
-        let _tmp_guard = TmpGuard(s.path.clone());
+
+        // The temp blob is removed by `s.tmp` whichever way this function
+        // leaves — including the destination filling mid-copy, the realistic
+        // failure here.
 
         // Flush + rewind the temp blob for reading.
         s.file.flush()?;
@@ -519,6 +647,10 @@ impl<W: Write + Seek> BaseWriter<W> {
                 config: std::mem::take(&mut self.mmproj_config),
                 tensors: std::mem::take(&mut s.mmproj_entries),
             });
+        }
+        if !s.speculator_entries.is_empty() {
+            let entries = std::mem::take(&mut s.speculator_entries);
+            self.install_speculator(entries);
         }
 
         // Extension slots continue past the blob (8-byte aligned) on the

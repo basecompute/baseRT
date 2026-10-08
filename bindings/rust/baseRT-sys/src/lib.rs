@@ -265,9 +265,27 @@ pub struct BaseRTGenerationStats {
     pub decode_tokens_per_sec: c_float,
 }
 
+/// Opaque per-sequence handle (independent KV state on the model's shared
+/// paged-KV pool). Mirrors `baseRT_sequence_t` in baseRT.h.
+pub type baseRT_sequence_t = *mut c_void;
+
+/// Result of a prefix-cache lookup (`baseRT_prefix_match`). `blocks` points
+/// into engine-owned storage valid until `baseRT_prefix_unlock(handle)` /
+/// `baseRT_prefix_release(handle)`. `handle == 0` means miss / cache
+/// disabled — nothing to unlock.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BaseRTPrefixMatch {
+    pub matched_tokens: c_int,
+    pub n_blocks: c_int,
+    pub blocks: *const c_int,
+    pub handle: u64,
+}
+
 /// Callback for streaming token output. Return `false` to stop generation.
-pub type baseRT_token_callback =
-    Option<unsafe extern "C" fn(token_id: u32, text: *const c_char, user_data: *mut c_void) -> bool>;
+pub type baseRT_token_callback = Option<
+    unsafe extern "C" fn(token_id: u32, text: *const c_char, user_data: *mut c_void) -> bool,
+>;
 
 /// Callback for streaming transcription segments. Return `false` to stop transcription.
 pub type baseRT_segment_callback = Option<
@@ -289,6 +307,9 @@ extern "C" {
     ) -> baseRT_model_t;
 
     pub fn baseRT_free_model(model: baseRT_model_t);
+    /// Tokenizer-only load: metadata + vocab, no GPU tensors. Only the
+    /// tokenizer surface is valid on the returned handle.
+    pub fn baseRT_load_tokenizer_only(model_path: *const c_char) -> baseRT_model_t;
 
     // === Model info ===
 
@@ -316,6 +337,25 @@ extern "C" {
         kv_bits: c_int,
         paged_kv: c_int,
     ) -> c_int;
+    /// As above, plus the speculators loading beside those models:
+    /// `speculator_embedded[i]` non-zero is the target bundle's embedded head
+    /// (its KV pool only); zero (or a null array) a sidecar / draft model
+    /// (weights and KV pool), even when also served. `speculator_target[i]`
+    /// >= 0 is the index of the model a sidecar's baseRT_load_drafter reopens
+    /// for its embedding / lm_head (charged where the backend copies wrapped
+    /// weights); -1 (or a null array) for none. Speculators never cap the
+    /// window.
+    pub fn baseRT_suggest_max_context_spec(
+        model_paths: *const *const c_char,
+        n_models: c_int,
+        speculator_paths: *const *const c_char,
+        speculator_embedded: *const c_int,
+        speculator_target: *const c_int,
+        n_speculators: c_int,
+        max_batch: c_int,
+        kv_bits: c_int,
+        paged_kv: c_int,
+    ) -> c_int;
     /// 1 = the window fits the co-resident set, 0 = it does not, -1 = unknown.
     pub fn baseRT_context_window_fits(
         model_paths: *const *const c_char,
@@ -335,8 +375,35 @@ extern "C" {
         out_tokens: *mut u32,
         max_tokens: c_int,
     ) -> c_int;
+    /// Special-token strings in `text` are ordinary text (client content),
+    /// never control ids. See the header.
+    pub fn baseRT_encode_plain(
+        model: baseRT_model_t,
+        text: *const c_char,
+        out_tokens: *mut u32,
+        max_tokens: c_int,
+    ) -> c_int;
+    /// `n_pieces` texts encoded as one: piece `i` parses marker strings
+    /// when `plain[i]` is zero and keeps them as text otherwise, with the
+    /// pre-tokenizer seeing the concatenation. See the header.
+    pub fn baseRT_encode_pieces(
+        model: baseRT_model_t,
+        texts: *const *const c_char,
+        plain: *const c_int,
+        n_pieces: c_int,
+        out_tokens: *mut u32,
+        max_tokens: c_int,
+    ) -> c_int;
 
     pub fn baseRT_decode_token(model: baseRT_model_t, token_id: u32) -> *const c_char;
+    /// Length-preserving stateless decode (byte-level tokens can contain
+    /// NUL); returns the true byte length, which may exceed `max_bytes`.
+    pub fn baseRT_decode_token_raw(
+        model: baseRT_model_t,
+        token_id: u32,
+        out: *mut c_char,
+        max_bytes: c_int,
+    ) -> c_int;
 
     // === Generation ===
 
@@ -458,6 +525,7 @@ extern "C" {
     ) -> c_int;
 
     pub fn baseRT_embedding_dim(model: baseRT_model_t) -> c_int;
+    pub fn baseRT_is_embedding_model(model: baseRT_model_t) -> bool;
 
     // === Chat templates ===
 
@@ -468,6 +536,60 @@ extern "C" {
     ) -> *const c_char;
 
     pub fn baseRT_chat_template(model: baseRT_model_t) -> *const c_char;
+
+    /// Raw Jinja `chat_template` source folded in from the HF tokenizer
+    /// (empty if the bundle carries none).
+    pub fn baseRT_chat_template_jinja(model: baseRT_model_t) -> *const c_char;
+
+    /// Create a grammar from a JSON Schema (converted to GBNF internally);
+    /// NULL on error. Used to validate that a codec's tool-call grammar
+    /// compiles in the engine (the runtime constrained-decode path).
+    pub fn baseRT_grammar_create_from_schema(
+        model: baseRT_model_t,
+        json_schema: *const c_char,
+    ) -> *mut std::os::raw::c_void;
+
+    /// Create a grammar from an xgrammar STRUCTURAL TAG document (JSON, not a
+    /// grammar string); NULL on error. The tag's content formats reach past
+    /// JSON Schema — `sequence`, `const_string`, `regex`, `or` — which is how
+    /// a dialect whose call body is not JSON (Gemma 4's `call:fn{k:v}`) still
+    /// gets an enforceable `tool_choice`.
+    pub fn baseRT_grammar_create_from_structural_tag(
+        model: baseRT_model_t,
+        tag_json: *const c_char,
+    ) -> *mut std::os::raw::c_void;
+
+    /// Create a grammar from a GBNF string; NULL on parse error.
+    pub fn baseRT_grammar_create(
+        model: baseRT_model_t,
+        gbnf: *const c_char,
+    ) -> *mut std::os::raw::c_void;
+
+    /// Step a grammar by one token; 0 = the grammar REJECTS it. Lets a test
+    /// assert what a compiled grammar actually admits, not merely that it
+    /// compiled — the difference between "the tag parses" and "the tag
+    /// permits the calls this dialect must be able to make".
+    pub fn baseRT_grammar_accept_token(
+        grammar: *mut std::os::raw::c_void,
+        token_id: u32,
+    ) -> std::os::raw::c_int;
+
+    /// Reset a grammar's acceptance state to its initial stacks, so one
+    /// handle can check several candidate strings.
+    pub fn baseRT_grammar_reset(grammar: *mut std::os::raw::c_void);
+
+    /// Free a grammar.
+    pub fn baseRT_grammar_free(grammar: *mut std::os::raw::c_void);
+
+    /// Number of added/special tokens the model declares.
+    pub fn baseRT_special_token_count(model: baseRT_model_t) -> c_int;
+
+    /// The `index`-th special token string; writes its id to `id_out`.
+    pub fn baseRT_special_token(
+        model: baseRT_model_t,
+        index: c_int,
+        id_out: *mut u32,
+    ) -> *const c_char;
 
     // === Token counting ===
 
@@ -502,6 +624,136 @@ extern "C" {
         n_tokens: c_int,
         penalty: c_float,
     );
+
+    // === Pre-load configuration (call BEFORE baseRT_load_model) ===
+
+    pub fn baseRT_set_paged_kv(enable: c_int);
+    pub fn baseRT_set_baked_decode(enable: c_int);
+    pub fn baseRT_set_max_batch_size(n: c_int);
+    pub fn baseRT_set_prefix_cache(enable: c_int);
+    pub fn baseRT_set_prefill_chunk(n: c_int);
+    pub fn baseRT_set_kv_bits(bits: c_int);
+    pub fn baseRT_set_verbose(on: c_int);
+
+    // === Error / capability introspection ===
+
+    pub fn baseRT_get_error_code() -> c_int;
+    pub fn baseRT_strerror(code: c_int) -> *const c_char;
+    pub fn baseRT_capabilities(model: baseRT_model_t) -> u32;
+    pub fn baseRT_eos_token_id(model: baseRT_model_t) -> u32;
+    pub fn baseRT_is_eos_token(model: baseRT_model_t, token: u32) -> i32;
+    pub fn baseRT_weights_identity(model: baseRT_model_t) -> u64;
+    pub fn baseRT_kv_bits_effective(model: baseRT_model_t) -> c_int;
+    pub fn baseRT_bos_id(model: baseRT_model_t) -> u32;
+
+    // === Multi-sequence generation (paged-KV only) ===
+
+    pub fn baseRT_sequence_create(model: baseRT_model_t) -> baseRT_sequence_t;
+    pub fn baseRT_sequence_free(seq: baseRT_sequence_t);
+    pub fn baseRT_sequence_rollback(seq: baseRT_sequence_t, length: c_int) -> c_int;
+
+    // === Batched prefill/decode ===
+
+    pub fn baseRT_batch_step(
+        model: baseRT_model_t,
+        seqs: *mut baseRT_sequence_t,
+        n_seqs: c_int,
+        in_tokens: *const u32,
+        in_token_counts: *const c_int,
+        out_tokens: *mut u32,
+    ) -> c_int;
+    pub fn baseRT_batch_step_fused(
+        model: baseRT_model_t,
+        seqs: *mut baseRT_sequence_t,
+        n_seqs: c_int,
+        in_tokens: *const u32,
+        in_token_counts: *const c_int,
+        out_tokens: *mut u32,
+    ) -> c_int;
+    pub fn baseRT_batch_step_fused_logits(
+        model: baseRT_model_t,
+        seqs: *mut baseRT_sequence_t,
+        n_seqs: c_int,
+        in_tokens: *const u32,
+        in_token_counts: *const c_int,
+    ) -> c_int;
+    pub fn baseRT_batch_warmup(model: baseRT_model_t, max_batch: c_int) -> c_int;
+    pub fn baseRT_max_prefill_chunk(model: baseRT_model_t) -> c_int;
+
+    // === Host-side logits-row operations ===
+
+    pub fn baseRT_read_batch_logits(
+        model: baseRT_model_t,
+        n_seqs: c_int,
+        out_logits_f16: *mut c_void,
+    ) -> c_int;
+    pub fn baseRT_batch_logits_stride(model: baseRT_model_t) -> usize;
+    pub fn baseRT_mask_logits_row(
+        model: baseRT_model_t,
+        row: *mut c_void,
+        bitmask: *const i32,
+    ) -> c_int;
+    pub fn baseRT_sample_logits_row(
+        model: baseRT_model_t,
+        row: *const c_void,
+        cfg: *const BaseRTSamplingConfig,
+        prev_tokens: *const u32,
+        n_prev: c_int,
+        repeat_window: c_int,
+        seed_offset: u32,
+    ) -> u32;
+    pub fn baseRT_argmax_logits_row(model: baseRT_model_t, row: *const c_void) -> u32;
+    pub fn baseRT_logits_row_logprobs(
+        model: baseRT_model_t,
+        row: *const c_void,
+        token: u32,
+        top_k: c_int,
+        out_token_logprob: *mut c_float,
+        out_ids: *mut u32,
+        out_logprobs: *mut c_float,
+    ) -> c_int;
+
+    // === Prefix cache — scheduler-driven primitives ===
+
+    pub fn baseRT_prefix_match(
+        model: baseRT_model_t,
+        tokens: *const u32,
+        n_tokens: c_int,
+    ) -> BaseRTPrefixMatch;
+    pub fn baseRT_sequence_seed_prefix(
+        seq: baseRT_sequence_t,
+        blocks: *const c_int,
+        n_blocks: c_int,
+        n_tokens: c_int,
+    ) -> c_int;
+    pub fn baseRT_page_size(model: baseRT_model_t) -> c_int;
+    pub fn baseRT_prefix_insert(
+        model: baseRT_model_t,
+        tokens: *const u32,
+        n_tokens: c_int,
+        seq: baseRT_sequence_t,
+    ) -> c_int;
+    pub fn baseRT_prefix_unlock(model: baseRT_model_t, handle: u64);
+    pub fn baseRT_prefix_release(model: baseRT_model_t, handle: u64);
+    pub fn baseRT_prefix_discard(model: baseRT_model_t, handle: u64);
+    pub fn baseRT_prefix_evict(model: baseRT_model_t, n_blocks: c_int) -> c_int;
+    pub fn baseRT_prefix_cache_stats(
+        model: baseRT_model_t,
+        out_hits: *mut u64,
+        out_misses: *mut u64,
+        out_reused_tokens: *mut u64,
+        out_blocks_cached: *mut c_int,
+    );
+
+    // === Recurrent (GDN) state snapshots — hybrid models only ===
+
+    pub fn baseRT_gdn_snapshot_size(model: baseRT_model_t) -> c_int;
+    pub fn baseRT_sequence_gdn_capture(seq: baseRT_sequence_t, out: *mut u8, cap: c_int) -> c_int;
+    pub fn baseRT_sequence_gdn_restore(
+        seq: baseRT_sequence_t,
+        blob: *const u8,
+        len: c_int,
+    ) -> c_int;
 }
 
 #[cfg(test)]
@@ -595,7 +847,10 @@ mod tests {
         assert_eq!(&base.n_layers as *const _ as usize - base_ptr, 4);
         assert_eq!(&base.norm_eps as *const _ as usize - base_ptr, 40);
         assert_eq!(&base.rope_theta as *const _ as usize - base_ptr, 44);
-        assert_eq!(&base.sliding_window_pattern as *const _ as usize - base_ptr, 48);
+        assert_eq!(
+            &base.sliding_window_pattern as *const _ as usize - base_ptr,
+            48
+        );
         // The field the old binding dropped — everything after shifts by 4.
         assert_eq!(&base.sliding_window as *const _ as usize - base_ptr, 52);
         assert_eq!(&base.rope_local_theta as *const _ as usize - base_ptr, 56);
@@ -606,31 +861,55 @@ mod tests {
         assert_eq!(&base.swa_layers as *const _ as usize - base_ptr, 144);
         assert_eq!(&base.ffn_dims as *const _ as usize - base_ptr, 208);
         assert_eq!(&base.attn_output_gate as *const _ as usize - base_ptr, 1232);
-        assert_eq!(&base.linear_attn_layers as *const _ as usize - base_ptr, 1244);
+        assert_eq!(
+            &base.linear_attn_layers as *const _ as usize - base_ptr,
+            1244
+        );
         assert_eq!(&base.gdn_num_k_heads as *const _ as usize - base_ptr, 1308);
         // Nemotron-H SSM block, inserted between gdn_* and the MoE block —
         // 20 bytes that shifted every field below it.
         assert_eq!(&base.ssm_state_size as *const _ as usize - base_ptr, 1328);
         assert_eq!(&base.ssm_num_heads as *const _ as usize - base_ptr, 1344);
         assert_eq!(&base.n_experts as *const _ as usize - base_ptr, 1348);
-        assert_eq!(&base.expert_weights_scale as *const _ as usize - base_ptr, 1368);
+        assert_eq!(
+            &base.expert_weights_scale as *const _ as usize - base_ptr,
+            1368
+        );
         assert_eq!(&base.vision_n_layers as *const _ as usize - base_ptr, 1372);
         assert_eq!(&base.vision_arch as *const _ as usize - base_ptr, 1432);
         assert_eq!(&base.audio_n_layers as *const _ as usize - base_ptr, 1448);
         assert_eq!(&base.eoa_token_id as *const _ as usize - base_ptr, 1524);
         assert_eq!(&base.mrope_section as *const _ as usize - base_ptr, 1528);
-        assert_eq!(&base.mrope_interleaved as *const _ as usize - base_ptr, 1540);
-        assert_eq!(&base.rope_scaling_factor as *const _ as usize - base_ptr, 1544);
-        assert_eq!(&base.rope_orig_max_pos as *const _ as usize - base_ptr, 1556);
-        assert_eq!(&base.rope_scaling_type as *const _ as usize - base_ptr, 1560);
+        assert_eq!(
+            &base.mrope_interleaved as *const _ as usize - base_ptr,
+            1540
+        );
+        assert_eq!(
+            &base.rope_scaling_factor as *const _ as usize - base_ptr,
+            1544
+        );
+        assert_eq!(
+            &base.rope_orig_max_pos as *const _ as usize - base_ptr,
+            1556
+        );
+        assert_eq!(
+            &base.rope_scaling_type as *const _ as usize - base_ptr,
+            1560
+        );
         assert_eq!(&base.qk_scale_factor as *const _ as usize - base_ptr, 1564);
         assert_eq!(&base.nope_layers as *const _ as usize - base_ptr, 1576);
         assert_eq!(&base.embed_norm_eps as *const _ as usize - base_ptr, 1640);
-        assert_eq!(&base.vision_window_layers as *const _ as usize - base_ptr, 1644);
+        assert_eq!(
+            &base.vision_window_layers as *const _ as usize - base_ptr,
+            1644
+        );
         assert_eq!(&base.video_token_id as *const _ as usize - base_ptr, 1724);
         assert_eq!(&base.q_lora_rank as *const _ as usize - base_ptr, 1728);
         assert_eq!(&base.indexer_top_k as *const _ as usize - base_ptr, 1768);
-        assert_eq!(&base.rope_yarn_beta_fast as *const _ as usize - base_ptr, 1772);
+        assert_eq!(
+            &base.rope_yarn_beta_fast as *const _ as usize - base_ptr,
+            1772
+        );
     }
 
     #[test]
@@ -661,8 +940,14 @@ mod tests {
         assert_eq!(&base.generated_tokens as *const _ as usize - base_ptr, 4);
         assert_eq!(&base.prefill_time_ms as *const _ as usize - base_ptr, 8);
         assert_eq!(&base.decode_time_ms as *const _ as usize - base_ptr, 12);
-        assert_eq!(&base.prefill_tokens_per_sec as *const _ as usize - base_ptr, 16);
-        assert_eq!(&base.decode_tokens_per_sec as *const _ as usize - base_ptr, 20);
+        assert_eq!(
+            &base.prefill_tokens_per_sec as *const _ as usize - base_ptr,
+            16
+        );
+        assert_eq!(
+            &base.decode_tokens_per_sec as *const _ as usize - base_ptr,
+            20
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -683,6 +968,19 @@ mod tests {
         assert_eq!(cfg.n_logit_bias, 0);
         assert!(cfg.logit_bias_tokens.is_null());
         assert!(cfg.logit_bias_values.is_null());
+    }
+
+    #[test]
+    fn prefix_match_layout() {
+        // int matched_tokens (4) + int n_blocks (8) + const int *blocks
+        // (16) + uint64_t handle (24). Returned BY VALUE from
+        // baseRT_prefix_match, so the mirror must match the C layout
+        // exactly.
+        assert_eq!(mem::size_of::<BaseRTPrefixMatch>(), 24);
+        assert_eq!(mem::offset_of!(BaseRTPrefixMatch, matched_tokens), 0);
+        assert_eq!(mem::offset_of!(BaseRTPrefixMatch, n_blocks), 4);
+        assert_eq!(mem::offset_of!(BaseRTPrefixMatch, blocks), 8);
+        assert_eq!(mem::offset_of!(BaseRTPrefixMatch, handle), 16);
     }
 
     #[test]

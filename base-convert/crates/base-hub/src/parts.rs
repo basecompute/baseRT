@@ -769,8 +769,10 @@ fn discard_staged(fetcher: &dyn Fetcher, repo: &str, src: &Path) {
 const MAX_HEADER_LEN: u64 = 256 * 1024 * 1024;
 
 /// Flags that promise an extension-slot section after the weights blob.
+/// HAS_SPECULATOR is not one of them: the speculator sub-bundle lives in
+/// the weights blob (`header.speculator.tensors`, the mmproj convention)
+/// and writes no slot.
 const SLOT_FLAGS: base_format::HeaderFlags = base_format::HeaderFlags::HAS_LORA
-    .union(base_format::HeaderFlags::HAS_SPECULATOR)
     .union(base_format::HeaderFlags::HAS_COMPUTE_GRAPH)
     .union(base_format::HeaderFlags::HAS_KV_WARMUP)
     .union(base_format::HeaderFlags::HAS_TRACE_REF)
@@ -813,8 +815,10 @@ fn check_complete(path: &Path, len: u64) -> Result<()> {
         .checked_next_multiple_of(BLOB_ALIGNMENT)
         .ok_or_else(overflow)?;
     let mut blob_end = blob_offset;
+    // The sub-bundles (mmproj towers, the speculator head) share the blob.
     let mmproj = header.mmproj.iter().flat_map(|m| m.tensors.iter());
-    for t in header.tensors.iter().chain(mmproj) {
+    let speculator = header.speculator.iter().flat_map(|m| m.tensors.iter());
+    for t in header.tensors.iter().chain(mmproj).chain(speculator) {
         let regions = [
             (Some(t.offset), Some(t.length)),
             (t.scale_offset, t.scale_length),
