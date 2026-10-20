@@ -365,8 +365,13 @@ enum AwqMode {
 #[derive(Parser, Debug)]
 struct PullArgs {
     /// Model id: `basecompute/<name>` (pre-converted, from the catalog) or
-    /// `org/model` (a raw HF repo, downloaded + converted locally).
+    /// `org/model` (a raw HF repo, downloaded + converted locally). Append
+    /// `:<variant>` (e.g. `:default-q8`) to pick a quant build.
     id: String,
+    /// Quant build to pull, e.g. `default-q8`; same as `<id>:default-q8`
+    /// (an inline `:variant` wins). Overrides `--target`.
+    #[arg(long)]
+    variant: Option<String>,
     /// Override the auto-selected quant profile (path to a profile JSON).
     #[arg(long)]
     profile: Option<PathBuf>,
