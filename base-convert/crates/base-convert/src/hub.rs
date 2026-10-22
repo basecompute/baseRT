@@ -480,7 +480,8 @@ fn bundled_computearena_harness(
 
 /// Forward `basert <cmd> [args…]` to the matching runtime binary. Searches for
 /// `basert-<cmd>` (release layout) then `baseRT_<cmd>` (local dev build),
-/// looking next to this executable first and then on `PATH`. On success the
+/// looking next to this executable first and then on `PATH`. `basert serve`
+/// has no runtime binary: it runs superfluid (`crate::serve`). On success the
 /// current process is replaced (`exec`), so this only returns on failure.
 pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
     use std::os::unix::process::CommandExt;
@@ -501,6 +502,9 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
         // hub-id resolution.
         let (variant_flag, rest) = extract_variant_flag(rest)?;
         let rest = resolve_model_args(&rest, variant_flag.as_deref())?;
+        if cmd == "serve" {
+            return crate::serve::run(&rest);
+        }
         (vec![format!("basert-{cmd}"), format!("baseRT_{cmd}")], rest)
     };
 
@@ -559,14 +563,7 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
 /// Commands served by the BaseRT runtime rather than this binary. Used only
 /// to shape the not-found error above; dispatch itself is name-driven, so
 /// commands absent from this list (or from `basert --help`) still dispatch.
-const RUNTIME_COMMANDS: [&str; 6] = [
-    "serve",
-    "chat",
-    "complete",
-    "bench",
-    "transcribe",
-    "profile",
-];
+const RUNTIME_COMMANDS: [&str; 5] = ["chat", "complete", "bench", "transcribe", "profile"];
 
 pub fn cmd_pull(args: PullArgs) -> Result<()> {
     let reg = MergedRegistry::load()?;
