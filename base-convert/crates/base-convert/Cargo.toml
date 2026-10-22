@@ -30,6 +30,9 @@ base-hub.workspace = true
 memmap2.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+dirs.workspace = true
+# `basert superfluid install` fetches superfluid's release tarball from GitHub.
+ureq = "3"
 
 [dev-dependencies]
 tempfile.workspace = true

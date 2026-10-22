@@ -506,6 +506,45 @@ mod tests {
         assert!(matches!(router.dtype, TensorDtype::F16 | TensorDtype::Bf16));
     }
 
+    /// Gemma-4 q4mix keeps the attention key projection at q8 (q / v / o
+    /// stay q4). Gemma-4 attends with scale 1.0 over RMS-normed q and k,
+    /// and every later query reads a position's cached key, so 4-bit keys
+    /// blunt the heads that point back at an earlier occurrence of a token:
+    /// the 26B-A4B garbles identifiers it is copying (`y_position_m` in a
+    /// script it is writing). 8-bit keys alone restore it.
+    #[test]
+    fn gemma4_moe_q4mix_keeps_k_proj_q8() {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let path = std::path::Path::new(&manifest)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("profiles")
+            .join("gemma4-moe-q4mix.json");
+        let p = QuantProfile::from_path(&path).unwrap();
+        for name in [
+            "model.language_model.layers.0.self_attn.k_proj.weight",
+            "layers.5.self_attn.k_proj.weight",
+            "blk.3.attn_k.weight",
+        ] {
+            let r = p.resolve(name).unwrap();
+            assert_eq!(r.dtype, TensorDtype::BaseQ8, "{name}");
+            assert_eq!(r.group_size, 64, "{name}");
+            assert_eq!(r.scale_dtype, ScaleDtype::Bf16, "{name}");
+        }
+        for name in [
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.self_attn.v_proj.weight",
+            "model.language_model.layers.0.self_attn.o_proj.weight",
+            "model.vision_tower.encoder.layers.0.self_attn.k_proj.linear.weight",
+        ] {
+            let r = p.resolve(name).unwrap();
+            assert_eq!(r.dtype, TensorDtype::BaseQ4, "{name}");
+            assert_eq!(r.group_size, 64, "{name}");
+        }
+    }
+
     /// q3-aggressive profile routes MLP / experts to q3 / gs=32 per spec.
     #[test]
     fn q3_aggressive_profile_uses_q3_gs32() {

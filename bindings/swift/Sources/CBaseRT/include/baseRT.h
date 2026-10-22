@@ -63,7 +63,7 @@ extern "C" {
 // === Versioning ===
 
 #define BASERT_VERSION_MAJOR 0
-#define BASERT_VERSION_MINOR 3
+#define BASERT_VERSION_MINOR 4
 #define BASERT_VERSION_PATCH 0
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
@@ -74,6 +74,22 @@ extern "C" {
 /// library; useful for diagnostics when a binding loads a different
 /// `.dylib` than it was compiled against.
 const char *baseRT_version_string(void);
+
+/// The engine's C ABI number. Two libraries with the same number can be
+/// driven through the same bindings: the same functions with the same
+/// signatures, struct layouts and enum values. It changes only when one of
+/// those changes incompatibly, whatever the version number does; a patch
+/// release never changes it, and a release may add functions, and append
+/// fields to BaseRTModelConfig, without changing it (a loader reads that
+/// struct with baseRT_get_config_into(), by size). A binding that opens
+/// libbaseRT at run time compares this with `baseRT_abi_version()` rather
+/// than with the version string.
+#define BASERT_ABI_VERSION 1
+
+/// Runtime-resolved ABI number of the loaded library (its
+/// BASERT_ABI_VERSION). Since 0.3.1: a library without this function is
+/// 0.3.0 or older, and its ABI is told by its major.minor alone.
+unsigned int baseRT_abi_version(void);
 
 /// Opaque model handle.
 typedef void *baseRT_model_t;
@@ -275,8 +291,22 @@ void baseRT_free_model(baseRT_model_t model);
 
 // === Model info ===
 
-/// Get model configuration.
+/// Get model configuration, by value. A caller that opened the library at
+/// run time should prefer baseRT_get_config_into(): the struct grows by
+/// appended fields across releases, and a by-value return into a caller
+/// built for another size is undefined.
 BaseRTModelConfig baseRT_get_config(baseRT_model_t model);
+
+/// Copy the model configuration into a caller-sized buffer: the first
+/// `out_size` bytes of the library's BaseRTModelConfig, the whole struct
+/// followed by zeros when `out_size` is larger. Returns the library's
+/// sizeof(BaseRTModelConfig), so the caller can tell what it was given.
+/// Fields are only ever appended to the struct, so a caller built against
+/// an older or newer header reads the fields it knows and sees zeros for
+/// the rest, which every field treats as "not applicable". This is how a
+/// loader stays on one ABI number while the struct grows. A null model
+/// fills `out` with zeros. Since 0.4.0.
+size_t baseRT_get_config_into(baseRT_model_t model, void *out, size_t out_size);
 
 /// sizeof(BaseRTModelConfig) as compiled into the library. Language
 /// bindings that mirror the struct by hand (Python/Rust/Node) compare

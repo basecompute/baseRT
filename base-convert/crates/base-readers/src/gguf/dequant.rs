@@ -101,6 +101,11 @@ impl GgmlType {
             Q5K => (256, 176),
             Q6K => (256, 210),
             Q8K => (256, 292),
+            Iq4Xs => (256, 136), // fp16 d + 2-byte scales_h + 4-byte scales_l + 128 bytes
+            Iq2Xs => (256, 74),  // fp16 d + 32 x u16 grid/sign indices + 8 scale bytes
+            Iq2S => (256, 82),   // fp16 d + 32 grid + 32 sign + 8 qh + 8 scale bytes
+            Iq3Xxs => (256, 98), // fp16 d + 64 grid indices + 32 scale/sign bytes
+            Iq3S => (256, 110),  // fp16 d + 64 grid + 8 qh + 32 sign + 4 scale bytes
             other => panic!("block_geometry not defined for {other:?}"),
         }
     }
@@ -159,6 +164,7 @@ pub fn dequant_to_f32(info: &TensorInfo, bytes: &[u8]) -> Result<Vec<f32>> {
         GgmlType::Q4K => dequant_q4_k(bytes, n),
         GgmlType::Q5K => dequant_q5_k(bytes, n),
         GgmlType::Q6K => dequant_q6_k(bytes, n),
+        GgmlType::Iq4Xs => dequant_iq4_xs(bytes, n),
         other => bail!(
             "dequant_to_f32: {:?} not yet implemented (tensor {:?})",
             other,
@@ -640,6 +646,49 @@ fn dequant_q5_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+const IQ4_XS_BLOCK: usize = 136; // 2 (d) + 2 (scales_h) + 4 (scales_l) + 128 (qs)
+const KVALUES_IQ4NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+/// ggml dequantize_row_iq4_xs: value = d * (ls - 32) * kvalues_iq4nl[q], ls the
+/// sub-block's 6-bit scale, q the low nibble of qs[16*ib + j] for j < 16 and
+/// the high nibble of qs[16*ib + j - 16] for j >= 16.
+fn dequant_iq4_xs(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+    if n % QK_K != 0 {
+        bail!("IQ4_XS element count {n} not a multiple of {QK_K}");
+    }
+    let n_blocks = n / QK_K;
+    if bytes.len() != n_blocks * IQ4_XS_BLOCK {
+        bail!(
+            "IQ4_XS byte length mismatch: got {}, expected {}",
+            bytes.len(),
+            n_blocks * IQ4_XS_BLOCK
+        );
+    }
+    let mut out = Vec::with_capacity(n);
+    for b in 0..n_blocks {
+        let base = b * IQ4_XS_BLOCK;
+        let d = f16::from_le_bytes([bytes[base], bytes[base + 1]]).to_f32();
+        let scales_h = u16::from_le_bytes([bytes[base + 2], bytes[base + 3]]);
+        let scales_l = &bytes[base + 4..base + 8];
+        let qs = &bytes[base + 8..base + IQ4_XS_BLOCK];
+        for ib in 0..8usize {
+            let ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) as i32
+                | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
+            let dl = d * (ls - 32) as f32;
+            let q = &qs[16 * ib..16 * ib + 16];
+            for j in 0..16 {
+                out.push(dl * KVALUES_IQ4NL[(q[j] & 0xF) as usize] as f32);
+            }
+            for j in 0..16 {
+                out.push(dl * KVALUES_IQ4NL[(q[j] >> 4) as usize] as f32);
+            }
+        }
+    }
+    Ok(out)
+}
+
 const Q6_K_BLOCK: usize = 210; // 128 (ql) + 64 (qh) + 16 (scales) + 2 (d)
 
 fn dequant_q6_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
@@ -747,5 +796,36 @@ mod tests {
         assert_eq!(out[1], 7.0);
         assert_eq!(out[16], 0.0);
         assert_eq!(out[17], -8.0);
+    }
+
+    /// The grid i-quants are copied verbatim, never dequantized here, but the
+    /// parser sizes their tensors from these block geometries (ggml-common.h).
+    #[test]
+    fn grid_iquant_block_geometry_matches_ggml() {
+        assert_eq!(GgmlType::Iq2Xs.block_geometry(), (256, 74));
+        assert_eq!(GgmlType::Iq2S.block_geometry(), (256, 82));
+        assert_eq!(GgmlType::Iq3Xxs.block_geometry(), (256, 98));
+        assert_eq!(GgmlType::Iq3S.block_geometry(), (256, 110));
+    }
+
+    /// IQ4_XS: d * (ls - 32) * kvalue, low nibbles first then high nibbles of
+    /// each sub-block's 16 bytes, ls split across scales_l and scales_h.
+    #[test]
+    fn iq4_xs_dequant_matches_ggml_layout() {
+        let mut block = vec![0u8; 136];
+        block[0..2].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+        // sub-block 0: ls = 34 (low nibble 2, high bits 2); sub-block 1: ls = 31 (15, 1).
+        block[4] = 2 | (15 << 4);
+        block[2] = 2 | (1 << 2);
+        for j in 0..16 {
+            block[8 + j] = 8 | (15 << 4); // values 1 (low) and 113 (high)
+            block[8 + 16 + j] = 7 << 4; // values -127 (low) and -10 (high)
+        }
+        let out = dequant_iq4_xs(&block, 256).unwrap();
+        assert_eq!(out[0], 0.5 * 2.0 * 1.0);
+        assert_eq!(out[16], 0.5 * 2.0 * 113.0);
+        assert_eq!(out[32], -0.5 * -127.0); // d * (31 - 32) * kvalue
+        assert_eq!(out[48], -0.5 * -10.0);
+        assert_eq!(out[64], 0.5 * -32.0 * -127.0); // ls = 0 for the zeroed sub-blocks
     }
 }

@@ -5,6 +5,8 @@ use std::path::PathBuf;
 mod gpt_oss;
 mod hub;
 mod lora;
+mod serve;
+mod superfluid;
 
 /// Hand-written top-level help: the runtime commands are dispatched via
 /// clap's external-subcommand catch-all (invisible to clap's auto listing),
@@ -15,7 +17,8 @@ const HELP_TEMPLATE: &str = "\
 {usage-heading} {usage}
 
 Run models:
-  serve       Start an OpenAI-compatible HTTP server
+  serve       Start an OpenAI-compatible HTTP server (superfluid, installed on first use)
+  superfluid  Install or check superfluid, the server `basert serve` runs
   chat        Chat with a model interactively
   complete    Generate a one-shot completion
   bench       Measure throughput
@@ -75,6 +78,8 @@ enum Cmd {
     CatalogScan(CatalogScanArgs),
     /// Write the manifest a Hub-split `.base` needs beside its parts.
     CatalogManifest(CatalogManifestArgs),
+    /// Install or check superfluid, the server `basert serve` runs.
+    Superfluid(superfluid::SuperfluidArgs),
     /// Runtime commands — `serve`, `chat`, `complete`, `bench`, … — handled
     /// by the BaseRT runtime (dispatched in `hub::dispatch_external`).
     #[command(external_subcommand)]
@@ -161,12 +166,13 @@ struct ConvertArgs {
     /// halves it, q4 quarters it, at a small cost in acceptance.
     #[arg(long)]
     quantize_drafter: bool,
-    /// GGUF sources only: copy Q4_K / Q5_K / Q6_K super-blocks into the
-    /// bundle VERBATIM instead of dequantizing and re-packing them.
+    /// GGUF sources only: copy Q3_K / Q4_K / Q5_K / Q6_K / IQ4_XS and IQ2_XS /
+    /// IQ2_S / IQ3_XXS / IQ3_S super-blocks into the bundle VERBATIM instead
+    /// of dequantizing and re-packing them.
     ///
     /// This is lossless — the exact block bytes land in the `.base`
     /// weights blob, tagged with `layout = gguf_super`, `group_size =
-    /// 256` and the source `ggml_type` (12/13/14) so the runtime can
+    /// 256` and the source `ggml_type` (11/12/13/14/23, 17/18/21/22) so the runtime can
     /// dispatch a native k-quant kernel. It is therefore NOT
     /// "quant-from-quant" and does not need `--allow-quant-from-quant`;
     /// the canonical-quant spec forbids dequant→requant precisely
@@ -418,7 +424,7 @@ struct ListArgs {
 /// White→lime vertical gradient anchored on brand Lime #E8FFBD (the brand
 /// tone alone is too close to white to read as terminal text). Printed only
 /// on an interactive terminal; NO_COLOR drops the colors.
-fn print_banner() {
+pub(crate) fn print_banner() {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() {
         return;
@@ -485,6 +491,7 @@ fn main() -> Result<()> {
         Cmd::List(a) => hub::cmd_list(a),
         Cmd::CatalogScan(a) => hub::cmd_catalog_scan(a.org, a.out, a.dry_run),
         Cmd::CatalogManifest(a) => hub::cmd_catalog_manifest(a.bundle),
+        Cmd::Superfluid(a) => superfluid::cmd(a),
         Cmd::External(argv) => hub::dispatch_external(argv),
     }
 }
@@ -668,13 +675,37 @@ fn convert_gguf(
     // are the layouts `Layout::GgufSuper` + `source_ggml_type` describe
     // and the ones the runtime knows how to dispatch natively.
     let kquant_passthrough = ctx.kquant_passthrough;
-    let is_kquant = |t: GgmlType| matches!(t, GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K);
-    let has_kquant = gguf.tensors.iter().any(|t| is_kquant(t.ggml_type));
+    let has_kquant = gguf.tensors.iter().any(kquant_passes_through);
     if kquant_passthrough && !has_kquant {
         eprintln!(
-            "  warning: --kquant-passthrough set but no Q4_K/Q5_K/Q6_K tensors \
-             in this GGUF; every tensor takes the normal convert path"
+            "  warning: --kquant-passthrough set but no Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ2_XS/\
+             IQ2_S/IQ3_XXS/IQ3_S tensors outside the MoE expert stacks in this GGUF; every \
+             tensor takes the normal convert path"
         );
+    }
+    let kquant_experts = gguf
+        .tensors
+        .iter()
+        .filter(|t| is_passthrough_kquant(t.ggml_type) && is_gguf_expert_stack(&t.name))
+        .count();
+    if kquant_passthrough && kquant_experts > 0 {
+        eprintln!(
+            "  kquant:  {} MoE expert tensors take the normal convert path \
+             (the expert GEMM has no k-quant kernels)",
+            kquant_experts
+        );
+    }
+    if kquant_passthrough {
+        if let Some(t) = unconvertible_expert_stack(&gguf.tensors) {
+            bail!(
+                "MoE expert tensor `{}` is {}: --kquant-passthrough leaves expert stacks \
+                 to the normal convert path (the expert GEMM has no k-quant kernels), \
+                 and that path cannot dequantize {}",
+                t.name,
+                ggml_type_name(t.ggml_type),
+                ggml_type_name(t.ggml_type)
+            );
+        }
     }
 
     // Per CANONICAL_QUANT_SPEC.md: profile-driven canonical-quant
@@ -688,10 +719,11 @@ fn convert_gguf(
     // Tensors headed for k-quant PASSTHROUGH are exempt: they are never
     // dequantized, so there is no compounded error to acknowledge. The
     // guard still fires for anything else quantized in the same file
-    // (a stray Q4_0 / Q8_0 tensor does get dequant→requant).
+    // (a stray Q4_0 / Q8_0 tensor, or a k-quant MoE expert stack, does get
+    // dequant→requant).
     if ctx.profile.is_some() && !ctx.allow_quant_from_quant {
         for tensor in gguf.tensors.iter() {
-            if kquant_passthrough && is_kquant(tensor.ggml_type) {
+            if kquant_passthrough && kquant_passes_through(tensor) {
                 continue;
             }
             if !matches!(
@@ -860,7 +892,7 @@ fn convert_gguf(
         // so a k-quant embedding yields a head at the SAME precision as the
         // embedding — the profile's head rule never runs. Say so.
         let copy = match src_idx {
-            Some(idx) if kquant_passthrough && is_kquant(gguf.tensors[idx].ggml_type) => {
+            Some(idx) if kquant_passthrough && kquant_passes_through(&gguf.tensors[idx]) => {
                 TiedHeadCopy::Verbatim {
                     ggml_type: ggml_type_name(gguf.tensors[idx].ggml_type),
                 }
@@ -908,7 +940,7 @@ fn convert_gguf(
         // INSIDE each 256-element block, so there are no separate
         // scale/bias regions — `scale_offset` / `bias_offset` stay None
         // and the runtime keys off `source_ggml_type` + `Layout::GgufSuper`.
-        if kquant_passthrough && is_kquant(info.ggml_type) {
+        if kquant_passthrough && kquant_passes_through(info) {
             let (entry, data) = kquant_passthrough_entry(info, bytes, canonical);
             passthrough_tensors += 1;
             writer.add_tensor(TensorPayload { entry, data });
@@ -1264,7 +1296,7 @@ fn convert_gguf(
                 || canonical.contains("patch_embed")
                 || canonical.ends_with(".bias");
 
-            if !must_stay_raw && kquant_passthrough && is_kquant(info.ggml_type) {
+            if !must_stay_raw && kquant_passthrough && kquant_passes_through(info) {
                 let (entry, data) = kquant_passthrough_entry(info, raw, canonical);
                 mm_passthrough += 1;
                 mm_kept += 1;
@@ -1501,6 +1533,52 @@ fn unpermute_rope_rows(
     Ok(out)
 }
 
+/// The GGUF super-block types `--kquant-passthrough` can copy verbatim.
+fn is_passthrough_kquant(t: base_readers::gguf::GgmlType) -> bool {
+    use base_readers::gguf::GgmlType;
+    matches!(
+        t,
+        GgmlType::Q3K
+            | GgmlType::Q4K
+            | GgmlType::Q5K
+            | GgmlType::Q6K
+            | GgmlType::Iq4Xs
+            | GgmlType::Iq2Xs
+            | GgmlType::Iq2S
+            | GgmlType::Iq3Xxs
+            | GgmlType::Iq3S
+    )
+}
+
+/// A GGUF MoE expert stack (`ffn_{gate,up,down,gate_up}_exps`).
+fn is_gguf_expert_stack(name: &str) -> bool {
+    name.contains("_exps")
+}
+
+/// The first expert stack in a type `--kquant-passthrough` copies but
+/// `dequant_to_f32` cannot read (the grid i-quants). Expert stacks never pass
+/// through, so such a tensor has no way into the bundle.
+fn unconvertible_expert_stack(
+    tensors: &[base_readers::gguf::TensorInfo],
+) -> Option<&base_readers::gguf::TensorInfo> {
+    use base_readers::gguf::GgmlType;
+    tensors.iter().find(|t| {
+        is_gguf_expert_stack(&t.name)
+            && matches!(
+                t.ggml_type,
+                GgmlType::Iq2Xs | GgmlType::Iq2S | GgmlType::Iq3Xxs | GgmlType::Iq3S
+            )
+    })
+}
+
+/// Whether `--kquant-passthrough` copies this tensor verbatim. Expert
+/// stacks never do: the MoE expert GEMM has no kernel for any GGUF
+/// super-block dtype, so a copied stack would convert and then abort at
+/// the first expert dispatch. They take the normal convert path instead.
+fn kquant_passes_through(t: &base_readers::gguf::TensorInfo) -> bool {
+    is_passthrough_kquant(t.ggml_type) && !is_gguf_expert_stack(&t.name)
+}
+
 /// Build the `.base` entry for a GGUF k-quant tensor copied through
 /// verbatim. The payload is the source super-block bytes unchanged.
 ///
@@ -1520,10 +1598,20 @@ fn kquant_passthrough_entry(
     use base_readers::gguf::GgmlType;
 
     let (dtype, ggml_code) = match info.ggml_type {
+        // 3.4375 bits per element: base_q3 sizes it from below.
+        GgmlType::Q3K => (TensorDtype::BaseQ3, 11u32),
         GgmlType::Q4K => (TensorDtype::BaseQ4, 12u32),
         GgmlType::Q5K => (TensorDtype::BaseQ5, 13u32),
         GgmlType::Q6K => (TensorDtype::BaseQ6, 14u32),
-        // Unreachable: the caller gates on the same three types.
+        // 4.25 bits per element: base_q4 sizes it from below, as for Q4_K.
+        GgmlType::Iq4Xs => (TensorDtype::BaseQ4, 23u32),
+        // The grid i-quants (2.31 / 2.56 / 3.06 / 3.44 bits per element):
+        // base_q2 / base_q3 size them from below, as base_q4 does Q4_K.
+        GgmlType::Iq2Xs => (TensorDtype::BaseQ2, 17u32),
+        GgmlType::Iq2S => (TensorDtype::BaseQ2, 22u32),
+        GgmlType::Iq3Xxs => (TensorDtype::BaseQ3, 18u32),
+        GgmlType::Iq3S => (TensorDtype::BaseQ3, 21u32),
+        // Unreachable: the caller gates on the same types.
         other => unreachable!("kquant passthrough called with {other:?}"),
     };
     // Same role-based routing the re-quantizing path uses: the
@@ -6252,7 +6340,8 @@ struct QuantContext {
     /// vocabulary (`mtp.draft_rank`), and `--mtp-draft-vocab`, its default K.
     mtp_draft_ranking: Option<Vec<u32>>,
     mtp_draft_vocab: Option<u32>,
-    /// Copy GGUF Q4_K/Q5_K/Q6_K super-blocks through verbatim.
+    /// Copy GGUF Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S super-blocks
+    /// through verbatim.
     kquant_passthrough: bool,
     /// Materialize `lm_head.weight` for tied models (`plan_tied_lm_head`);
     /// false under `--no-synth-tied-head`.
@@ -7592,7 +7681,10 @@ mod rope_permute_tests {
 
 #[cfg(test)]
 mod gguf_passthrough_tests {
-    use super::{kquant_passthrough_entry, rope_permute_rows, unpermute_rope_rows};
+    use super::{
+        kquant_passes_through, kquant_passthrough_entry, rope_permute_rows,
+        unconvertible_expert_stack, unpermute_rope_rows,
+    };
     use base_readers::gguf::{GgmlType, TensorInfo};
 
     /// GGUF dimension order: ne[0] is the fastest-varying (in-features)
@@ -7706,9 +7798,15 @@ mod gguf_passthrough_tests {
     fn passthrough_entry_describes_gguf_super_blocks() {
         use base_format::{ComputeRegion, Layout, TensorDtype};
         for (ty, want_dtype, want_code) in [
+            (GgmlType::Q3K, TensorDtype::BaseQ3, 11u32),
             (GgmlType::Q4K, TensorDtype::BaseQ4, 12u32),
             (GgmlType::Q5K, TensorDtype::BaseQ5, 13u32),
             (GgmlType::Q6K, TensorDtype::BaseQ6, 14u32),
+            (GgmlType::Iq4Xs, TensorDtype::BaseQ4, 23u32),
+            (GgmlType::Iq2Xs, TensorDtype::BaseQ2, 17u32),
+            (GgmlType::Iq2S, TensorDtype::BaseQ2, 22u32),
+            (GgmlType::Iq3Xxs, TensorDtype::BaseQ3, 18u32),
+            (GgmlType::Iq3S, TensorDtype::BaseQ3, 21u32),
         ] {
             let bytes: Vec<u8> = (0..64u8).collect();
             let (entry, data) = kquant_passthrough_entry(
@@ -7728,6 +7826,68 @@ mod gguf_passthrough_tests {
             assert_eq!(entry.scale_dtype, None);
             assert_eq!(entry.length, bytes.len() as u64);
             assert_eq!(entry.compute_region, ComputeRegion::Accelerator);
+        }
+    }
+
+    /// MoE expert stacks stay off the passthrough path whatever their type
+    /// (the expert GEMM has no k-quant kernels); dense and shared-expert
+    /// weights of the same types still pass through.
+    #[test]
+    fn expert_stacks_are_not_passed_through() {
+        for ty in [
+            GgmlType::Q3K,
+            GgmlType::Q4K,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+            GgmlType::Iq4Xs,
+            GgmlType::Iq2Xs,
+            GgmlType::Iq2S,
+            GgmlType::Iq3Xxs,
+            GgmlType::Iq3S,
+        ] {
+            for (name, want) in [
+                ("blk.0.attn_q.weight", true),
+                ("blk.0.ffn_gate_shexp.weight", true),
+                ("blk.0.ffn_gate_exps.weight", false),
+                ("blk.0.ffn_up_exps.weight", false),
+                ("blk.0.ffn_down_exps.weight", false),
+                ("blk.0.ffn_gate_up_exps.weight", false),
+            ] {
+                let t = TensorInfo {
+                    name: name.into(),
+                    ..info(256, 4, ty)
+                };
+                assert_eq!(kquant_passes_through(&t), want, "{ty:?} {name}");
+            }
+        }
+        assert!(!kquant_passes_through(&info(256, 4, GgmlType::F16)));
+        assert!(!kquant_passes_through(&info(256, 4, GgmlType::Q8_0)));
+    }
+
+    /// A grid i-quant expert stack is refused up front: it cannot pass
+    /// through and cannot be dequantized. A dequantizable one (Q4_K) and a
+    /// grid i-quant dense weight are not.
+    #[test]
+    fn grid_iquant_expert_stacks_are_refused() {
+        let named = |name: &str, ty: GgmlType| TensorInfo {
+            name: name.into(),
+            ..info(256, 4, ty)
+        };
+        let ok = vec![
+            named("blk.0.attn_q.weight", GgmlType::Iq2Xs),
+            named("blk.0.ffn_gate_exps.weight", GgmlType::Q4K),
+        ];
+        assert!(unconvertible_expert_stack(&ok).is_none());
+        for ty in [
+            GgmlType::Iq2Xs,
+            GgmlType::Iq2S,
+            GgmlType::Iq3Xxs,
+            GgmlType::Iq3S,
+        ] {
+            let mut tensors = ok.clone();
+            tensors.push(named("blk.0.ffn_down_exps.weight", ty));
+            let found = unconvertible_expert_stack(&tensors).map(|t| t.name.as_str());
+            assert_eq!(found, Some("blk.0.ffn_down_exps.weight"), "{ty:?}");
         }
     }
 
