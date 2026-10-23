@@ -418,6 +418,7 @@ fn auto_pull_and_resolve(
 
     cmd_pull(PullArgs {
         id: pull_id.clone(),
+        variant: None,
         profile: None,
         target,
         revision: "main".to_string(),
@@ -671,7 +672,39 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
 /// commands absent from this list (or from `basert --help`) still dispatch.
 const RUNTIME_COMMANDS: [&str; 5] = ["chat", "complete", "bench", "transcribe", "profile"];
 
-pub fn cmd_pull(args: PullArgs) -> Result<()> {
+/// Fold a `:variant` suffix on the id (or `--variant`) into the pull: the id
+/// loses the suffix and the variant's quant picks `--target`, the same mapping
+/// the run commands use when they auto-pull. Without this the suffix went to
+/// the Hub as part of the repo name (`basecompute/Qwen3-8B:default-q8@main` →
+/// 404). The inline form wins over the flag, as it does for `serve`/`chat`.
+fn apply_pull_variant(args: &mut PullArgs) -> Result<()> {
+    let (id, inline) = match args.id.split_once(':') {
+        Some((id, v)) => (id.to_string(), Some(v.to_string())),
+        None => (args.id.clone(), None),
+    };
+    if inline.as_deref() == Some("") {
+        bail!(
+            "empty variant after ':' in `{}` — name a variant (e.g. `{id}:default-q8`) \
+             or drop the colon",
+            args.id
+        );
+    }
+    if let Some(v) = inline.or_else(|| args.variant.clone()) {
+        if v.is_empty() {
+            bail!("`--variant` value is empty");
+        }
+        let quant = base_hub::registry::quant_bits(&v)
+            .map(str::to_string)
+            .unwrap_or_else(|| quant_tag(&v));
+        args.target = target_from_quant(&quant);
+        args.variant = Some(v);
+    }
+    args.id = id;
+    Ok(())
+}
+
+pub fn cmd_pull(mut args: PullArgs) -> Result<()> {
+    apply_pull_variant(&mut args)?;
     let reg = MergedRegistry::load()?;
     let root = reg.root.clone();
     let want = quant_token(&args);
@@ -1790,6 +1823,7 @@ mod tests {
         let root = tmp.path().join("cache");
         let args = PullArgs {
             id: "basecompute/m".into(),
+            variant: None,
             profile: None,
             target: TargetScheme::BaseQ4,
             revision: "main".into(),
@@ -1860,6 +1894,7 @@ mod tests {
         let root = tmp.path().join("cache");
         let args = PullArgs {
             id: "basecompute/m".into(),
+            variant: None,
             profile: None,
             target: TargetScheme::BaseQ8,
             revision: "main".into(),
@@ -2540,6 +2575,7 @@ mod tests {
 
         let args = PullArgs {
             id: "basecompute/m".into(),
+            variant: None,
             profile: None,
             target: TargetScheme::BaseQ4,
             revision: "main".into(),
@@ -2610,6 +2646,56 @@ mod tests {
             preconverted_id(&reg, "someorg/Definitely-Not-Catalogued-XYZ"),
             "someorg/Definitely-Not-Catalogued-XYZ"
         );
+    }
+
+    #[test]
+    fn apply_pull_variant_splits_inline_and_flag() {
+        let mk = |id: &str, variant: Option<&str>| PullArgs {
+            id: id.into(),
+            variant: variant.map(Into::into),
+            profile: None,
+            target: TargetScheme::BaseQ4,
+            revision: "main".into(),
+            force: false,
+            dry_run: false,
+        };
+
+        // Inline `:variant` comes off the id and picks the quant (#70).
+        let mut a = mk("basecompute/Qwen3-8B:default-q8", None);
+        apply_pull_variant(&mut a).unwrap();
+        assert_eq!(a.id, "basecompute/Qwen3-8B");
+        assert_eq!(a.target, TargetScheme::BaseQ8);
+        assert_eq!(quant_token(&a), "q8");
+
+        // `--variant` does the same.
+        let mut a = mk("basecompute/Qwen3-8B", Some("default-q8"));
+        apply_pull_variant(&mut a).unwrap();
+        assert_eq!(a.id, "basecompute/Qwen3-8B");
+        assert_eq!(a.target, TargetScheme::BaseQ8);
+
+        // Inline wins over the flag.
+        let mut a = mk("basecompute/Qwen3-8B:default-q8", Some("default-q4"));
+        apply_pull_variant(&mut a).unwrap();
+        assert_eq!(a.target, TargetScheme::BaseQ8);
+
+        // Backend-native names map by their bit width.
+        let mut a = mk("basecompute/Qwen3-8B:cuda-q4mix", None);
+        apply_pull_variant(&mut a).unwrap();
+        assert_eq!(a.target, TargetScheme::BaseQ4);
+        let mut a = mk("basecompute/gpt-oss-20b:default-mxfp4", None);
+        apply_pull_variant(&mut a).unwrap();
+        assert_eq!(a.target, TargetScheme::Mxfp4);
+
+        // No variant: id and `--target` untouched.
+        let mut a = mk("basecompute/Qwen3-8B", None);
+        a.target = TargetScheme::BaseQ6;
+        apply_pull_variant(&mut a).unwrap();
+        assert_eq!(a.id, "basecompute/Qwen3-8B");
+        assert_eq!(a.target, TargetScheme::BaseQ6);
+
+        // A trailing colon or an empty flag is an error, not a silent q4.
+        assert!(apply_pull_variant(&mut mk("basecompute/Qwen3-8B:", None)).is_err());
+        assert!(apply_pull_variant(&mut mk("basecompute/Qwen3-8B", Some(""))).is_err());
     }
 
     #[test]
@@ -2909,6 +2995,7 @@ mod tests {
     fn choose_profile_uses_bundled_for_q4_q6_and_q8() {
         let mk = |t| PullArgs {
             id: "x/y".into(),
+            variant: None,
             profile: None,
             target: t,
             revision: "main".into(),
