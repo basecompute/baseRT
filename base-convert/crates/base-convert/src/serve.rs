@@ -1,7 +1,7 @@
 //! `basert serve`: the command line basert-serve has always had (the C++
 //! server's, flag for flag), run on superfluid. The launcher reads the
-//! command line, finds the engine library and the pinned superfluid release
-//! beside itself (installing it if asked, see [`crate::superfluid`]), and
+//! command line, finds the engine library and a superfluid beside itself
+//! (installing the newest release if asked, see [`crate::superfluid`]), and
 //! execs `superfluid serve` with baseRT's models only, nothing fetched, and a
 //! request log that starts fresh with each start: the server basert-serve has
 //! always been.
@@ -22,9 +22,10 @@ Usage: basert serve <model> [--model <model2> ...] [options]
 
   The server is superfluid (https://github.com/basecompute/superfluid). basert
   runs the one installed beside it or in its own data directory, installing
-  the release it was tested with when there is none, or when the one found
-  cannot serve this engine: asked first on a terminal, without asking
-  otherwise, never with BASERT_SUPERFLUID_AUTO_INSTALL=0.
+  the newest release that serves this engine when there is none, or when the
+  one found cannot serve it (the release basert was tested with when GitHub
+  cannot be read): asked first on a terminal, without asking otherwise, never
+  with BASERT_SUPERFLUID_AUTO_INSTALL=0.
   `basert superfluid install` does it ahead of time, and
   `basert superfluid status` shows what is installed and whether it can serve.
 
@@ -94,8 +95,10 @@ State (the request log, uploaded files) is kept under $BASERT_STATE_DIR, by
 default the serve/ directory beside the model cache, one directory per port.
 The engine library is found beside basert (or in ../lib); BASERT_LIB names
 another directory. BASERT_SUPERFLUID_DIR names where superfluid is installed;
-BASERT_SUPERFLUID_SOURCE a directory holding its release tarball, read instead
-of GitHub; BASERT_SUPERFLUID_AUTO_INSTALL=0 forbids a download at a start.
+BASERT_SUPERFLUID_RELEASES another release listing (a URL or a file);
+BASERT_SUPERFLUID_SOURCE a directory holding the tested release's tarball,
+read instead of GitHub; BASERT_SUPERFLUID_AUTO_INSTALL=0 forbids a download
+at a start.
 ";
 
 /// Flags every start hands superfluid; one given on the command line too is
@@ -432,7 +435,7 @@ pub fn run(rest: &[String]) -> Result<()> {
                 i.binary().display()
             ),
             None => println!(
-                "superfluid {} pinned, not installed (`basert superfluid install`)",
+                "superfluid not installed (`basert superfluid install` installs the newest release; tested with {})",
                 superfluid::RELEASE
             ),
         }
@@ -504,10 +507,7 @@ pub fn run(rest: &[String]) -> Result<()> {
     if o.print_command {
         let binary = match superfluid::Install::locate()? {
             Some(i) => i.binary().display().to_string(),
-            None => format!(
-                "superfluid (not installed; {} would be)",
-                superfluid::RELEASE
-            ),
+            None => "superfluid (not installed; the newest release would be)".to_string(),
         };
         let mut words = vec![binary, "serve".to_string()];
         words.extend(superfluid_args(&o, &sessions));

@@ -1,7 +1,8 @@
 //! `basert serve` and `basert superfluid`, end to end against a fake superfluid
-//! release: the launcher installs it from a directory of release assets, asks
-//! it whether it can serve the engine, brings one that cannot to the pin, and
-//! execs it with the C++ server's command line translated to superfluid's.
+//! release: the launcher installs it from a directory of release assets, or
+//! the newest a release listing names, asks it whether it can serve the
+//! engine, replaces one that cannot, and execs it with the C++ server's
+//! command line translated to superfluid's.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -173,13 +174,134 @@ fn run(command: &mut Command) -> (i32, String, String) {
     )
 }
 
-/// The pinned release, as `basert superfluid status` prints it.
+/// The release basert was tested with, as `basert superfluid status` prints
+/// it: what a directory of release assets holds.
 fn pinned(f: &Fixture) -> String {
     let (_, out, _) = run(f.basert().args(["superfluid", "status"]));
     out.lines()
-        .find_map(|l| l.strip_prefix("pinned:"))
+        .find_map(|l| l.strip_prefix("tested:"))
         .map(|v| v.trim().to_string())
-        .unwrap_or_else(|| panic!("no pinned line in {out:?}"))
+        .unwrap_or_else(|| panic!("no tested line in {out:?}"))
+}
+
+/// Serves the files under `root` over HTTP on 127.0.0.1 while the test runs,
+/// as GitHub serves a release's assets; returns the base URL.
+fn serve_files(root: PathBuf) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            if reader.read_line(&mut request).is_err() {
+                continue;
+            }
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                line.clear();
+            }
+            let path = request.split_whitespace().nth(1).unwrap_or("/");
+            let _ = match fs::read(root.join(path.trim_start_matches('/'))) {
+                Ok(body) => write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .and_then(|_| stream.write_all(&body)),
+                Err(_) => write!(
+                    stream,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+            };
+        }
+    });
+    base
+}
+
+#[test]
+fn without_superfluid_the_newest_release_that_serves_the_engine_is_installed() {
+    let f = fixture();
+    // A mirror's layout: each checksum in another directory than its tarball.
+    let www = f.tmp.path().join("www");
+    for version in ["1.2.0", "2.0.0"] {
+        let assets = release_assets(&f.tmp.path().join(format!("release-{version}")), version);
+        for entry in fs::read_dir(&assets).unwrap() {
+            let entry = entry.unwrap();
+            let kind = match entry.path().extension().and_then(|e| e.to_str()) {
+                Some("sha256") => "checksums",
+                _ => "files",
+            };
+            let dir = www.join(kind).join(format!("v{version}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::copy(entry.path(), dir.join(entry.file_name())).unwrap();
+        }
+    }
+    let base = serve_files(www);
+    let name = format!("superfluid-{}", target());
+    let release = |tag: &str, abi: u32| {
+        serde_json::json!({"tag_name": tag, "draft": false, "prerelease": false, "assets": [
+            {"name": format!("{name}.tar.gz"), "browser_download_url": format!("{base}/files/{tag}/{name}.tar.gz")},
+            {"name": format!("{name}.tar.gz.sha256"), "browser_download_url": format!("{base}/checksums/{tag}/{name}.tar.gz.sha256")},
+            {"name": format!("superfluid-basert-abi-{abi}.txt"), "browser_download_url": format!("{base}/{tag}/abi")},
+        ]})
+    };
+    // 2.0.0 serves another engine ABI: 1.2.0 is the newest that serves this one.
+    let listing = f.tmp.path().join("releases.json");
+    let list = |releases: Vec<serde_json::Value>| {
+        fs::write(&listing, serde_json::Value::from(releases).to_string()).unwrap()
+    };
+    list(vec![
+        release("v2.0.0", 2),
+        release("v1.2.0", 1),
+        release("v1.1.0", 1),
+    ]);
+    let basert = || {
+        let mut c = f.basert();
+        c.env_remove("BASERT_SUPERFLUID_SOURCE")
+            .env("BASERT_SUPERFLUID_RELEASES", &listing);
+        c
+    };
+
+    let (code, out, err) = run(basert()
+        .env("BASERT_SUPERFLUID_AUTO_INSTALL", "0")
+        .args(["serve", f.model()]));
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(err.contains("superfluid is not installed"), "{err}");
+    assert!(
+        !err.contains("v1.2.0"),
+        "a start forbidden to download looks nothing up: {err}"
+    );
+
+    let (code, out, err) = run(basert().args(["serve", f.model()]));
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        err.contains("basert serve: installing superfluid v1.2.0 into"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "downloading superfluid v1.2.0 ({name}.tar.gz) from {base}/files/v1.2.0/{name}.tar.gz"
+        )),
+        "{err}"
+    );
+    assert_eq!(f.stamp(), "v1.2.0");
+    assert!(out.contains("ARGS: serve"), "{out}");
+
+    let (code, out, _) = run(basert().args(["superfluid", "install"]));
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("superfluid v1.2.0 is installed at"), "{out}");
+
+    // A listing whose newest is older than the install downgrades nothing.
+    list(vec![release("v1.1.0", 1)]);
+    let (code, out, err) = run(basert().args(["superfluid", "install"]));
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        out.contains("newer than v1.1.0: nothing is downgraded"),
+        "{out}"
+    );
+    assert_eq!(f.stamp(), "v1.2.0");
 }
 
 #[test]

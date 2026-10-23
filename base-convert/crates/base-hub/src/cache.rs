@@ -137,6 +137,10 @@ pub struct HubSidecar {
     /// sha256 of the installed `model.base`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sha256: Option<String>,
+    /// The repo file a pre-converted `.base` was taken from, so a later
+    /// `pull --file` can tell its own file from another with the same tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// Write the provenance sidecar into a variant directory (creates the dir).
@@ -244,6 +248,7 @@ mod tests {
             profile: Some("default-q4".into()),
             pulled_at: "2026-06-24T00:00:00Z".into(),
             base_sha256: None,
+            file: None,
         };
         write_sidecar(&vdir, &s).unwrap();
         let back = read_sidecar(&vdir).unwrap().unwrap();

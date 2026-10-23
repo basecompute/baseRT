@@ -102,6 +102,10 @@ pub struct ModelEntry {
     pub source_kind: SourceKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// The repo file the `.base` was pulled from (`hub.json`), or that a
+    /// catalog row publishes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// Common interface implemented by each individual source.
@@ -200,6 +204,10 @@ impl LocalRegistry {
             installed: true,
             source_kind: SourceKind::Local,
             path: Some(artifact.to_path_buf()),
+            file: cache::read_sidecar(variant_dir)
+                .ok()
+                .flatten()
+                .and_then(|s| s.file),
         })
     }
 
@@ -257,7 +265,8 @@ impl CatalogRegistry {
         }
     }
 
-    fn backend_ok(e: &crate::catalog::CatalogEntry) -> bool {
+    /// Whether this client can run `e`: a universal row, or one for its backend.
+    pub fn backend_ok(e: &crate::catalog::CatalogEntry) -> bool {
         e.backend
             .as_deref()
             .map(|b| b == Self::client_backend())
@@ -289,6 +298,34 @@ impl CatalogRegistry {
             Some(b) => b == w,
             None => entry_quant == want,
         }
+    }
+
+    /// The catalog row for `id` (exact id first, then case-insensitive),
+    /// whatever its quant or backend: where `pull --file` finds the repo a
+    /// cataloged id's files live in.
+    pub fn entry(&self, id: &str) -> Option<&crate::catalog::CatalogEntry> {
+        let rows = &self.catalog.models;
+        rows.iter()
+            .find(|e| e.id == id)
+            .or_else(|| rows.iter().find(|e| e.id.eq_ignore_ascii_case(id)))
+    }
+
+    /// Every catalog row of `id`, whatever its quant or backend: where a
+    /// `pull --file` finds the variant and checksums of a file the catalog
+    /// publishes. Rows of the exact id when there are any, else its
+    /// case-insensitive aliases, as resolution prefers.
+    pub fn rows<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> impl Iterator<Item = &'a crate::catalog::CatalogEntry> {
+        let exact = self.catalog.models.iter().any(|e| e.id == id);
+        self.catalog.models.iter().filter(move |e| {
+            if exact {
+                e.id == id
+            } else {
+                e.id.eq_ignore_ascii_case(id)
+            }
+        })
     }
 
     /// Quant-agnostic, backend-aware resolve.
@@ -411,6 +448,7 @@ impl Registry for CatalogRegistry {
                 installed: false,
                 source_kind: SourceKind::Catalog,
                 path: None,
+                file: Some(e.file.clone()).filter(|f| !f.is_empty()),
             })
             .collect())
     }
@@ -808,6 +846,21 @@ mod tests {
             ModelRef::Catalog { hf_repo, .. } => assert_eq!(hf_repo, "basecompute/exact"),
             other => panic!("exact id must win, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rows_prefer_the_exact_id_over_case_aliases() {
+        let reg = catalog_json(
+            r#"{"id":"basecompute/CamelModel","hf_repo":"basecompute/alias","file":"alias-Q4.base","quant":"default-q4"},
+               {"id":"basecompute/camelmodel","hf_repo":"basecompute/exact","file":"exact-Q4.base","quant":"default-q4"}"#,
+        );
+        let repos = |id| reg.rows(id).map(|e| e.hf_repo.as_str()).collect::<Vec<_>>();
+        assert_eq!(repos("basecompute/camelmodel"), ["basecompute/exact"]);
+        assert_eq!(repos("basecompute/CamelModel"), ["basecompute/alias"]);
+        assert_eq!(
+            repos("basecompute/CAMELMODEL"),
+            ["basecompute/alias", "basecompute/exact"]
+        );
     }
 
     #[test]
