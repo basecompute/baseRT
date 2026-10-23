@@ -382,6 +382,13 @@ struct PullArgs {
     /// HF revision / branch / tag.
     #[arg(long, default_value = "main")]
     revision: String,
+    /// Take this `.base` file from the repo (e.g. `Foo-Medium.base`) rather
+    /// than picking one by quant — for repos whose `.base` files are not
+    /// named by quant. A file the catalog lists installs under its catalog
+    /// variant; any other under one of its own (`file-foo-medium-<hash>`),
+    /// which `basert list --json` shows beside the file.
+    #[arg(long)]
+    file: Option<String>,
     /// Re-download / re-convert even if already cached.
     #[arg(long)]
     force: bool,

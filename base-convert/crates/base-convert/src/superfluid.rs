@@ -5,10 +5,12 @@
 //! installs for itself at a start. Which superfluid may serve this engine is
 //! superfluid's own call: before a start the launcher asks each install it
 //! finds (`superfluid runtimes --json`, the engine library named) whether its
-//! basert runtime is ready, and runs the first that is. One that is not, and
-//! is not the pinned release, is brought to the pin. The pin ([`RELEASE`]) is
-//! the release this basert was tested with; a newer one the probe accepts
-//! runs as it is, and nothing is ever downgraded.
+//! basert runtime is ready, and runs the first that is, whatever its release:
+//! nothing is ever downgraded. When none is installed, or none can serve, the
+//! newest release that states this engine's ABI number beside its tarballs
+//! (`superfluid-basert-abi-<N>.txt`) is installed, or the release this basert
+//! was tested with ([`RELEASE`]) when the release listing cannot be read or
+//! names none.
 //!
 //! Where superfluid is looked for, in order: `$BASERT_SUPERFLUID_DIR`;
 //! `superfluid/` beside basert, the one-shot installer's layout; a directory
@@ -22,10 +24,10 @@
 //! otherwise, since an older Local calls `basert serve` without knowing
 //! superfluid exists; `$BASERT_SUPERFLUID_AUTO_INSTALL=0` forbids it, and the
 //! command to run is named instead. `basert superfluid install` installs
-//! ahead of time; `$BASERT_SUPERFLUID_SOURCE` names a directory holding the
-//! release's tarball and checksum, read instead of GitHub.
+//! ahead of time; `$BASERT_SUPERFLUID_RELEASES` names another release listing
+//! (a mirror's, a file), and `$BASERT_SUPERFLUID_SOURCE` a directory holding
+//! the tested release's tarball and checksum, read instead of GitHub.
 
-use std::fmt;
 use std::fs;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -37,11 +39,20 @@ use clap::{Args, Subcommand};
 use sha2::{Digest, Sha256};
 
 /// The superfluid release this basert was tested with, a tag of
-/// <https://github.com/basecompute/superfluid/releases>: installed when
-/// none is found, or when the one found cannot serve this engine.
+/// <https://github.com/basecompute/superfluid/releases>: installed instead
+/// of the newest when the release listing cannot be read or names no release
+/// for this engine, and the release a `$BASERT_SUPERFLUID_SOURCE` holds.
 pub const RELEASE: &str = "v0.1.3";
 
+/// `BASERT_ABI_VERSION` of the engine shipped beside this basert, which a
+/// superfluid release names when it serves it (`superfluid-basert-abi-<N>.txt`).
+pub const ENGINE_ABI: u32 = 1;
+
 const REPO: &str = "basecompute/superfluid";
+/// The releases the newest superfluid is chosen from, newest first.
+const RELEASES: &str = "https://api.github.com/repos/basecompute/superfluid/releases?per_page=30";
+/// Another release listing in GitHub's form, a URL or a file: a mirror's, or the tests'.
+pub const RELEASES_ENV: &str = "BASERT_SUPERFLUID_RELEASES";
 /// Where superfluid is installed, instead of the places looked in by default.
 pub const DIR_ENV: &str = "BASERT_SUPERFLUID_DIR";
 /// A directory holding the release's tarball and its `.sha256`, read instead
@@ -64,44 +75,53 @@ pub struct SuperfluidArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum Action {
-    /// Install the pinned superfluid release where `basert serve` looks for
-    /// it (nothing to do when it is already there).
+    /// Install the newest superfluid release that serves this engine where
+    /// `basert serve` looks for it (nothing to do when it is already there).
     Install {
-        /// Install again even when the pinned release is already there.
+        /// Install again even when that release, or a newer one, is there.
         #[arg(long)]
         force: bool,
     },
-    /// Show the pinned release, what is installed where, and whether it can
-    /// serve the engine beside basert. Exits 0 when an installed superfluid
-    /// can, 1 when none is installed, 2 when the installed one cannot.
+    /// Show the release this basert was tested with, what is installed where,
+    /// and whether it can serve the engine beside basert. Exits 0 when an
+    /// installed superfluid can, 1 when none is installed, 2 when the
+    /// installed one cannot.
     Status,
 }
 
 pub fn cmd(args: SuperfluidArgs) -> Result<()> {
     match args.action {
         Action::Install { force } => {
+            let source = Source::locate();
+            let release = wanted(&source, &mut |line| eprintln!("{line}"));
+            let tag = &release.tag;
             let dest = match Install::locate()? {
-                Some(i) if !force && i.installed_release().as_deref() == Some(RELEASE) => {
-                    println!("superfluid {RELEASE} is installed at {}", i.root.display());
+                Some(i) if !force && i.installed_release().as_deref() == Some(tag.as_str()) => {
+                    println!("superfluid {tag} is installed at {}", i.root.display());
+                    return Ok(());
+                }
+                Some(i) if !force && newer(i.installed_release().as_deref(), tag) => {
+                    println!(
+                        "superfluid {} is installed at {}, newer than {tag}: nothing is downgraded (--force installs {tag})",
+                        i.installed_release().unwrap_or_default(),
+                        i.root.display()
+                    );
                     return Ok(());
                 }
                 Some(i) if i.writable() => i,
                 _ => Install::for_install()?,
             };
-            dest.install(&Source::locate(), &mut |line| eprintln!("{line}"))?;
-            println!(
-                "superfluid {RELEASE} is installed at {}",
-                dest.root.display()
-            );
+            dest.install(&source, &release, &mut |line| eprintln!("{line}"))?;
+            println!("superfluid {tag} is installed at {}", dest.root.display());
             Ok(())
         }
         Action::Status => {
-            println!("pinned:    {RELEASE}");
+            println!("tested:    {RELEASE}");
             let code = match Install::locate()? {
                 None => {
                     let dest = Install::for_install()?;
                     println!(
-                        "installed: nothing (`basert superfluid install` puts {RELEASE} at {})",
+                        "installed: nothing (`basert superfluid install` puts the newest release at {})",
                         dest.root.display()
                     );
                     1
@@ -302,11 +322,17 @@ impl Install {
         }
     }
 
-    /// Download the pinned release, check its SHA-256 against the one the
-    /// release publishes, unpack it beside the install and swap it in. An
-    /// install that is there stays until the new one is complete, and comes
-    /// back if the swap fails.
-    pub fn install(&self, source: &Source, say: &mut dyn FnMut(&str)) -> Result<()> {
+    /// Download `release`, check its SHA-256 against the one the release
+    /// publishes, unpack it beside the install and swap it in. An install
+    /// that is there stays until the new one is complete, and comes back if
+    /// the swap fails.
+    pub fn install(
+        &self,
+        source: &Source,
+        release: &Release,
+        say: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        let tag = &release.tag;
         let name = format!("superfluid-{}", target()?);
         let parent = self.parent();
         fs::create_dir_all(&parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -319,10 +345,11 @@ impl Install {
         let checksum = stage.path().join(format!("{name}.tar.gz.sha256"));
 
         say(&format!(
-            "downloading superfluid {RELEASE} ({name}.tar.gz) from {source}"
+            "downloading superfluid {tag} ({name}.tar.gz) from {}",
+            source.describe(release, &format!("{name}.tar.gz"))
         ));
-        source.fetch(&format!("{name}.tar.gz"), &tarball)?;
-        source.fetch(&format!("{name}.tar.gz.sha256"), &checksum)?;
+        source.fetch(release, &format!("{name}.tar.gz"), &tarball)?;
+        source.fetch(release, &format!("{name}.tar.gz.sha256"), &checksum)?;
         let want = fs::read_to_string(&checksum)
             .with_context(|| format!("reading {}", checksum.display()))?
             .split_whitespace()
@@ -353,7 +380,7 @@ impl Install {
         if !is_executable(&fresh.join("bin").join("superfluid")) {
             bail!("{name}.tar.gz holds no {name}/bin/superfluid");
         }
-        fs::write(fresh.join(STAMP), format!("{RELEASE}\n"))?;
+        fs::write(fresh.join(STAMP), format!("{tag}\n"))?;
 
         let old = parent.join(format!(".superfluid-old-{}", std::process::id()));
         let had_old = self.root.exists();
@@ -376,7 +403,7 @@ impl Install {
             let _ = fs::remove_dir_all(&old);
         }
         say(&format!(
-            "installed superfluid {RELEASE} at {}",
+            "installed superfluid {tag} at {}",
             self.root.display()
         ));
         Ok(())
@@ -439,10 +466,42 @@ impl Probe {
 
 /// Where a release's files come from.
 pub enum Source {
-    /// The release's assets on GitHub.
+    /// The release's assets on GitHub, or where the listing that named it
+    /// says they are.
     GitHub,
     /// A directory holding the tarball and its `.sha256` ([`SOURCE_ENV`]).
     Dir(PathBuf),
+}
+
+/// A superfluid release to install: its tag, and the URL of each asset its
+/// listing gave, by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    pub tag: String,
+    urls: Vec<(String, String)>,
+}
+
+impl Release {
+    /// [`RELEASE`], on GitHub.
+    pub fn tested() -> Release {
+        Release {
+            tag: RELEASE.to_string(),
+            urls: Vec::new(),
+        }
+    }
+
+    /// Where the asset `file` is: the URL the listing gave for it, else
+    /// GitHub's download URL for this tag. A mirror may keep a checksum
+    /// elsewhere than its tarball.
+    fn url(&self, file: &str) -> String {
+        match self.urls.iter().find(|(name, _)| name == file) {
+            Some((_, url)) => url.clone(),
+            None => format!(
+                "https://github.com/{REPO}/releases/download/{}/{file}",
+                self.tag
+            ),
+        }
+    }
 }
 
 impl Source {
@@ -453,7 +512,7 @@ impl Source {
         }
     }
 
-    fn fetch(&self, file: &str, dest: &Path) -> Result<()> {
+    fn fetch(&self, release: &Release, file: &str, dest: &Path) -> Result<()> {
         match self {
             Source::Dir(dir) => {
                 let from = dir.join(file);
@@ -462,17 +521,10 @@ impl Source {
                     .map(|_| ())
             }
             Source::GitHub => {
-                let url = format!("https://github.com/{REPO}/releases/download/{RELEASE}/{file}");
+                let url = release.url(file);
                 // GitHub answers an asset with a redirect to its storage, which
-                // the agent follows. A server that goes quiet fails the install
-                // rather than hanging a `basert serve` start.
-                let agent: ureq::Agent = ureq::Agent::config_builder()
-                    .timeout_connect(Some(Duration::from_secs(30)))
-                    .timeout_recv_response(Some(Duration::from_secs(60)))
-                    .timeout_recv_body(Some(Duration::from_secs(600)))
-                    .build()
-                    .into();
-                let response = agent
+                // the agent follows.
+                let response = agent(Duration::from_secs(600))
                     .get(&url)
                     .call()
                     .with_context(|| format!("downloading {url}"))?;
@@ -486,12 +538,109 @@ impl Source {
     }
 }
 
-impl fmt::Display for Source {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Source {
+    /// Where `file` of `release` comes from, for a message.
+    fn describe(&self, release: &Release, file: &str) -> String {
         match self {
-            Source::GitHub => write!(f, "https://github.com/{REPO}/releases/tag/{RELEASE}"),
-            Source::Dir(dir) => write!(f, "{}", dir.display()),
+            Source::GitHub => release.url(file),
+            Source::Dir(dir) => dir.display().to_string(),
         }
+    }
+}
+
+/// An HTTP agent whose server, gone quiet, fails the request rather than
+/// hanging a `basert serve` start; a body may take up to `body`.
+fn agent(body: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(Duration::from_secs(60)))
+        .timeout_recv_body(Some(body))
+        .build()
+        .into()
+}
+
+/// The release a start, or `basert superfluid install`, installs from
+/// `source`: from GitHub the newest that serves this engine, else the one
+/// this basert was tested with, saying why; from a directory, the one it holds.
+pub fn wanted(source: &Source, say: &mut dyn FnMut(&str)) -> Release {
+    if let Source::Dir(_) = source {
+        return Release::tested();
+    }
+    let found = target().and_then(|target| {
+        let listing = releases()?;
+        newest_in(&listing, target, ENGINE_ABI).with_context(|| {
+            format!("no superfluid release there serves engine ABI {ENGINE_ABI} on {target}")
+        })
+    });
+    found.unwrap_or_else(|why| {
+        say(&format!(
+            "the newest superfluid release could not be chosen ({why:#}); {RELEASE}, the release this basert was tested with, is installed"
+        ));
+        Release::tested()
+    })
+}
+
+/// superfluid's release listing, or the one `$BASERT_SUPERFLUID_RELEASES` names.
+fn releases() -> Result<serde_json::Value> {
+    let named = std::env::var(RELEASES_ENV).ok().filter(|v| !v.is_empty());
+    let at = named.as_deref().unwrap_or(RELEASES);
+    let text = if at.starts_with("https://") || at.starts_with("http://") {
+        agent(Duration::from_secs(60))
+            .get(at)
+            .header("Accept", "application/vnd.github+json")
+            .call()
+            .and_then(|r| r.into_body().read_to_string())
+            .with_context(|| format!("reading the release listing {at}"))?
+    } else {
+        fs::read_to_string(at).with_context(|| format!("reading the release listing {at}"))?
+    };
+    serde_json::from_str(&text).with_context(|| format!("the release listing {at}"))
+}
+
+/// The newest release in a listing of GitHub's form that is neither a draft
+/// nor a pre-release and publishes, for `target`, the tarball, its checksum
+/// and the marker of engine ABI `abi`.
+pub fn newest_in(listing: &serde_json::Value, target: &str, abi: u32) -> Option<Release> {
+    let tarball = format!("superfluid-{target}.tar.gz");
+    let checksum = format!("{tarball}.sha256");
+    let marker = format!("superfluid-basert-abi-{abi}.txt");
+    listing
+        .as_array()?
+        .iter()
+        .filter(|r| !r["draft"].as_bool().unwrap_or(false))
+        .filter(|r| !r["prerelease"].as_bool().unwrap_or(false))
+        .filter_map(|r| {
+            let tag = r["tag_name"].as_str()?;
+            let assets = r["assets"].as_array()?;
+            let named = |name: &str| assets.iter().find(|a| a["name"] == name);
+            let url = |name: &str| -> Option<(String, String)> {
+                let at = named(name)?["browser_download_url"].as_str()?;
+                Some((name.to_string(), at.to_string()))
+            };
+            named(&marker)?;
+            Some((
+                release_key(tag)?,
+                Release {
+                    tag: tag.to_string(),
+                    urls: vec![url(&tarball)?, url(&checksum)?],
+                },
+            ))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, release)| release)
+}
+
+/// `v0.1.3` as `[0, 1, 3]`; `None` for a tag that is not a release number.
+fn release_key(tag: &str) -> Option<Vec<u64>> {
+    let digits = tag.strip_prefix('v').unwrap_or(tag);
+    digits.split('.').map(|part| part.parse().ok()).collect()
+}
+
+/// Whether the release `have` is newer than `than`.
+fn newer(have: Option<&str>, than: &str) -> bool {
+    match (have.and_then(release_key), release_key(than)) {
+        (Some(have), Some(than)) => have > than,
+        _ => false,
     }
 }
 
@@ -539,69 +688,91 @@ pub fn ensure_with(
     home: &Path,
     say: &mut dyn FnMut(&str),
 ) -> Result<PathBuf> {
-    // Every install found is asked; the first that can serve runs. An install
-    // that cannot and is the pin itself makes the engine the problem, which no
-    // download mends.
-    let mut unready: Vec<Install> = Vec::new();
+    // Every install found is asked; the first that can serve runs.
+    let mut unready: Vec<(Install, Option<String>, String)> = Vec::new();
     for install in Install::candidates()?
         .into_iter()
         .filter(Install::is_installed)
     {
-        let why = match install.probe(engine, Some(home)).ready {
+        match install.probe(engine, Some(home)).ready {
             Ok(()) => return Ok(install.binary()),
-            Err(why) => why,
-        };
-        let have = install.installed_release();
-        if have.as_deref() == Some(RELEASE) {
+            Err(why) => {
+                let have = install.installed_release();
+                unready.push((install, have, why));
+            }
+        }
+    }
+    // Looked up only when it may be downloaded: a start forbidden to download
+    // does not wait on GitHub.
+    let release = match policy {
+        Download::Never => None,
+        Download::Ask | Download::Auto => Some(wanted(source, say)),
+    };
+    let tag = release
+        .as_ref()
+        .map_or(RELEASE, |r| r.tag.as_str())
+        .to_string();
+    for (install, have, why) in &unready {
+        // An install that cannot serve and is the release itself makes the
+        // engine the problem, which no download mends.
+        if have.as_deref() == Some(tag.as_str()) {
             bail!(
-                "superfluid {RELEASE} at {} cannot serve this engine: {why}",
+                "superfluid {tag} at {} cannot serve this engine: {why}",
                 install.root.display()
             );
         }
         say(&format!(
-            "superfluid {} at {} cannot serve this engine ({why}); {RELEASE} can",
+            "superfluid {} at {} cannot serve this engine ({why}){}",
             have.as_deref().unwrap_or("of a release it does not say"),
-            install.root.display()
+            install.root.display(),
+            if release.is_some() {
+                format!("; {tag} can")
+            } else {
+                String::new()
+            }
         ));
-        unready.push(install);
     }
-    let dest = match unready.iter().find(|i| i.writable()) {
+    let dest = match unready.iter().map(|(i, _, _)| i).find(|i| i.writable()) {
         Some(found) => found.clone(),
         None => Install::for_install()?,
     };
     let hint = format!(
-        "install it with\n  basert superfluid install\n(superfluid {RELEASE} from \
-         https://github.com/{REPO}/releases, into {})",
+        "install it with\n  basert superfluid install\n(the newest superfluid release that serves \
+         this engine, from https://github.com/{REPO}/releases, into {})",
         dest.root.display()
     );
-    match policy {
-        Download::Never => {
+    let release = match (policy, release) {
+        (Download::Never, _) | (_, None) => {
             if unready.is_empty() {
                 bail!("superfluid is not installed, and {AUTO_INSTALL_ENV}=0 forbids a download at a start; {hint}");
             }
             bail!("{AUTO_INSTALL_ENV}=0 forbids a download at a start; {hint}");
         }
-        Download::Ask => {
+        (Download::Ask, Some(release)) => {
             if unready.is_empty() {
                 eprintln!("basert serve runs superfluid, which is not installed.");
             }
             if !confirm(&format!(
-                "Download and install superfluid {RELEASE} into {} now? [Y/n] ",
+                "Download and install superfluid {tag} into {} now? [Y/n] ",
                 dest.root.display()
             ))? {
-                bail!("superfluid {RELEASE} is not installed; {hint}");
+                bail!("superfluid {tag} is not installed; {hint}");
             }
+            release
         }
-        Download::Auto => say(&format!(
-            "installing superfluid {RELEASE} into {} ({AUTO_INSTALL_ENV}=0 forbids this)",
-            dest.root.display()
-        )),
-    }
-    dest.install(source, say)?;
+        (Download::Auto, Some(release)) => {
+            say(&format!(
+                "installing superfluid {tag} into {} ({AUTO_INSTALL_ENV}=0 forbids this)",
+                dest.root.display()
+            ));
+            release
+        }
+    };
+    dest.install(source, &release, say)?;
     match dest.probe(engine, Some(home)).ready {
         Ok(()) => Ok(dest.binary()),
         Err(why) => bail!(
-            "superfluid {RELEASE}, installed at {}, cannot serve this engine: {why}",
+            "superfluid {tag}, installed at {}, cannot serve this engine: {why}",
             dest.root.display()
         ),
     }
@@ -713,7 +884,9 @@ mod tests {
         assert_eq!(install.installed_release(), None);
         let mut said = Vec::new();
         install
-            .install(&Source::Dir(assets), &mut |l| said.push(l.to_string()))
+            .install(&Source::Dir(assets), &Release::tested(), &mut |l| {
+                said.push(l.to_string())
+            })
             .unwrap();
         assert!(install.is_installed());
         assert!(install
@@ -739,10 +912,12 @@ mod tests {
         let good = release(&tmp.path().join("good"), "0.1.3", true);
         let bad = release(&tmp.path().join("bad"), "0.1.3", false);
         let install = install_at(tmp.path().join("superfluid"));
-        install.install(&Source::Dir(good), &mut |_| {}).unwrap();
+        install
+            .install(&Source::Dir(good), &Release::tested(), &mut |_| {})
+            .unwrap();
         fs::write(install.root.join("marker"), "kept").unwrap();
         let err = install
-            .install(&Source::Dir(bad), &mut |_| {})
+            .install(&Source::Dir(bad), &Release::tested(), &mut |_| {})
             .unwrap_err()
             .to_string();
         assert!(
@@ -761,7 +936,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let install = install_at(tmp.path().join("superfluid"));
         let err = install
-            .install(&Source::Dir(tmp.path().join("nowhere")), &mut |_| {})
+            .install(
+                &Source::Dir(tmp.path().join("nowhere")),
+                &Release::tested(),
+                &mut |_| {},
+            )
             .unwrap_err()
             .to_string();
         assert!(err.contains("copying") && err.contains(".tar.gz"), "{err}");
@@ -773,14 +952,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let assets = release(tmp.path(), "0.0.9", true);
         let install = install_at(tmp.path().join("superfluid"));
-        install.install(&Source::Dir(assets), &mut |_| {}).unwrap();
+        install
+            .install(&Source::Dir(assets), &Release::tested(), &mut |_| {})
+            .unwrap();
         assert_eq!(install.installed_release().as_deref(), Some(RELEASE));
         // A copy put here by hand has no stamp: the binary is asked.
         fs::remove_file(install.root.join(STAMP)).unwrap();
         assert_eq!(install.installed_release().as_deref(), Some("v0.0.9"));
         // A second install replaces it, stamp included.
         let newer = release(&tmp.path().join("again"), "0.1.3", true);
-        install.install(&Source::Dir(newer), &mut |_| {}).unwrap();
+        install
+            .install(&Source::Dir(newer), &Release::tested(), &mut |_| {})
+            .unwrap();
         assert_eq!(install.installed_release().as_deref(), Some(RELEASE));
         assert!(!tmp
             .path()
@@ -864,7 +1047,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let assets = release(tmp.path(), "0.1.3", true);
         let install = install_at(tmp.path().join("superfluid"));
-        install.install(&Source::Dir(assets), &mut |_| {}).unwrap();
+        install
+            .install(&Source::Dir(assets), &Release::tested(), &mut |_| {})
+            .unwrap();
         let p = install.probe(Some(Path::new("/lib")), Some(Path::new("/home")));
         assert_eq!(
             p,
@@ -875,6 +1060,97 @@ mod tests {
         );
         let p = install_at(tmp.path().join("nowhere")).probe(None, None);
         assert!(p.ready.unwrap_err().contains("could not be run"));
+    }
+
+    /// A release as GitHub's listing has it, with assets of these names.
+    fn listed(tag: &str, names: &[String]) -> serde_json::Value {
+        let assets: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "browser_download_url": format!("https://github.com/{REPO}/releases/download/{tag}/{name}"),
+                })
+            })
+            .collect();
+        serde_json::json!({"tag_name": tag, "draft": false, "prerelease": false, "assets": assets})
+    }
+
+    #[test]
+    fn the_newest_release_is_the_highest_that_serves_the_engine_here() {
+        let t = "aarch64-apple-darwin";
+        let tarball = format!("superfluid-{t}.tar.gz");
+        let checksum = format!("{tarball}.sha256");
+        let marker = |abi: u32| format!("superfluid-basert-abi-{abi}.txt");
+        let whole =
+            |tag: &str, abi: u32| listed(tag, &[tarball.clone(), checksum.clone(), marker(abi)]);
+        let mut draft = whole("v0.9.0", 1);
+        draft["draft"] = true.into();
+        let mut pre = whole("v0.8.0", 1);
+        pre["prerelease"] = true.into();
+        let listing = serde_json::json!([
+            draft,
+            pre,
+            whole("v0.7.0", 2),
+            listed("v0.6.0", &[tarball.clone(), marker(1)]),
+            listed("v0.5.0", &[tarball.clone(), checksum.clone()]),
+            whole("nightly", 1),
+            whole("v0.1.9", 1),
+            whole("v0.1.10", 1),
+        ]);
+        let newest = newest_in(&listing, t, 1).unwrap();
+        assert_eq!(newest.tag, "v0.1.10", "by number, not as text");
+        assert_eq!(
+            newest.url(&tarball),
+            format!("https://github.com/{REPO}/releases/download/v0.1.10/{tarball}")
+        );
+        // Each asset where the listing says it is, not beside the tarball.
+        let mut mirrored = whole("v0.2.0", 1);
+        mirrored["assets"][1]["browser_download_url"] =
+            format!("https://mirror/checksums/{checksum}").into();
+        let release = newest_in(&serde_json::json!([mirrored]), t, 1).unwrap();
+        assert_eq!(
+            release.url(&checksum),
+            format!("https://mirror/checksums/{checksum}")
+        );
+        assert_eq!(
+            Release::tested().url(&checksum),
+            format!("https://github.com/{REPO}/releases/download/{RELEASE}/{checksum}")
+        );
+        assert_eq!(newest_in(&listing, t, 2).unwrap().tag, "v0.7.0");
+        assert_eq!(newest_in(&listing, "x86_64-unknown-linux-gnu", 1), None);
+        let refused = serde_json::json!({"message": "API rate limit exceeded"});
+        assert_eq!(newest_in(&refused, t, 1), None);
+    }
+
+    #[test]
+    fn nothing_installed_is_downgraded() {
+        assert!(newer(Some("v0.1.10"), "v0.1.9"));
+        assert!(!newer(Some("v0.1.3"), "v0.1.3"));
+        assert!(!newer(Some("v0.1.2"), "v0.1.3"));
+        assert!(!newer(None, "v0.1.3"));
+        assert!(!newer(Some("a release that does not say"), "v0.1.3"));
+    }
+
+    #[test]
+    fn the_engine_abi_is_the_one_the_header_states() {
+        // The headers are at the repository's root: four directories up here,
+        // three in the public repository, where this crate is `base-convert/`.
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let header = [
+            "../../../../include/baseRT/baseRT.h",
+            "../../../include/baseRT/baseRT.h",
+        ]
+        .iter()
+        .map(|rel| crate_dir.join(rel))
+        .find(|p| p.is_file())
+        .expect("include/baseRT/baseRT.h at the repository's root");
+        let text = fs::read_to_string(&header).unwrap();
+        let stated = text
+            .lines()
+            .find_map(|l| l.strip_prefix("#define BASERT_ABI_VERSION "))
+            .map(|n| n.trim().parse::<u32>().unwrap());
+        assert_eq!(stated, Some(ENGINE_ABI), "{}", header.display());
     }
 
     /// `ensure_with` against installs named by `BASERT_SUPERFLUID_DIR` is
