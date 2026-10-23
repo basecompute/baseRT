@@ -7,7 +7,10 @@
 # (Metal) or Linux/arm64 (CUDA) — the engine library + the basert CLI and
 # runtime tools, installs it to ~/.basert, then adds it to your PATH. Re-running
 # upgrades in place; it skips the download when you're already on the target
-# release.
+# release. The server `basert serve` runs, superfluid, is not in the bundle:
+# the installed basert downloads the release it was tested with beside itself
+# (from 0.4.0 on), and does the same at its first `basert serve` when this
+# step was skipped.
 #
 # Environment overrides:
 #   BASERT_INSTALL_DIR   install location           (default: $HOME/.basert)
@@ -112,6 +115,20 @@ if [ ! -x "$INSTALL_DIR/basert" ]; then
   warn "need a newer release. Build the launcher meanwhile: see the docs."
 fi
 
+# --- superfluid, the server `basert serve` runs ------------------------------
+# basert 0.4.0 and later do not bundle it: the launcher downloads the release
+# it was tested with, checks its SHA-256 against the published one and installs
+# it beside itself, where `basert serve` looks first. Not fatal here: a start
+# installs it too, and `basert superfluid install` does it by hand. A release
+# before 0.4.0 has no such command and nothing to install.
+if [ -x "$INSTALL_DIR/basert" ] && "$INSTALL_DIR/basert" superfluid --help >/dev/null 2>&1; then
+  say "installing superfluid, the server basert serve runs"
+  if ! "$INSTALL_DIR/basert" superfluid install; then
+    warn "superfluid could not be installed now; 'basert serve' installs it at its first start,"
+    warn "or run: $INSTALL_DIR/basert superfluid install"
+  fi
+fi
+
 # --- PATH wiring -------------------------------------------------------------
 add_path_line='export PATH="'"$INSTALL_DIR"':$PATH"'
 already_on_path=0
@@ -137,5 +154,6 @@ echo
 echo "  Try it:"
 echo "    basert pull basecompute/Qwen3-0.6B"
 echo "    basert chat basecompute/Qwen3-0.6B"
+echo "    basert serve basecompute/Qwen3-0.6B   # an OpenAI-compatible server"
 echo
 echo "  Docs: https://github.com/$REPO"
