@@ -263,6 +263,8 @@ jobs:
           venv/bin/basert --version
           venv/bin/basert chat --help | head -n 3   # the launcher finds basert-chat
           venv/bin/basert serve --help | head -n 3
+          # The wheel's own engine, not one installed elsewhere on the machine.
+          venv/bin/python -c "import baseRT; p = baseRT._find_library(); assert '/_engine/' in p, p; print(p)"
           venv/bin/python -c "import ctypes, baseRT; f = baseRT._get_lib().baseRT_version_string; f.restype = ctypes.c_char_p; print('engine', f().decode())"
 
       - name: npm install @basecompute/basert
@@ -271,13 +273,18 @@ jobs:
           npm install --no-audit --no-fund ../out/npm/basecompute-basert-darwin-arm64-*.tgz ../out/npm/basecompute-basert-[0-9]*.tgz
           npx basert --version
           npx basert serve --help | head -n 3
-          # A missing model fails inside the engine, which proves the library loaded.
+          # Only the engine's own refusal of a missing model proves it loaded.
+          # A library or symbol koffi cannot load, or anything else failing,
+          # throws some other error; a model that loads is wrong too.
           node -e '
             const { BaseRTModel } = require("@basecompute/basert");
+            const expected = "Failed to load model: Failed to open model: /nonexistent.base";
             try { new BaseRTModel("/nonexistent.base"); } catch (e) {
-              if (/Cannot find libbaseRT/.test(e.message)) throw e;
-              console.log("engine loaded:", e.message.split("\n")[0]);
-            }'
+              if (!e.message.startsWith(expected)) throw e;
+              console.log("engine loaded:", e.message);
+              process.exit(0);
+            }
+            throw new Error("a model that does not exist loaded");'
 
       # A Rust or C program linked against an installed engine (BASERT_LIB_DIR
       # pointed at it) asks at startup for the name the library records,
@@ -339,6 +346,8 @@ jobs:
           venv/bin/basert --version
           venv/bin/basert chat --help | head -n 3   # the launcher finds basert-chat
           venv/bin/basert serve --help | head -n 3
+          # The wheel's own engine, not one installed elsewhere on the machine.
+          venv/bin/python -c "import baseRT; p = baseRT._find_library(); assert '/_engine/' in p, p; print(p)"
           venv/bin/python -c "import ctypes, baseRT; f = baseRT._get_lib().baseRT_version_string; f.restype = ctypes.c_char_p; print('engine', f().decode())"
 
       - name: npm install @basecompute/basert
@@ -348,13 +357,18 @@ jobs:
           npm install --no-audit --no-fund ../out/npm/basecompute-basert-linux-arm64-cuda-*.tgz ../out/npm/basecompute-basert-[0-9]*.tgz
           npx basert --version
           npx basert serve --help | head -n 3
-          # A missing model fails inside the engine, which proves the library loaded.
+          # Only the engine's own refusal of a missing model proves it loaded.
+          # A library or symbol koffi cannot load, or anything else failing,
+          # throws some other error; a model that loads is wrong too.
           node -e '
             const { BaseRTModel } = require("@basecompute/basert");
+            const expected = "Failed to load model: Failed to open model: /nonexistent.base";
             try { new BaseRTModel("/nonexistent.base"); } catch (e) {
-              if (/Cannot find libbaseRT/.test(e.message)) throw e;
-              console.log("engine loaded:", e.message.split("\n")[0]);
-            }'
+              if (!e.message.startsWith(expected)) throw e;
+              console.log("engine loaded:", e.message);
+              process.exit(0);
+            }
+            throw new Error("a model that does not exist loaded");'
 
       # A program linked against an installed engine asks at startup for the
       # SONAME the library records, libbaseRT.so.0, and loading the engine pulls
