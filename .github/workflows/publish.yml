@@ -56,7 +56,10 @@ concurrency:
 
 env:
   TAG: ${{ github.event.release.tag_name || inputs.tag }}
-  PYTHON_VERSION: "3.12.15"
+  # setup-python must find this exact release for macOS as well as Linux, and
+  # its macOS builds stop when a Python line goes security-only: 3.12 has none
+  # past 3.12.10. So the pin stays on a line still getting bugfix releases.
+  PYTHON_VERSION: "3.14.9"
   NODE_VERSION: "24.21.0"
   RUST_VERSION: "1.99.0"
   TAP_REPO: basecompute/homebrew-tap
