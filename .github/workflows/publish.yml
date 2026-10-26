@@ -9,8 +9,9 @@ name: Publish packages
 # It runs when a release is published (the engine's release pipeline creates
 # it as a draft at the commit that holds the release's source, attaches both
 # engine bundles, then publishes it) and by hand for a tag. Every run builds
-# every package and installs each on macOS and on Linux arm64. A run uploads
-# only when all of these hold, and is otherwise a dry run:
+# every package and installs each on macOS and, on the GB10 the CUDA engine
+# needs, on Linux arm64. A run uploads only when all of these hold, and is
+# otherwise a dry run:
 #   - the repository variable PUBLISH_ENABLED is "true" and dry_run is not ticked;
 #   - the release is published: not a draft, not a pre-release;
 #   - this run's commit is the one the tag names, so the packages hold that
@@ -18,18 +19,12 @@ name: Publish packages
 # Each upload job first asks its registry what it has, so a rerun finishes
 # what an interrupted run left and repeats nothing.
 #
-# The Linux wheel and npm engine package are built and tested on every run
-# but uploaded only when PUBLISH_LINUX is "true" too: the Linux engine's
-# licence grants use on Apple Silicon only. Until then the npm package depends
-# on the macOS engine package alone. (The Homebrew formula keeps its Linux URL:
-# it points at the bundle the release already publishes, the one install.sh
-# fetches.)
-#
 # Setup, once: environments pypi, npm, crates and homebrew, each limited to
 # v* tags; PyPI trusted publisher for basert (this repository, publish.yml,
 # environment pypi); secrets NPM_TOKEN (npm), CARGO_REGISTRY_TOKEN (crates)
 # and HOMEBREW_TAP_TOKEN (homebrew: Contents and Pull requests write on the
-# tap); then PUBLISH_ENABLED.
+# tap); the self-hosted GB10 runner made available to this repository; then
+# PUBLISH_ENABLED.
 #
 # Actions are pinned to commits and tools to exact versions: the upload jobs
 # hold publishing rights.
@@ -71,7 +66,6 @@ jobs:
     outputs:
       version: ${{ steps.plan.outputs.version }}
       upload: ${{ steps.plan.outputs.upload }}
-      linux: ${{ steps.plan.outputs.linux }}
       pypi: ${{ steps.registries.outputs.pypi }}
       npm: ${{ steps.registries.outputs.npm }}
       crates: ${{ steps.registries.outputs.crates }}
@@ -86,7 +80,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PUBLISH_ENABLED: ${{ vars.PUBLISH_ENABLED }}
-          PUBLISH_LINUX: ${{ vars.PUBLISH_LINUX }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
@@ -126,8 +119,6 @@ jobs:
               sys.exit(1)
           EOF
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          if [ "${PUBLISH_LINUX:-}" = true ]; then linux=true; else linux=false; fi
-          echo "linux=$linux" >> "$GITHUB_OUTPUT"
           # A missing release stops the run here, with gh's message.
           state=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease \
             --jq 'if .isDraft then "a draft" elif .isPrerelease then "a pre-release" else "published" end')
@@ -143,7 +134,6 @@ jobs:
           if [ -z "$why" ]; then
             echo "upload=true" >> "$GITHUB_OUTPUT"
             echo "Uploading BaseRT $V wherever it is missing."
-            [ "$linux" = true ] || echo "::notice::PUBLISH_LINUX is not \"true\": the Linux wheel and npm engine package are tested, not uploaded."
           else
             echo "upload=false" >> "$GITHUB_OUTPUT"
             echo "::notice::Dry run ($why): every package is built and tested, none uploaded."
@@ -154,7 +144,6 @@ jobs:
         env:
           V: ${{ steps.plan.outputs.version }}
           UPLOAD: ${{ steps.plan.outputs.upload }}
-          LINUX: ${{ steps.plan.outputs.linux }}
         run: |
           set -euo pipefail
           set -f # the file name patterns below are matched, not expanded
@@ -175,12 +164,8 @@ jobs:
           # Every platform wheel this run uploads, not just the version: a run
           # that uploaded one wheel and then failed leaves the version on PyPI.
           # The platform tags come from the build, so they're matched.
-          wheels="basert-$V-py3-none-macosx_*_arm64.whl"
-          engines="basert-darwin-arm64"
-          if [ "$LINUX" = true ]; then
-            wheels="$wheels basert-$V-py3-none-manylinux_*_aarch64.whl"
-            engines="$engines basert-linux-arm64-cuda"
-          fi
+          wheels="basert-$V-py3-none-macosx_*_arm64.whl basert-$V-py3-none-manylinux_*_aarch64.whl"
+          engines="basert-darwin-arm64 basert-linux-arm64-cuda"
           pypi_has() {
             files=$(curl -sf -A "$agent" "https://pypi.org/pypi/basert/$V/json" | jq -r '.urls[].filename') || return 1
             for want in $wheels; do
@@ -243,14 +228,7 @@ jobs:
           python3 -m twine check --strict out/wheels/*.whl
 
       - name: npm packages
-        env:
-          LINUX: ${{ needs.plan.outputs.linux }}
-        run: |
-          # Both engine packages are built for the tests below; the main
-          # package depends only on the ones this run may publish.
-          engines=basert-darwin-arm64
-          [ "$LINUX" != true ] || engines="$engines,basert-linux-arm64-cuda"
-          node packaging/npm/build-packages.mjs bundles out/npm --engines "$engines"
+        run: node packaging/npm/build-packages.mjs bundles out/npm
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -329,15 +307,23 @@ jobs:
           basert chat --help | head -n 3
           basert serve --help | head -n 3
 
+  # The same checks as on macOS, on the DGX Spark (GB10) the CUDA engine is
+  # built on. GitHub's arm64 runners have no NVIDIA GPU or CUDA runtime, so
+  # there the engine could not load and these stopped at finding its file.
+  # The runner is self-hosted and keeps its workspace between runs, so all of
+  # this happens under RUNNER_TEMP, which each job starts empty.
   test-linux:
-    name: Test on Linux arm64
+    name: Test on Linux arm64 (GB10)
     needs: build
-    runs-on: ubuntu-24.04-arm
+    runs-on: [self-hosted, Linux, ARM64, gb10]
+    env:
+      # `serve --help` must not install superfluid on the shared machine.
+      BASERT_SUPERFLUID_AUTO_INSTALL: "0"
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: packages
-          path: out
+          path: ${{ runner.temp }}/out
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -345,35 +331,44 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      # No GPU on this runner, so the CUDA engine can't load; check that each
-      # package installs, runs the launcher, and points the bindings at the
-      # bundled library.
       - name: pip install basert
+        working-directory: ${{ runner.temp }}
         run: |
           python3 -m venv venv
           venv/bin/pip install --quiet out/wheels/*manylinux*.whl
           venv/bin/basert --version
+          venv/bin/basert chat --help | head -n 3   # the launcher finds basert-chat
           venv/bin/basert serve --help | head -n 3
-          venv/bin/python -c "import baseRT; p = baseRT._find_library(); assert '/_engine/' in p, p; print(p)"
+          venv/bin/python -c "import ctypes, baseRT; f = baseRT._get_lib().baseRT_version_string; f.restype = ctypes.c_char_p; print('engine', f().decode())"
 
       - name: npm install @basecompute/basert
+        working-directory: ${{ runner.temp }}
         run: |
           mkdir npm-test && cd npm-test && npm init -y > /dev/null
           npm install --no-audit --no-fund ../out/npm/basecompute-basert-linux-arm64-cuda-*.tgz ../out/npm/basecompute-basert-[0-9]*.tgz
           npx basert --version
           npx basert serve --help | head -n 3
+          # A missing model fails inside the engine, which proves the library loaded.
+          node -e '
+            const { BaseRTModel } = require("@basecompute/basert");
+            try { new BaseRTModel("/nonexistent.base"); } catch (e) {
+              if (/Cannot find libbaseRT/.test(e.message)) throw e;
+              console.log("engine loaded:", e.message.split("\n")[0]);
+            }'
 
-      # As on macOS, but nothing here can run the CUDA engine: link past the
-      # driver libraries it needs and check the engine's own name, the SONAME
-      # libbaseRT.so.0 a linked program records, resolves in the package.
+      # A program linked against an installed engine asks at startup for the
+      # SONAME the library records, libbaseRT.so.0, and loading the engine pulls
+      # in the CUDA driver and cuBLAS: check the name resolves in the package,
+      # then run the program.
       - name: Link a program against the installed engines
+        working-directory: ${{ runner.temp }}
         run: |
-          printf 'const char *baseRT_version_string(void);\nint main(void) { return baseRT_version_string() == 0; }\n' > consumer.c
+          printf '#include <stdio.h>\nconst char *baseRT_version_string(void);\nint main(void) { return puts(baseRT_version_string()) < 0; }\n' > consumer.c
           for engine in "$(venv/bin/python -c 'import baseRT, os; print(os.path.dirname(baseRT._find_library()))')" \
                         "$PWD/npm-test/node_modules/@basecompute/basert-linux-arm64-cuda/engine"; do
-            cc consumer.c -o consumer -L"$engine" -lbaseRT -Wl,-rpath,"$engine" -Wl,--allow-shlib-undefined
-            ldd ./consumer | grep libbaseRT
+            cc consumer.c -o consumer -L"$engine" -lbaseRT -Wl,-rpath,"$engine"
             ldd ./consumer | grep -q "libbaseRT.so.0 => $engine/libbaseRT.so.0"
+            ./consumer
           done
 
   crates-check:
@@ -413,9 +408,6 @@ jobs:
         with:
           name: packages
           path: out
-      - name: Leave out the Linux wheel unless PUBLISH_LINUX
-        if: needs.plan.outputs.linux != 'true'
-        run: rm -v out/wheels/*manylinux*.whl
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           packages-dir: out/wheels/
@@ -446,14 +438,11 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           V: ${{ needs.plan.outputs.version }}
-          LINUX: ${{ needs.plan.outputs.linux }}
         run: |
           set -euo pipefail
           # Engine packages first, so the main package's optional dependencies
           # already exist when it appears. Skip any a previous run published.
-          engines=basert-darwin-arm64
-          [ "$LINUX" != true ] || engines="$engines basert-linux-arm64-cuda"
-          for pkg in $engines basert; do
+          for pkg in basert-darwin-arm64 basert-linux-arm64-cuda basert; do
             if npm view "@basecompute/$pkg@$V" version > /dev/null 2>&1; then
               echo "@basecompute/$pkg@$V is on npm already"
             else
