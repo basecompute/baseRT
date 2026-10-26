@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Every job only reads the repository: its checkout, and rust-sys-abi's
+# release download.
+permissions:
+  contents: read
+
 # Self-hosted runner safety: a push only happens with write access, but a
 # pull_request can come from an external fork. Gate every job so PR runs execute
 # on the laptop runner ONLY for branches pushed into THIS repo (i.e. by someone
