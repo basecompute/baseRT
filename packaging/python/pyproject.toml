@@ -1,0 +1,51 @@
+# PyPI packaging for `pip install basert`.
+#
+# Not built in place. packaging/python/build-wheel.sh copies bindings/python
+# into a staging folder, puts this file, README.md and _cli.py beside it, adds the
+# prebuilt engine from the GitHub release under baseRT/_engine/, and builds one
+# wheel per platform. The wheel is then retagged for that platform, since the
+# Python code itself is platform-independent (ctypes, no compiled extension).
+
+[build-system]
+requires = ["setuptools>=77", "wheel>=0.42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "basert"
+dynamic = ["version"]
+description = "Fast local LLM inference on Apple Silicon and NVIDIA GB10: the basert CLI, engine, and Python bindings"
+readme = "README.md"
+# The bindings and CLI launcher are Apache-2.0; the bundled engine binaries in
+# baseRT/_engine/ are under the BaseRT Engine license (_engine/LICENSE).
+license = "Apache-2.0 AND LicenseRef-BaseRT-Engine"
+license-files = ["LICENSE", "NOTICE", "baseRT/_engine/LICENSE", "baseRT/_engine/NOTICE"]
+requires-python = ">=3.9"
+authors = [{ name = "BaseCompute" }]
+keywords = ["llm", "inference", "apple-silicon", "metal", "cuda", "openai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/basecompute/baseRT"
+Documentation = "https://docs.basecompute.co"
+Changelog = "https://github.com/basecompute/baseRT/blob/main/CHANGELOG.md"
+
+[project.scripts]
+basert = "baseRT._cli:main"
+
+[tool.setuptools]
+packages = ["baseRT"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+baseRT = ["_engine/*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "baseRT.__version__" }
