@@ -73,3 +73,18 @@ jobs:
         run: cargo test
         env:
           BASERT_LIB_DIR: ${{ github.workspace }}/build
+
+  packaging:
+    name: packaging scripts (tests)
+    # GitHub-hosted, so it needs no fork guard. linux-arm64 is one of the
+    # platforms the npm launcher tests run on.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # publish.yml runs these scripts only after a release; their engine
+      # staging, link check and npm launcher are tested here on synthetic
+      # bundles.
+      - run: python3 tests/scripts/test_packaging.py

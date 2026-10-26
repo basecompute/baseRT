@@ -1,0 +1,556 @@
+name: Publish packages
+
+# Puts each BaseRT release on PyPI (basert), npm (@basecompute/basert and its
+# engine packages) and crates.io (the basert-* CLI crates, baseRT-sys and
+# baseRT), and opens the Homebrew formula PR on basecompute/homebrew-tap, by
+# repackaging the engine bundles the release carries: nothing here compiles
+# the engine. The scripts are in packaging/.
+#
+# It runs when a release is published (the engine's release pipeline creates
+# it as a draft at the commit that holds the release's source, attaches both
+# engine bundles, then publishes it) and by hand for a tag. Every run builds
+# every package and installs each on macOS and on Linux arm64. A run uploads
+# only when all of these hold, and is otherwise a dry run:
+#   - the repository variable PUBLISH_ENABLED is "true" and dry_run is not ticked;
+#   - the release is published: not a draft, not a pre-release;
+#   - this run's commit is the one the tag names, so the packages hold that
+#     release's source (a manual run from a branch dry-runs).
+# Each upload job first asks its registry what it has, so a rerun finishes
+# what an interrupted run left and repeats nothing.
+#
+# The Linux wheel and npm engine package are built and tested on every run
+# but uploaded only when PUBLISH_LINUX is "true" too: the Linux engine's
+# licence grants use on Apple Silicon only. Until then the npm package depends
+# on the macOS engine package alone. (The Homebrew formula keeps its Linux URL:
+# it points at the bundle the release already publishes, the one install.sh
+# fetches.)
+#
+# Setup, once: environments pypi, npm, crates and homebrew, each limited to
+# v* tags; PyPI trusted publisher for basert (this repository, publish.yml,
+# environment pypi); secrets NPM_TOKEN (npm), CARGO_REGISTRY_TOKEN (crates)
+# and HOMEBREW_TAP_TOKEN (homebrew: Contents and Pull requests write on the
+# tap); then PUBLISH_ENABLED.
+#
+# Actions are pinned to commits and tools to exact versions: the upload jobs
+# hold publishing rights.
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to package (vX.Y.Z); run from that tag to upload
+        required: true
+      dry_run:
+        description: Build and test everything, upload nothing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  PYTHON_VERSION: "3.12.15"
+  NODE_VERSION: "24.21.0"
+  RUST_VERSION: "1.99.0"
+  TAP_REPO: basecompute/homebrew-tap
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      upload: ${{ steps.plan.outputs.upload }}
+      linux: ${{ steps.plan.outputs.linux }}
+      pypi: ${{ steps.registries.outputs.pypi }}
+      npm: ${{ steps.registries.outputs.npm }}
+      crates: ${{ steps.registries.outputs.crates }}
+      brew: ${{ steps.registries.outputs.brew }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Upload or dry run
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_ENABLED: ${{ vars.PUBLISH_ENABLED }}
+          PUBLISH_LINUX: ${{ vars.PUBLISH_LINUX }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::$TAG is not a release tag (vX.Y.Z)"; exit 1 ;;
+          esac
+          V="${TAG#v}"
+          # The packages take their versions from these files, so each must
+          # say the tag's.
+          python3 - "$V" <<'EOF'
+          import json, re, sys, tomllib
+          from pathlib import Path
+
+          def toml(path, *keys):
+              data = tomllib.loads(Path(path).read_text())
+              for key in keys:
+                  data = data[key]
+              return data
+
+          def find(path, pattern):
+              m = re.search(pattern, Path(path).read_text(), re.M)
+              return m.group(1) if m else "nothing"
+
+          header = "include/baseRT/baseRT.h"
+          found = {
+              "base-convert/Cargo.toml": toml("base-convert/Cargo.toml", "workspace", "package", "version"),
+              "bindings/rust/baseRT-sys/Cargo.toml": toml("bindings/rust/baseRT-sys/Cargo.toml", "package", "version"),
+              "bindings/rust/baseRT/Cargo.toml": toml("bindings/rust/baseRT/Cargo.toml", "package", "version"),
+              "bindings/python/baseRT/__init__.py": find("bindings/python/baseRT/__init__.py", r'^__version__ = "(.*)"$'),
+              "bindings/node/package.json": json.loads(Path("bindings/node/package.json").read_text())["version"],
+              header: ".".join(find(header, rf"^#define BASERT_VERSION_{p} (\d+)$") for p in ("MAJOR", "MINOR", "PATCH")),
+          }
+          wrong = [f"{path} says {v}" for path, v in found.items() if v != sys.argv[1]]
+          if wrong:
+              print(f"::error::this tree is not at {sys.argv[1]}: " + "; ".join(wrong))
+              sys.exit(1)
+          EOF
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if [ "${PUBLISH_LINUX:-}" = true ]; then linux=true; else linux=false; fi
+          echo "linux=$linux" >> "$GITHUB_OUTPUT"
+          # A missing release stops the run here, with gh's message.
+          state=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease \
+            --jq 'if .isDraft then "a draft" elif .isPrerelease then "a pre-release" else "published" end')
+          # The commit the tag names: the peeled line for an annotated tag, else the tag's own.
+          tagged=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY" "refs/tags/$TAG" "refs/tags/$TAG^{}" \
+            | sort -k2 | tail -n 1 | cut -f1)
+          why=""
+          if [ "${PUBLISH_ENABLED:-}" != true ]; then why="PUBLISH_ENABLED is ${PUBLISH_ENABLED:-unset}"
+          elif [ "${DRY_RUN:-}" = true ]; then why="dry_run is ticked"
+          elif [ "$state" != published ]; then why="$TAG is $state"
+          elif [ "$tagged" != "$GITHUB_SHA" ]; then why="this run is at $GITHUB_SHA, and $TAG names ${tagged:-no commit}"
+          fi
+          if [ -z "$why" ]; then
+            echo "upload=true" >> "$GITHUB_OUTPUT"
+            echo "Uploading BaseRT $V wherever it is missing."
+            [ "$linux" = true ] || echo "::notice::PUBLISH_LINUX is not \"true\": the Linux wheel and npm engine package are tested, not uploaded."
+          else
+            echo "upload=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Dry run ($why): every package is built and tested, none uploaded."
+          fi
+
+      - name: What each registry has
+        id: registries
+        env:
+          V: ${{ steps.plan.outputs.version }}
+          UPLOAD: ${{ steps.plan.outputs.upload }}
+          LINUX: ${{ steps.plan.outputs.linux }}
+        run: |
+          set -euo pipefail
+          set -f # the file name patterns below are matched, not expanded
+          agent="basert-publish (github.com/$GITHUB_REPOSITORY)"
+          has() { curl -sfo /dev/null -A "$agent" "$1"; }
+          # need <registry> <check>: its jobs run unless this run uploads and
+          # the check finds everything there. A dry run builds and tests all.
+          need() {
+            name=$1; shift
+            if [ "$UPLOAD" != true ]; then
+              echo "$name=true" >> "$GITHUB_OUTPUT"; echo "$name: dry run, $V is built and tested"
+            elif "$@"; then
+              echo "$name=false" >> "$GITHUB_OUTPUT"; echo "$name: $V is there already"
+            else
+              echo "$name=true" >> "$GITHUB_OUTPUT"; echo "$name: $V will be published"
+            fi
+          }
+          # Every platform wheel this run uploads, not just the version: a run
+          # that uploaded one wheel and then failed leaves the version on PyPI.
+          # The platform tags come from the build, so they're matched.
+          wheels="basert-$V-py3-none-macosx_*_arm64.whl"
+          engines="basert-darwin-arm64"
+          if [ "$LINUX" = true ]; then
+            wheels="$wheels basert-$V-py3-none-manylinux_*_aarch64.whl"
+            engines="$engines basert-linux-arm64-cuda"
+          fi
+          pypi_has() {
+            files=$(curl -sf -A "$agent" "https://pypi.org/pypi/basert/$V/json" | jq -r '.urls[].filename') || return 1
+            for want in $wheels; do
+              found=no
+              for f in $files; do case "$f" in $want) found=yes ;; esac; done
+              [ "$found" = yes ] || return 1
+            done
+          }
+          npm_has() {
+            for pkg in $engines basert; do has "https://registry.npmjs.org/@basecompute%2F$pkg/$V" || return 1; done
+          }
+          # The last crate of each workspace goes up last, so both present
+          # means the whole set is.
+          crates_has() {
+            has "https://crates.io/api/v1/crates/basert-cli/$V" && has "https://crates.io/api/v1/crates/baseRT/$V"
+          }
+          tap_has() {
+            curl -sf "https://raw.githubusercontent.com/$TAP_REPO/HEAD/Formula/basert.rb" | grep -q "^  version \"$V\"$"
+          }
+          need pypi pypi_has
+          need npm npm_has
+          need crates crates_has
+          need brew tap_has
+
+  build:
+    name: Build packages
+    needs: plan
+    runs-on: ubuntu-24.04
+    env:
+      V: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Test the packaging scripts
+        run: python3 tests/scripts/test_packaging.py
+
+      - name: Download the release bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'basert-engine-*' --dir bundles
+          ls -l bundles
+          (cd bundles && sha256sum -c ./*.sha256)
+
+      - name: Homebrew formula
+        run: packaging/update-formula.sh "$V" bundles out/formula
+
+      - name: PyPI wheels
+        run: |
+          python3 -m pip install --quiet build==1.6.1 wheel==0.48.0 twine==7.0.0
+          for b in bundles/*.tar.gz; do packaging/python/build-wheel.sh "$b" out/wheels; done
+          python3 -m twine check --strict out/wheels/*.whl
+
+      - name: npm packages
+        env:
+          LINUX: ${{ needs.plan.outputs.linux }}
+        run: |
+          # Both engine packages are built for the tests below; the main
+          # package depends only on the ones this run may publish.
+          engines=basert-darwin-arm64
+          [ "$LINUX" != true ] || engines="$engines,basert-linux-arm64-cuda"
+          node packaging/npm/build-packages.mjs bundles out/npm --engines "$engines"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages
+          path: out/
+          if-no-files-found: error
+
+  test-macos:
+    name: Test on macOS
+    needs: build
+    runs-on: macos-15
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packages
+          path: out
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # `basert serve --help` below: serving is what the READMEs lead with,
+      # and nothing else here runs that command. (A dropped library name is
+      # caught earlier, by check_engine_links.py when the engine is staged,
+      # and by the linked program after the installs.)
+      - name: pip install basert
+        run: |
+          python3 -m venv venv
+          venv/bin/pip install --quiet out/wheels/*macosx*.whl
+          venv/bin/basert --version
+          venv/bin/basert chat --help | head -n 3   # the launcher finds basert-chat
+          venv/bin/basert serve --help | head -n 3
+          venv/bin/python -c "import ctypes, baseRT; f = baseRT._get_lib().baseRT_version_string; f.restype = ctypes.c_char_p; print('engine', f().decode())"
+
+      - name: npm install @basecompute/basert
+        run: |
+          mkdir npm-test && cd npm-test && npm init -y > /dev/null
+          npm install --no-audit --no-fund ../out/npm/basecompute-basert-darwin-arm64-*.tgz ../out/npm/basecompute-basert-[0-9]*.tgz
+          npx basert --version
+          npx basert serve --help | head -n 3
+          # A missing model fails inside the engine, which proves the library loaded.
+          node -e '
+            const { BaseRTModel } = require("@basecompute/basert");
+            try { new BaseRTModel("/nonexistent.base"); } catch (e) {
+              if (/Cannot find libbaseRT/.test(e.message)) throw e;
+              console.log("engine loaded:", e.message.split("\n")[0]);
+            }'
+
+      # A Rust or C program linked against an installed engine (BASERT_LIB_DIR
+      # pointed at it) asks at startup for the name the library records,
+      # libbaseRT.0.dylib, not the file it was linked through: build one
+      # against each and run it.
+      - name: Link a program against the installed engines
+        run: |
+          printf '#include <stdio.h>\nconst char *baseRT_version_string(void);\nint main(void) { return puts(baseRT_version_string()) < 0; }\n' > consumer.c
+          for engine in "$(venv/bin/python -c 'import baseRT, os; print(os.path.dirname(baseRT._find_library()))')" \
+                        "$PWD/npm-test/node_modules/@basecompute/basert-darwin-arm64/engine"; do
+            cc consumer.c -o consumer -L"$engine" -lbaseRT -Wl,-rpath,"$engine"
+            ./consumer
+          done
+
+      # The formula installs the release's bundle from its public URL, so
+      # this needs the release published.
+      - name: brew install basert
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          # A throwaway local tap stands in for basecompute/homebrew-tap.
+          brew tap-new --no-git basecompute/publish-test
+          cp out/formula/basert.rb "$(brew --repository basecompute/publish-test)/Formula/"
+          brew style basecompute/publish-test/basert
+          brew install basecompute/publish-test/basert
+          brew test basecompute/publish-test/basert
+          basert chat --help | head -n 3
+          basert serve --help | head -n 3
+
+  test-linux:
+    name: Test on Linux arm64
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packages
+          path: out
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # No GPU on this runner, so the CUDA engine can't load; check that each
+      # package installs, runs the launcher, and points the bindings at the
+      # bundled library.
+      - name: pip install basert
+        run: |
+          python3 -m venv venv
+          venv/bin/pip install --quiet out/wheels/*manylinux*.whl
+          venv/bin/basert --version
+          venv/bin/basert serve --help | head -n 3
+          venv/bin/python -c "import baseRT; p = baseRT._find_library(); assert '/_engine/' in p, p; print(p)"
+
+      - name: npm install @basecompute/basert
+        run: |
+          mkdir npm-test && cd npm-test && npm init -y > /dev/null
+          npm install --no-audit --no-fund ../out/npm/basecompute-basert-linux-arm64-cuda-*.tgz ../out/npm/basecompute-basert-[0-9]*.tgz
+          npx basert --version
+          npx basert serve --help | head -n 3
+
+      # As on macOS, but nothing here can run the CUDA engine: link past the
+      # driver libraries it needs and check the engine's own name, the SONAME
+      # libbaseRT.so.0 a linked program records, resolves in the package.
+      - name: Link a program against the installed engines
+        run: |
+          printf 'const char *baseRT_version_string(void);\nint main(void) { return baseRT_version_string() == 0; }\n' > consumer.c
+          for engine in "$(venv/bin/python -c 'import baseRT, os; print(os.path.dirname(baseRT._find_library()))')" \
+                        "$PWD/npm-test/node_modules/@basecompute/basert-linux-arm64-cuda/engine"; do
+            cc consumer.c -o consumer -L"$engine" -lbaseRT -Wl,-rpath,"$engine" -Wl,--allow-shlib-undefined
+            ldd ./consumer | grep libbaseRT
+            ldd ./consumer | grep -q "libbaseRT.so.0 => $engine/libbaseRT.so.0"
+          done
+
+  crates-check:
+    name: Verify crates
+    needs: plan
+    if: needs.plan.outputs.crates == 'true'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: cargo publish --dry-run
+        run: |
+          python3 packaging/crates/stage.py "$RUNNER_TEMP/crates"
+          (cd "$RUNNER_TEMP/crates/cli" && cargo publish --workspace --dry-run)
+          # baseRT-sys only needs its library directory to exist to package.
+          mkdir -p "$RUNNER_TEMP/engine"
+          (cd "$RUNNER_TEMP/crates/bindings" && BASERT_LIB_DIR="$RUNNER_TEMP/engine" cargo publish --workspace --dry-run)
+
+  # --- uploads: only when the plan says so -----------------------------------
+
+  pypi:
+    name: Publish to PyPI
+    needs: [plan, test-macos, test-linux]
+    if: needs.plan.outputs.upload == 'true' && needs.plan.outputs.pypi == 'true'
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/basert/${{ needs.plan.outputs.version }}/
+    permissions:
+      id-token: write # trusted publishing, and the attestations
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packages
+          path: out
+      - name: Leave out the Linux wheel unless PUBLISH_LINUX
+        if: needs.plan.outputs.linux != 'true'
+        run: rm -v out/wheels/*manylinux*.whl
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: out/wheels/
+          # PyPI never accepts a file name twice, so a rerun after a partial
+          # upload would stop at the first wheel already there. Step over it.
+          skip-existing: true
+
+  npm:
+    name: Publish to npm
+    needs: [plan, test-macos, test-linux]
+    if: needs.plan.outputs.upload == 'true' && needs.plan.outputs.npm == 'true'
+    runs-on: ubuntu-24.04
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@basecompute/basert/v/${{ needs.plan.outputs.version }}
+    permissions:
+      id-token: write # provenance
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packages
+          path: out
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+      - name: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          V: ${{ needs.plan.outputs.version }}
+          LINUX: ${{ needs.plan.outputs.linux }}
+        run: |
+          set -euo pipefail
+          # Engine packages first, so the main package's optional dependencies
+          # already exist when it appears. Skip any a previous run published.
+          engines=basert-darwin-arm64
+          [ "$LINUX" != true ] || engines="$engines basert-linux-arm64-cuda"
+          for pkg in $engines basert; do
+            if npm view "@basecompute/$pkg@$V" version > /dev/null 2>&1; then
+              echo "@basecompute/$pkg@$V is on npm already"
+            else
+              npm publish "out/npm/basecompute-$pkg-$V.tgz" --access public --provenance
+            fi
+          done
+
+  crates:
+    name: Publish to crates.io
+    needs: [plan, crates-check, test-macos, test-linux]
+    if: needs.plan.outputs.upload == 'true' && needs.plan.outputs.crates == 'true'
+    runs-on: ubuntu-24.04-arm
+    environment:
+      name: crates
+      url: https://crates.io/crates/basert-cli/${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          V: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 packaging/crates/stage.py "$RUNNER_TEMP/crates"
+          mkdir -p "$RUNNER_TEMP/engine"
+          export BASERT_LIB_DIR="$RUNNER_TEMP/engine"
+          # One crate at a time, dependencies first, skipping any a previous
+          # run published. `cargo publish` waits for each to reach the index.
+          # --no-verify: crates-check built these same crates from this same
+          # commit, and verifying again would run every dependency's build
+          # script with CARGO_REGISTRY_TOKEN in the environment.
+          publish() {
+            ws=$1; shift
+            for crate in "$@"; do
+              if curl -sfo /dev/null -A "basert-publish (github.com/$GITHUB_REPOSITORY)" \
+                   "https://crates.io/api/v1/crates/$crate/$V"; then
+                echo "$crate $V is on crates.io already"
+              else
+                (cd "$RUNNER_TEMP/crates/$ws" && cargo publish --no-verify -p "$crate")
+              fi
+            done
+          }
+          publish cli basert-format basert-quant basert-readers basert-sign \
+                      basert-hub basert-awq basert-arch basert-cli
+          publish bindings baseRT-sys baseRT
+
+  homebrew:
+    name: Open the Homebrew formula PR
+    needs: [plan, test-macos]
+    if: needs.plan.outputs.upload == 'true' && needs.plan.outputs.brew == 'true'
+    runs-on: ubuntu-24.04
+    environment: homebrew
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packages
+          path: out
+      # The formula reaches `brew install` users when this PR is merged on the
+      # tap, so a person sees every Homebrew release. Each step is safe to
+      # repeat: a rerun finishes a branch pushed without a PR, a PR closed
+      # unmerged, or a PR whose checksums went stale because the release's
+      # bundles were uploaded again (--clobber).
+      - name: Open a pull request on the tap
+        env:
+          # A token for the tap alone, with Contents and Pull requests write;
+          # this repository's own token cannot write there.
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          V: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          branch="formula/basert-$V"
+          gh auth setup-git # plain `git push` below authenticates with GH_TOKEN
+          gh repo clone "$TAP_REPO" tap -- --depth 1
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if cmp -s ../out/formula/basert.rb Formula/basert.rb; then
+            echo "The tap's default branch has basert $V already."
+            exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then
+            git fetch --depth 1 origin "$branch:$branch"
+            git switch "$branch"
+          else
+            git switch -c "$branch"
+          fi
+          mkdir -p Formula
+          cp ../out/formula/basert.rb Formula/basert.rb
+          git add Formula/basert.rb
+          git diff --cached --quiet || git commit -m "basert $V"
+          git push origin "$branch"
+          open=$(gh pr list --repo "$TAP_REPO" --head "$branch" --state open --json url --jq '.[0].url')
+          if [ -n "$open" ]; then
+            echo "The PR is open already: $open"
+          else
+            gh pr create --repo "$TAP_REPO" --head "$branch" --title "basert $V" \
+              --body "Updates the formula to the v$V release bundles (version and checksums only), from basecompute/baseRT's publish workflow, which installed and tested it on macOS. Merging it makes $V what \`brew install\` and \`brew upgrade\` give."
+          fi
