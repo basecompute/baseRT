@@ -30,8 +30,12 @@ npm test          # struct-ABI + helper tests; no engine/model needed
 The bindings resolve `libbaseRT.dylib` in this order:
 
 1. `BASERT_LIB_PATH` environment variable (full path to the `.dylib`)
-2. `../../build/libbaseRT.dylib` relative to the package (when inside the repo)
-3. `build/libbaseRT.dylib` / `libbaseRT.dylib` under the current directory
+2. The engine package npm installed for this platform
+   (`@basecompute/basert-darwin-arm64` / `@basecompute/basert-linux-arm64-cuda`)
+3. `../../build/libbaseRT.dylib` relative to the package (when inside the repo)
+4. A prebuilt engine from `install.sh` (`$BASERT_INSTALL_DIR`, default
+   `~/.basert`) or Homebrew (`$(brew --prefix)/opt/basert/libexec`)
+5. `build/libbaseRT.dylib` / `libbaseRT.dylib` under the current directory
 
 ## Note on threading
 

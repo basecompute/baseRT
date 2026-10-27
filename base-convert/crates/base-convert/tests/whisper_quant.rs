@@ -19,8 +19,14 @@ fn bin() -> &'static str {
 }
 
 fn profiles_dir() -> PathBuf {
+    // The copy packaged in the crate (crates.io), else the workspace's:
     // crates/base-convert → ../../profiles
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let packaged = crate_dir.join("profiles");
+    if packaged.is_dir() {
+        return packaged;
+    }
+    crate_dir
         .parent()
         .unwrap()
         .parent()

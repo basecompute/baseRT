@@ -19,8 +19,7 @@
 // (default: all, `basert-darwin-arm64,basert-linux-arm64-cuda`). Every engine
 // tarball is still built, for testing, but the main package depends only on
 // the named ones: one that never reaches the registry must not be among its
-// optionalDependencies. publish.yml leaves the Linux engine out until its
-// licence covers Linux.
+// optionalDependencies. publish.yml publishes all of them.
 //
 // bindings/node is compiled in a staging copy and its package.json rewritten
 // there, so the published package gets its own name and metadata while the
@@ -127,11 +126,19 @@ try {
   }
 
   // --- main package: compile the bindings in a staging copy -----------------
+  // The copy's package.json leaves out os, cpu and libc. Those say where the
+  // bindings install (darwin/arm64), and npm ci refuses a project whose own
+  // platforms exclude the machine it runs on, such as publish.yml's Linux x64
+  // build runner. Compiling needs none of them; the main package below states
+  // its own.
   const build = path.join(stage, "build");
   fs.mkdirSync(build);
-  for (const f of ["src", "tsconfig.json", "package.json", "package-lock.json"]) {
+  for (const f of ["src", "tsconfig.json", "package-lock.json"]) {
     fs.cpSync(path.join(root, "bindings/node", f), path.join(build, f), { recursive: true });
   }
+  const buildable = { ...source };
+  for (const key of ["os", "cpu", "libc"]) delete buildable[key];
+  writeJson(path.join(build, "package.json"), buildable);
   run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], build);
   run("npx", ["tsc"], build);
 

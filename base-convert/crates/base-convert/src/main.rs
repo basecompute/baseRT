@@ -158,14 +158,24 @@ struct ConvertArgs {
     #[arg(long)]
     no_mlx_passthrough: bool,
     /// Block-drafter / EAGLE-3 sidecars only: quantize the drafter's own
-    /// transformer layers (`layers.*` q/k/v/o and FFN projections) with
-    /// `--target` instead of keeping the whole sidecar f16. The heads that
-    /// define the scheme (fc taps, hidden_norm, Markov / confidence heads,
-    /// the EAGLE-3 lm_head and d2t) and every norm stay f16. A DFlash-b16
-    /// head for Qwen3-4B is 1 GB f16 — streamed on every block step; q8
-    /// halves it, q4 quarters it, at a small cost in acceptance.
+    /// transformer layers (`layers.*` q/k/v/o and FFN projections) and the
+    /// block drafter's per-tap context projection `fc.{i}` with `--target`
+    /// instead of keeping the whole sidecar f16. The remaining heads that
+    /// define the scheme (hidden_norm, Markov / confidence heads, DFlash 2's
+    /// selector codebooks, the EAGLE-3 lm_head and d2t) and every norm stay
+    /// f16. A DFlash-b16 head for Qwen3-4B is 1 GB f16 — streamed on every
+    /// block step; q8 halves it, q4 quarters it, at a small cost in
+    /// acceptance. The fc taps are streamed on every round's context pass
+    /// (262 MB f16 on Qwen3.8-27B-DFlash2, 67 MB on Qwen3.6-35B-A3B-DFlash2);
+    /// measured 2026-10-19 at 4-bit: acceptance unchanged on both, 0.9 / 0.2 ms
+    /// less per round. `basert pull` converts a drafter sidecar this way, the
+    /// fc taps included for the DFlash family only, where that was measured.
     #[arg(long)]
     quantize_drafter: bool,
+    /// With --quantize-drafter: keep the block drafter's `fc.{i}` taps in f16
+    /// (the pre-2026-10-19 bundles). The 1/256 fold applies either way.
+    #[arg(long, requires = "quantize_drafter")]
+    keep_drafter_fc_f16: bool,
     /// GGUF sources only: copy Q3_K / Q4_K / Q5_K / Q6_K / IQ4_XS and IQ2_XS /
     /// IQ2_S / IQ3_XXS / IQ3_S super-blocks into the bundle VERBATIM instead
     /// of dequantizing and re-packing them.
@@ -371,7 +381,9 @@ enum AwqMode {
 #[derive(Parser, Debug)]
 struct PullArgs {
     /// Model id: `basecompute/<name>` (pre-converted, from the catalog) or
-    /// `org/model` (a raw HF repo, downloaded + converted locally).
+    /// `org/model` (a raw HF repo, downloaded + converted locally). Add
+    /// `:<variant>` for that variant, as `basert list` names it
+    /// (`default-q8`, `cuda-q4mix`, `file-…`), or a quant (`q8`).
     id: String,
     /// Override the auto-selected quant profile (path to a profile JSON).
     #[arg(long)]
@@ -402,7 +414,8 @@ struct CatalogScanArgs {
     /// Organization to scan.
     #[arg(long, default_value = "basecompute")]
     org: String,
-    /// Where to write the catalog. Defaults to the bundled one, in place.
+    /// Where to write the catalog. Defaults to the bundled one, in place, when
+    /// this launcher was built from source; to catalog.json here otherwise.
     #[arg(long)]
     out: Option<PathBuf>,
     /// Report what would change without writing anything.
@@ -3701,6 +3714,69 @@ fn dequant_to_f16(source_format: &str, src_quantized: bool, canonical: &str) -> 
     src_quantized && source_format == "mlx_safetensors" && f16_consumer(canonical)
 }
 
+/// Whether a drafter sidecar's tensor keeps f16: every one of them does
+/// without `--quantize-drafter`; with it, the transformer layers (`layers.*`)
+/// and, unless `keep_fc_f16`, the `fc.{i}` context taps follow the target
+/// scheme. DFlash 2's conv `base_kernel` ([2, K, D]) is read as raw halves,
+/// not a projection, so it stays f16 under either rule (its
+/// `kernel_projection` quantizes). The norms, the selector codebooks, the
+/// Markov / confidence heads and EAGLE-3's lm_head and d2t define the scheme
+/// and stay f16. 1-D tensors and biases stay raw anyway (`must_stay_raw`).
+fn drafter_tensor_stays_f16(quantize_drafter: bool, keep_fc_f16: bool, canonical: &str) -> bool {
+    let follows_target =
+        canonical.starts_with("layers.") || (!keep_fc_f16 && canonical.starts_with("fc."));
+    !(quantize_drafter && follows_target && !canonical.ends_with(".base_kernel"))
+}
+
+#[cfg(test)]
+mod drafter_policy_tests {
+    use super::drafter_tensor_stays_f16;
+
+    #[test]
+    fn without_the_flag_every_sidecar_tensor_stays_f16() {
+        for name in [
+            "layers.0.self_attn.q_proj.weight",
+            "fc.0.weight",
+            "hidden_norm.weight",
+            "lm_head.weight",
+        ] {
+            assert!(drafter_tensor_stays_f16(false, false, name), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_flag_quantizes_the_layers_and_the_fc_taps_and_nothing_else() {
+        for name in [
+            "layers.0.self_attn.q_proj.weight",
+            "layers.4.mlp.down_proj.weight",
+            "fc.0.weight",
+            "fc.7.weight",
+        ] {
+            assert!(!drafter_tensor_stays_f16(true, false, name), "{name}");
+        }
+        for name in [
+            "hidden_norm.weight",
+            "markov_head.weight",
+            "confidence_head.weight",
+            "lm_head.weight",
+            "d2t",
+            "layers.0.conv.base_kernel",
+        ] {
+            assert!(drafter_tensor_stays_f16(true, false, name), "{name}");
+        }
+    }
+
+    #[test]
+    fn keeping_the_fc_taps_f16_leaves_the_layers_quantized() {
+        assert!(drafter_tensor_stays_f16(true, true, "fc.0.weight"));
+        assert!(!drafter_tensor_stays_f16(
+            true,
+            true,
+            "layers.0.mlp.up_proj.weight"
+        ));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn convert_generic(
     input: &std::path::Path,
@@ -4134,20 +4210,14 @@ fn convert_generic(
         .cloned()
         .chain(speculator_mapped.iter().cloned())
         .collect();
-    // Block-drafter sidecars stay f16 end to end (acceptance rate is what
-    // the scheme buys; the block step is small next to the target's verify).
+    // Drafter sidecars stay f16 (acceptance rate is what the scheme buys; the
+    // block step is small next to the target's verify) except for what
+    // --quantize-drafter names: see drafter_tensor_stays_f16.
     let is_drafter_arch = base_arch::dflash::is_block_drafter_arch(canonical_arch)
         || base_arch::dflash::is_eagle3_arch(canonical_arch);
     for (src_name, canonical) in &mapped {
-        // --quantize-drafter: the drafter's transformer layers follow
-        // --target; everything else in the sidecar (fc taps, norms, heads,
-        // d2t) stays f16.
-        // DFlash 2's conv `base_kernel` ([2, K, D]) is read as raw halves,
-        // not a projection — it stays f16 (its kernel_projection quantizes).
         let drafter_f16 = is_drafter_arch
-            && !(ctx.quantize_drafter
-                && canonical.starts_with("layers.")
-                && !canonical.ends_with(".base_kernel"));
+            && drafter_tensor_stays_f16(ctx.quantize_drafter, ctx.keep_drafter_fc_f16, canonical);
         let is_spec = spec_names.contains(canonical);
         // --quantize-drafter also quantizes an in-bundle speculator's transformer
         // layer (`mtp.layers.*`): a Qwen3.8-27B MTP head is ~700 MB f16 and
@@ -6341,6 +6411,8 @@ struct QuantContext {
     q4_passthrough: bool,
     /// --quantize-drafter (sidecars): drafter `layers.*` follow the target scheme.
     quantize_drafter: bool,
+    /// --keep-drafter-fc-f16: the drafter's `fc.{i}` taps stay f16 under it.
+    keep_drafter_fc_f16: bool,
     /// `--speculator-lm-head`: the MTP head gets its own `mtp.lm_head.weight`.
     speculator_lm_head: bool,
     /// `--mtp-draft-ranking`: ranked token ids for the MTP head's drafting
@@ -6418,6 +6490,7 @@ impl QuantContext {
             allow_quant_from_quant: args.allow_quant_from_quant,
             q4_passthrough: !args.no_mlx_passthrough,
             quantize_drafter: args.quantize_drafter,
+            keep_drafter_fc_f16: args.keep_drafter_fc_f16,
             speculator_lm_head: args.speculator_lm_head,
             mtp_draft_ranking,
             mtp_draft_vocab: args.mtp_draft_vocab,

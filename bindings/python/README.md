@@ -26,8 +26,11 @@ pip install -e .
 The bindings look for `libbaseRT.dylib` in this order:
 
 1. `BASERT_LIB_PATH` environment variable (full path to the `.dylib`).
-2. `../../build/libbaseRT.dylib` relative to the package source.
-3. `build/libbaseRT.dylib` in the current working directory.
+2. `_engine/` inside the installed package (the PyPI wheel bundles the engine).
+3. `../../build/libbaseRT.dylib` relative to the package source.
+4. A prebuilt engine from `install.sh` (`$BASERT_INSTALL_DIR`, default
+   `~/.basert`) or Homebrew (`$(brew --prefix)/opt/basert/libexec`).
+5. `build/libbaseRT.dylib` in the current working directory.
 
 ## Usage
 

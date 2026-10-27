@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Unit tests for packaging/stage-engine.sh and packaging/check_engine_links.py.
+"""Unit tests for packaging/stage-engine.sh, packaging/check_engine_links.py and
+the npm launcher and package build (packaging/npm/).
 
 The bundles here are synthetic: a library is a few bytes of text, and the
 Mach-O and ELF programs carry only the load commands the link check reads.
@@ -274,6 +275,103 @@ class NpmLauncherTests(unittest.TestCase):
         run = self.launch()
         self.assertEqual(run.returncode, 1)
         self.assertIn("this release has no npm engine package", run.stderr)
+
+
+class NpmBuildTests(unittest.TestCase):
+    """packaging/npm/build-packages.mjs, run with npm over synthetic bundles.
+
+    The bindings it compiles say which platforms they install on, and
+    publish.yml builds on one they leave out (Linux x64). Here they name a
+    platform no test machine is, which `npm ci` refuses unless the build
+    compiles a copy without it. The bindings have no dependencies and `npx tsc`
+    is stubbed, so nothing is fetched.
+    """
+
+    VERSION = "1.2.3"
+    FOREIGN = {"os": ["win32"], "cpu": ["ia32"]}
+
+    def setUp(self) -> None:
+        node = shutil.which("node")
+        if not node or not shutil.which("npm"):
+            self.skipTest("needs node and npm")
+        self.node = node
+        self.tmp = Path(tempfile.mkdtemp())
+        v = self.VERSION
+        # A public tree with just what the build reads.
+        self.root = self.tmp / "tree"
+        (self.root / "packaging" / "npm").mkdir(parents=True)
+        for name in ("npm/build-packages.mjs", "npm/basert.js", "npm/README.md", "stage-engine.sh", "check_engine_links.py"):
+            shutil.copy(ROOT / "packaging" / name, self.root / "packaging" / name)
+        (self.root / "LICENSE").write_text("licence")
+        (self.root / "NOTICE").write_text("notice")
+        bindings = self.root / "bindings" / "node"
+        (bindings / "src").mkdir(parents=True)
+        (bindings / "src" / "index.ts").write_text("export {};\n")
+        (bindings / "tsconfig.json").write_text("{}\n")
+        (bindings / "package.json").write_text(
+            json.dumps({"name": "@baseRT/node", "version": v, "main": "dist/index.js", **self.FOREIGN})
+        )
+        (bindings / "package-lock.json").write_text(
+            json.dumps(
+                {
+                    "name": "@baseRT/node",
+                    "version": v,
+                    "lockfileVersion": 3,
+                    "requires": True,
+                    "packages": {"": {"name": "@baseRT/node", "version": v, **self.FOREIGN}},
+                }
+            )
+        )
+        # Stands in for `npx tsc` compiling src/index.ts.
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        (self.bin / "npx").write_text(
+            '#!/bin/sh\n[ "$1" = tsc ] || exit 1\nmkdir -p dist\necho "exports.v = 1;" > dist/index.js\n'
+        )
+        os.chmod(self.bin / "npx", 0o755)
+        self.bundles = self.tmp / "bundles"
+        self.bundles.mkdir()
+        bundle(
+            self.bundles / f"basert-engine-macos-arm64-{v}.tar.gz",
+            {f"libbaseRT.{v}.dylib": macho([], own_id="@rpath/libbaseRT.0.dylib"), "basert": macho([]), "LICENSE": b"engine"},
+            {"libbaseRT.0.dylib": f"libbaseRT.{v}.dylib", "libbaseRT.dylib": "libbaseRT.0.dylib"},
+        )
+        bundle(
+            self.bundles / f"basert-engine-linux-arm64-cuda-{v}.tar.gz",
+            {f"libbaseRT.so.{v}": elf([], soname="libbaseRT.so.0"), "basert": elf([]), "LICENSE": b"engine"},
+            {"libbaseRT.so.0": f"libbaseRT.so.{v}", "libbaseRT.so": "libbaseRT.so.0"},
+        )
+
+    def build(self, *args: str) -> tuple[subprocess.CompletedProcess, Path]:
+        out = self.tmp / "out"
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+            npm_config_cache=str(self.tmp / "npm-cache"),
+            npm_config_update_notifier="false",
+        )
+        script = self.root / "packaging" / "npm" / "build-packages.mjs"
+        run = subprocess.run(
+            [self.node, str(script), str(self.bundles), str(out), *args], capture_output=True, text=True, env=env
+        )
+        return run, out
+
+    def test_the_bindings_compile_on_a_machine_they_do_not_install_on(self) -> None:
+        run, out = self.build("--engines", "basert-darwin-arm64")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        v = self.VERSION
+        self.assertEqual(
+            sorted(p.name for p in out.iterdir()),
+            [f"basecompute-basert-{v}.tgz", f"basecompute-basert-darwin-arm64-{v}.tgz", f"basecompute-basert-linux-arm64-cuda-{v}.tgz"],
+        )
+        with tarfile.open(out / f"basecompute-basert-{v}.tgz") as tar:
+            main = json.load(tar.extractfile("package/package.json"))
+        self.assertEqual((main["os"], main["cpu"]), (["darwin", "linux"], ["arm64"]))
+        # Only the engine package this release publishes.
+        self.assertEqual(main["optionalDependencies"], {"@basecompute/basert-darwin-arm64": v})
+        # The bindings' own folder is left as it was.
+        source = json.loads((self.root / "bindings" / "node" / "package.json").read_text())
+        self.assertEqual(source["os"], self.FOREIGN["os"])
 
 
 if __name__ == "__main__":

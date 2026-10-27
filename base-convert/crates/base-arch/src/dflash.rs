@@ -12,9 +12,14 @@
 //! `DFlash2DraftModel`, `Qwen3DSparkModel`) — converting it as a Qwen3 would
 //! drop `fc` / `hidden_norm` and write a broken LM.
 //!
-//! Tensor policy: every tensor stays f16 (the drafter's acceptance rate is
-//! the whole point of the scheme, and the runtime's block step is bound by
-//! the target's verify anyway). `fc.weight` is split by input column into
+//! Tensor policy: f16 by default; under base-convert's `--quantize-drafter`
+//! the transformer layers and the `fc.{i}` taps follow the target scheme
+//! (`--keep-drafter-fc-f16` leaves the taps f16), while norms, the DFlash 2
+//! selector codebooks and the Markov / confidence heads stay f16. The
+//! catalog's default-q4 drafters quantize the layers; `basert pull` converts
+//! a sidecar that way, the taps included for this family only, where 4-bit
+//! taps were measured (DFlash2, 2026-10-19: acceptance unchanged), not for
+//! DSpark or EAGLE-3. `fc.weight` is split by input column into
 //! one `fc.{i}.weight` per tap (base-convert's `FcSplitProvider`), so the
 //! runtime runs one GEMM per tap block of the tap-major input.
 //!
