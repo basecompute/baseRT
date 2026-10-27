@@ -452,11 +452,51 @@ class TestFindLibrary:
         # Clear every resolver input. In particular, isolate cwd so a shared
         # library produced by an earlier test/CI build cannot satisfy the
         # fallback lookup and make this test order-dependent.
+        # Also hide any engine installed on this machine (~/.basert, Homebrew).
         monkeypatch.chdir(tmp_path)
         with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch("baseRT.__file__", "/nonexistent/bindings/python/baseRT/__init__.py"):
+            with mock.patch("baseRT.__file__", "/nonexistent/bindings/python/baseRT/__init__.py"), \
+                 mock.patch("baseRT._installed_engine_dirs", return_value=[]):
                 with pytest.raises(OSError, match="Cannot find"):
                     _find_library()
+
+    def test_finds_library_bundled_in_wheel(self, tmp_path):
+        # pip install basert: site-packages/baseRT/_engine/libbaseRT.*
+        package_dir = tmp_path / "baseRT"
+        (package_dir / "_engine").mkdir(parents=True)
+        fake_lib = package_dir / "_engine" / _LIB_NAME
+        fake_lib.touch()
+        fake_init = package_dir / "__init__.py"
+        fake_init.touch()
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch("baseRT.__file__", str(fake_init)):
+                assert _find_library() == str(fake_lib.resolve())
+
+    def test_finds_library_in_install_dir(self, tmp_path, monkeypatch):
+        # install.sh: $BASERT_INSTALL_DIR (default ~/.basert)
+        monkeypatch.chdir(tmp_path)
+        install_dir = tmp_path / "basert-install"
+        install_dir.mkdir()
+        fake_lib = install_dir / _LIB_NAME
+        fake_lib.touch()
+        with mock.patch.dict(os.environ, {"BASERT_INSTALL_DIR": str(install_dir)}, clear=True):
+            with mock.patch("baseRT.__file__", "/nonexistent/bindings/python/baseRT/__init__.py"):
+                assert _find_library() == str(fake_lib.resolve())
+
+    def test_install_dir_outranks_working_directory(self, tmp_path, monkeypatch):
+        # A library in the folder the script runs from must not shadow an
+        # installed engine, or any project could ship its own libbaseRT.
+        project = tmp_path / "project"
+        (project / "build").mkdir(parents=True)
+        (project / "build" / _LIB_NAME).touch()
+        monkeypatch.chdir(project)
+        install_dir = tmp_path / "basert-install"
+        install_dir.mkdir()
+        installed_lib = install_dir / _LIB_NAME
+        installed_lib.touch()
+        with mock.patch.dict(os.environ, {"BASERT_INSTALL_DIR": str(install_dir)}, clear=True):
+            with mock.patch("baseRT.__file__", "/nonexistent/bindings/python/baseRT/__init__.py"):
+                assert _find_library() == str(installed_lib.resolve())
 
     def test_finds_library_in_build_dir(self, tmp_path):
         # Simulate the project layout:

@@ -19,6 +19,7 @@
 
 import koffi from "koffi";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 
 // ---------------------------------------------------------------------------
@@ -40,15 +41,43 @@ function libNames(): string[] {
   }
 }
 
+// The prebuilt engine is published to npm as one package per platform, listed
+// as optionalDependencies of @basecompute/basert; npm installs only the one
+// whose os/cpu match this machine.
+const ENGINE_PACKAGES: Record<string, string> = {
+  "darwin-arm64": "@basecompute/basert-darwin-arm64",
+  "linux-arm64": "@basecompute/basert-linux-arm64-cuda",
+};
+
+function enginePackageDir(): string | undefined {
+  const pkg = ENGINE_PACKAGES[`${process.platform}-${process.arch}`];
+  if (!pkg) return undefined;
+  try {
+    return path.join(path.dirname(require.resolve(`${pkg}/package.json`)), "engine");
+  } catch {
+    return undefined; // not installed: a source checkout, or --no-optional
+  }
+}
+
 function resolveLibPath(): string {
   if (process.env.BASERT_LIB_PATH) return process.env.BASERT_LIB_PATH;
   const here = __dirname; // dist/ or src/ at runtime
+  // A source checkout's build directory comes before the installed engines
+  // (install.sh / Homebrew) so a fresh local build is never shadowed by an
+  // older release. The working directory is tried last: whatever folder the
+  // script runs in must never outrank an installed engine, or a project could
+  // ship its own library.
+  const installDir = process.env.BASERT_INSTALL_DIR || path.join(os.homedir(), ".basert");
   const dirs = [
+    enginePackageDir(), // npm install @basecompute/basert
     path.resolve(here, "..", "..", "..", "build"), // bindings/node/{dist,src} -> repo/build
     path.resolve(here, "..", "..", "build"),
+    installDir, // install.sh
+    "/opt/homebrew/opt/basert/libexec", // brew, macOS
+    "/home/linuxbrew/.linuxbrew/opt/basert/libexec", // brew, Linux
     path.resolve(process.cwd(), "build"),
     path.resolve(process.cwd()),
-  ];
+  ].filter((d): d is string => d !== undefined);
   const names = libNames();
   const tried: string[] = [];
   for (const d of dirs) {
@@ -59,7 +88,7 @@ function resolveLibPath(): string {
     }
   }
   throw new Error(
-    `Cannot find ${names.join(" / ")}. Set BASERT_LIB_PATH or build with \`make shared\`. Looked in:\n  ${tried.join(
+    `Cannot find ${names.join(" / ")}. Install the engine (npm install @basecompute/basert, brew install basecompute/tap/basert, or install.sh), set BASERT_LIB_PATH, or build with \`make shared\`. Looked in:\n  ${tried.join(
       "\n  "
     )}`
   );

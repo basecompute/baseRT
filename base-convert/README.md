@@ -42,6 +42,11 @@ basert pull basecompute/<name>
 basert pull meta-llama/Llama-3.2-1B
 basert pull Qwen/Qwen3-0.6B --target base-q8
 
+# A variant by the name `basert list` gives it (`default-q8`, `cuda-q4mix`,
+# a `file-…` variant), or a quant; the form `basert chat` and `serve` take:
+basert pull basecompute/<name>:default-q8
+basert pull Qwen/Qwen3-0.6B:q8
+
 basert pull <id> --dry-run     # resolve + print the plan, download nothing
 basert list                    # installed models (table; --json for JSON)
 basert list --remote           # also show catalog models not yet installed

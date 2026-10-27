@@ -273,7 +273,8 @@ impl CatalogRegistry {
             .unwrap_or(true)
     }
 
-    fn entry_to_ref(e: &crate::catalog::CatalogEntry) -> ModelRef {
+    /// The [`ModelRef`] a catalog row resolves to.
+    pub fn entry_to_ref(e: &crate::catalog::CatalogEntry) -> ModelRef {
         ModelRef::Catalog {
             id: e.id.clone(),
             hf_repo: e.hf_repo.clone(),

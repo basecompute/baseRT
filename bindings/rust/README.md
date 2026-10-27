@@ -20,7 +20,11 @@ By default the crates **dynamically link the one `libbaseRT.dylib`**, which
 already carries the Metal kernels (embedded metallib) and its own framework /
 C++ dependencies — one redistributable artifact, matching the Python / Node /
 Swift bindings. Point the build at the directory containing it with
-`BASERT_LIB_DIR` (defaults to `../../../build` relative to the sys crate):
+`BASERT_LIB_DIR`. When it is unset, the build uses the first of these that
+holds the library: `../../../build` relative to the sys crate, a prebuilt
+engine from `install.sh` (`$BASERT_INSTALL_DIR`, default `~/.basert`), or
+Homebrew (`$(brew --prefix)/opt/basert/libexec`). So after
+`brew install basecompute/tap/basert`, `cargo add baseRT` builds with no extra setup.
 
 ```bash
 export BASERT_LIB_DIR=/path/to/baseRT/build
@@ -39,9 +43,24 @@ frameworks manually), enable the `static` feature:
 baseRT = { path = "...", features = ["static"] }
 ```
 
+A crate that loads `libbaseRT` itself at run time can depend on `baseRT-sys`
+with the `no-link` feature: the build then looks for no library and links
+nothing. The types stay usable; the `extern` functions must not be called.
+
+Either way, `baseRT-sys` tells dependents' build scripts where the engine's C
+headers are: `DEP_BASERT_INCLUDE` holds `baseRT/baseRT.h`.
+
 ## Usage
 
-Add the dependency (path-based for now):
+Add the dependency from crates.io (install the engine first, e.g.
+`brew install basecompute/tap/basert`):
+
+```toml
+[dependencies]
+baseRT = "0.4"
+```
+
+or from a checkout:
 
 ```toml
 [dependencies]

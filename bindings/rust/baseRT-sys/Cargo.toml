@@ -1,6 +1,6 @@
 [package]
 name = "baseRT-sys"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Raw FFI bindings for the BaseRT LLM inference engine"
 license = "Apache-2.0"
@@ -12,3 +12,7 @@ default = []
 # Link the static engine archive (libbaseRT_engine.a) + frameworks instead of
 # the single libbaseRT.dylib. Default is dynamic (one self-contained dylib).
 static = []
+# Link nothing: the dependent loads libbaseRT itself at run time, so it builds
+# and starts without the library. The types stay usable; the extern functions
+# must then not be called.
+no-link = []

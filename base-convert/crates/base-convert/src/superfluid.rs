@@ -1136,15 +1136,17 @@ mod tests {
     fn the_engine_abi_is_the_one_the_header_states() {
         // The headers are at the repository's root: four directories up here,
         // three in the public repository, where this crate is `base-convert/`.
+        // The crate from crates.io carries its own copy.
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let header = [
             "../../../../include/baseRT/baseRT.h",
             "../../../include/baseRT/baseRT.h",
+            "include/baseRT/baseRT.h",
         ]
         .iter()
         .map(|rel| crate_dir.join(rel))
         .find(|p| p.is_file())
-        .expect("include/baseRT/baseRT.h at the repository's root");
+        .expect("include/baseRT/baseRT.h at the repository's root, or in the crate");
         let text = fs::read_to_string(&header).unwrap();
         let stated = text
             .lines()
