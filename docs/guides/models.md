@@ -69,6 +69,21 @@ basert list --remote    # also show catalog models not yet installed
 basert list --json      # machine-readable
 ```
 
+## Removing
+
+```sh
+basert rm Qwen/Qwen3-4B
+```
+
+Use the exact installed id from `basert list`. This removes `model.base` and
+`hub.json` for all installed variants, then prunes empty variant/model
+directories. Other files and nested models are preserved. Removal runs without
+a confirmation prompt and returns an error if the model is not installed.
+
+Source snapshots and partial downloads under `.src` are retained, including
+sources explicitly kept with `BASERT_KEEP_HF_SOURCES=1`. They are separate from
+the installed variants and may be reused by later pulls.
+
 ## Cache layout
 
 Models live under `$BASERT_MODELS_DIR` (default `~/.cache/baseRT/models`):
@@ -77,7 +92,7 @@ Models live under `$BASERT_MODELS_DIR` (default `~/.cache/baseRT/models`):
 ~/.cache/baseRT/models/
   <org>/<model>/<variant>/model.base    ← the artifact the runtime loads
   <org>/<model>/<variant>/hub.json      ← provenance sidecar
-  .src/<org>/<model>/<revision>/        ← raw HF snapshot staging (ignored by list)
+  .src/hf/models--<org>--<model>/       ← HF download staging (ignored by list)
 ```
 
 `<variant>` encodes the quant profile (e.g. `default-q4`). The same directory is

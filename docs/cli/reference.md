@@ -36,6 +36,21 @@ basert list [--remote] [--json]
 | `--remote` | Also list catalog models that aren't installed yet. |
 | `--json` | Emit JSON instead of a table. |
 
+## `basert rm`
+
+Remove all locally installed variants of an exact model id shown by `basert list`.
+
+```sh
+basert rm <model>
+basert rm Qwen/Qwen3-4B
+```
+
+Deletes each installed variant's `model.base` and `hub.json`, then removes empty
+variant/model directories. Other files and `.src` HF staging are retained.
+Uses `$BASERT_MODELS_DIR`, like `pull` and `list`. No confirmation is required;
+a missing model or unsafe id returns a non-zero exit status. Paths and
+`:variant` selectors are not accepted.
+
 ## `basert convert`
 
 Convert a source model (GGUF / HF / MLX) to `.base`.
