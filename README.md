@@ -111,6 +111,34 @@ pi
 Inside pi, run `/model` to pick a served model. See the
 [pi-basert README](https://github.com/basecompute/pi-basert) for details.
 
+### Claude Code via cc-bridge
+
+[cc-bridge](cc-bridge/) is a native Anthropic Messages API adapter that lets
+[Claude Code](https://claude.com/claude-code) talk to a local `basert serve`
+directly (`/v1/messages` ↔ `/v1/chat/completions`), with SSE streaming, thinking
+and tool blocks, keep-alive pings, and cancellation propagation. Inbound
+requests require a master key; the adapter binds to 127.0.0.1 by default.
+
+```sh
+# 1. Serve a model
+basert serve basecompute/Qwen3.6-35B-A3B
+
+# 2. Set up and run the adapter (see cc-bridge/README.md for all options)
+cd cc-bridge
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python anthropic_adapter.py --master-key change-me \
+  --model basecompute/Qwen3.6-35B-A3B
+
+# 3. Point Claude Code at it
+export ANTHROPIC_BASE_URL="http://localhost:4003"
+export ANTHROPIC_AUTH_TOKEN="change-me"
+export ANTHROPIC_MODEL="local"
+claude
+```
+
+Full client setup and troubleshooting:
+[docs/guides/connect-claude-code.md](docs/guides/connect-claude-code.md).
+
 ## The `basert` CLI
 
 `basert` is a single front-end. Model-management commands run natively; runtime
