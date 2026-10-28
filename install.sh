@@ -5,9 +5,13 @@
 #
 # Downloads the latest prebuilt engine bundle for this platform — macOS/arm64
 # (Metal) or Linux/arm64 (CUDA) — the engine library + the basert CLI and
-# runtime tools, installs it to ~/.basert, then adds it to your PATH. Re-running
-# upgrades in place; it skips the download when you're already on the target
-# release. The server `basert serve` runs, superfluid, is not in the bundle:
+# runtime tools, installs it to ~/.basert, then adds it to your PATH. Each
+# release goes to ~/.basert/versions/<v>/ (from 0.4.3 on), and ~/.basert holds
+# links to the one in use, so `basert self update` updates it later and
+# `basert self use <v>` goes back. Re-running installs the target release the
+# same way; it skips the download when you're already on it, and a copy an
+# earlier run placed directly in ~/.basert is kept as the version to go back
+# to. The server `basert serve` runs, superfluid, is not in the bundle:
 # the installed basert downloads the release it was tested with beside itself
 # (from 0.4.0 on), and does the same at its first `basert serve` when this
 # step was skipped.
@@ -88,26 +92,56 @@ trap 'rm -rf "$tmp"' EXIT
 say "downloading $(basename "$url")"
 curl -fSL --progress-bar "$url" -o "$tmp/bundle.tar.gz"
 
-# --- clean install -----------------------------------------------------------
+# --- install -----------------------------------------------------------------
+mkdir -p "$INSTALL_DIR/versions/.staging"
+stage="$INSTALL_DIR/versions/.staging/install-$$"
+rm -rf "$stage"
+mkdir "$stage"
+trap 'rm -rf "$tmp" "$stage"' EXIT
+tar -xzf "$tmp/bundle.tar.gz" -C "$stage"
+chmod +x "$stage"/basert* 2>/dev/null || true
+
+# From 0.4.3 the launcher places a release itself: under versions/, the links in
+# $INSTALL_DIR turned to it in one step, the copy there before kept. A release
+# whose launcher cannot is placed by the basert already installed, when that
+# one can; with neither, it is unpacked directly into $INSTALL_DIR as before.
+placer=""
+if [ -x "$stage/basert" ] && "$stage/basert" self install --help >/dev/null 2>&1; then
+  placer="$stage/basert"
+elif [ -x "$INSTALL_DIR/basert" ] && "$INSTALL_DIR/basert" self install --help >/dev/null 2>&1; then
+  placer="$INSTALL_DIR/basert"
+fi
+if [ -n "$placer" ]; then
+  "$placer" self install --from "$stage" --root "$INSTALL_DIR" \
+    || err "placing $tag in $INSTALL_DIR failed (see above)."
+  say "installed $tag to $INSTALL_DIR/versions"
+else
+  install_flat=1
+fi
+
+# --- clean install (releases before 0.4.3) ---------------------------------
 # Remove the previous bundle's artifacts first so a file dropped in a newer
 # release can't linger as an orphan. Only the known bundle contents are touched
 # (the bundle is flat: libbaseRT.{dylib,so}, baseRT.metallib on macOS, basert,
 # basert-*, include/), so an unrelated file in a custom INSTALL_DIR is left alone.
-mkdir -p "$INSTALL_DIR"
-# libbaseRT*.dylib, not libbaseRT.dylib: since 0.2.4 the macOS bundle ships a
-# VERSIONED library plus two symlinks (libbaseRT.0.2.4.dylib <- libbaseRT.0.dylib
-# <- libbaseRT.dylib), and the bare name matched only the last of those. Every
-# upgrade then left the previous release's real library behind — an orphan of
-# the full binary size that nothing points at, and a loaded gun for any future
-# change to the install name. (The .so pattern was already globbed.)
-rm -f  "$INSTALL_DIR"/basert "$INSTALL_DIR"/basert-* "$INSTALL_DIR"/baseRT_* \
-       "$INSTALL_DIR"/libbaseRT*.dylib "$INSTALL_DIR"/libbaseRT.so* "$INSTALL_DIR"/baseRT.metallib
-rm -rf "$INSTALL_DIR"/include
+if [ "${install_flat:-0}" = 1 ]; then
+  rm -rf "$stage"
+  rmdir "$INSTALL_DIR/versions/.staging" "$INSTALL_DIR/versions" 2>/dev/null || true
+  # libbaseRT*.dylib, not libbaseRT.dylib: since 0.2.4 the macOS bundle ships a
+  # VERSIONED library plus two symlinks (libbaseRT.0.2.4.dylib <- libbaseRT.0.dylib
+  # <- libbaseRT.dylib), and the bare name matched only the last of those. Every
+  # upgrade then left the previous release's real library behind — an orphan of
+  # the full binary size that nothing points at, and a loaded gun for any future
+  # change to the install name. (The .so pattern was already globbed.)
+  rm -f  "$INSTALL_DIR"/basert "$INSTALL_DIR"/basert-* "$INSTALL_DIR"/baseRT_* \
+         "$INSTALL_DIR"/libbaseRT*.dylib "$INSTALL_DIR"/libbaseRT.so* "$INSTALL_DIR"/baseRT.metallib
+  rm -rf "$INSTALL_DIR"/include
 
-tar -xzf "$tmp/bundle.tar.gz" -C "$INSTALL_DIR"
-chmod +x "$INSTALL_DIR"/basert* 2>/dev/null || true
-printf '%s\n' "$tag" > "$STAMP"
-say "installed $tag to $INSTALL_DIR"
+  tar -xzf "$tmp/bundle.tar.gz" -C "$INSTALL_DIR"
+  chmod +x "$INSTALL_DIR"/basert* 2>/dev/null || true
+  printf '%s\n' "$tag" > "$STAMP"
+  say "installed $tag to $INSTALL_DIR"
+fi
 
 if [ ! -x "$INSTALL_DIR/basert" ]; then
   warn "this release bundle does not include the 'basert' launcher; only the"
@@ -155,5 +189,9 @@ echo "  Try it:"
 echo "    basert pull basecompute/Qwen3-0.6B"
 echo "    basert chat basecompute/Qwen3-0.6B"
 echo "    basert serve basecompute/Qwen3-0.6B   # an OpenAI-compatible server"
+if [ -n "$placer" ]; then
+  echo
+  echo "  Later: basert self update   # the newest release, and the superfluid it needs"
+fi
 echo
 echo "  Docs: https://github.com/$REPO"
