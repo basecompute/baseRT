@@ -3,16 +3,21 @@
 # and the npm engine packages ship: every runtime file side by side, exactly as
 # install.sh lays out ~/.basert, minus the C headers.
 #
-#   packaging/stage-engine.sh basert-engine-macos-arm64-0.4.1.tar.gz out/engine
+#   packaging/stage-engine.sh basert-engine-macos-arm64-0.4.1.tar.gz out/engine ['<manager>: <command>']
+#
+# The third argument, when given, is written beside the launcher as
+# `installed-by`: `basert self update` then leaves the copy to that package
+# manager and names the command, and the notice of a newer release names it too.
 #
 # Keeping the release layout matters: the `basert` launcher finds the
 # `basert-*` runtime tools next to itself, and those find their kernel files
 # (baseRT*.metallib / baseRT_cuda_kernels.fatbin) the same way.
 set -eu
 
-[ $# -eq 2 ] || { echo "usage: $0 <bundle.tar.gz> <dest-dir>" >&2; exit 2; }
+[ $# -eq 2 ] || [ $# -eq 3 ] || { echo "usage: $0 <bundle.tar.gz> <dest-dir> ['<manager>: <command>']" >&2; exit 2; }
 bundle=$1
 dest=$2
+installed_by=${3:-}
 
 mkdir -p "$dest"
 tar -xzf "$bundle" -C "$dest"
@@ -64,3 +69,7 @@ esac
 python3 "$(dirname "$0")/check_engine_links.py" "$dest"
 
 [ -x "$dest/basert" ] || { echo "bundle has no executable basert launcher" >&2; exit 1; }
+if [ -n "$installed_by" ]; then
+  case "$installed_by" in *": "*) ;; *) echo "installed-by must read '<manager>: <command>', not '$installed_by'" >&2; exit 2 ;; esac
+  printf '%s\n' "$installed_by" > "$dest/installed-by"
+fi

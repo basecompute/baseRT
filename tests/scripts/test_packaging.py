@@ -80,11 +80,13 @@ class StageEngineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
 
-    def stage(self, files: dict[str, bytes], links: dict[str, str]) -> tuple[subprocess.CompletedProcess, Path]:
+    def stage(
+        self, files: dict[str, bytes], links: dict[str, str], *extra: str
+    ) -> tuple[subprocess.CompletedProcess, Path]:
         tarball = self.tmp / "bundle.tar.gz"
         bundle(tarball, files, links)
         dest = self.tmp / "engine"
-        run = subprocess.run(["sh", str(STAGE), str(tarball), str(dest)], capture_output=True, text=True)
+        run = subprocess.run(["sh", str(STAGE), str(tarball), str(dest), *extra], capture_output=True, text=True)
         return run, dest
 
     def libs(self, dest: Path) -> dict[str, bytes]:
@@ -113,6 +115,22 @@ class StageEngineTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(self.libs(dest), {"libbaseRT.dylib": b"release"})
         self.assertFalse((dest / "include").exists())
+
+    def test_the_package_manager_that_installs_it_is_named_beside_the_launcher(self) -> None:
+        # `basert self update` reads it to leave the copy to that manager.
+        files = {"libbaseRT.0.4.1.dylib": b"release", "basert": macho([])}
+        links = {"libbaseRT.dylib": "libbaseRT.0.4.1.dylib"}
+        run, dest = self.stage(files, links, "pip: pip install --upgrade basert")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual((dest / "installed-by").read_text(), "pip: pip install --upgrade basert\n")
+        shutil.rmtree(dest)
+        run, dest = self.stage(files, links)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse((dest / "installed-by").exists())
+        shutil.rmtree(dest)
+        run, _ = self.stage(files, links, "pip install --upgrade basert")
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("<manager>: <command>", run.stderr)
 
     def test_the_library_also_ships_under_the_name_it_records(self) -> None:
         # A program linked against the library asks for its install name
@@ -369,6 +387,10 @@ class NpmBuildTests(unittest.TestCase):
         self.assertEqual((main["os"], main["cpu"]), (["darwin", "linux"], ["arm64"]))
         # Only the engine package this release publishes.
         self.assertEqual(main["optionalDependencies"], {"@basecompute/basert-darwin-arm64": v})
+        # The engine names npm as what updates it, for `basert self update`.
+        with tarfile.open(out / f"basecompute-basert-darwin-arm64-{v}.tgz") as tar:
+            said = tar.extractfile("package/engine/installed-by").read().decode()
+        self.assertEqual(said, "npm: npm install --global @basecompute/basert@latest\n")
         # The bindings' own folder is left as it was.
         source = json.loads((self.root / "bindings" / "node" / "package.json").read_text())
         self.assertEqual(source["os"], self.FOREIGN["os"])

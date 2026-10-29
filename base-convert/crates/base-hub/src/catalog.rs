@@ -84,15 +84,22 @@ pub struct CatalogEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
     /// Speculative-decoding role. On a target bundle: the in-bundle
-    /// speculator it carries (`"mtp"` — `basertd --speculate mtp-head`
-    /// works out of the box). On a drafter sidecar row: its kind
+    /// speculator it carries (`"mtp"` — `superfluid serve --speculate
+    /// mtp-head` works out of the box). On a drafter sidecar row: its kind
     /// (`"dflash"` / `"dspark"` / `"eagle3"`), served with
     /// `--speculate <kind>:<pulled path>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speculator: Option<String>,
+    /// Target rows with an in-bundle head: the head's version, when
+    /// `basert add-speculator --head-version` recorded one
+    /// (`speculator.config.head_version`). A client serving with
+    /// `--speculate` pulls the file again when its own head's version is
+    /// not this one. Absent: unversioned, only a missing head is stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculator_version: Option<String>,
     /// Sidecar rows only: the catalog id of the target the drafter was
     /// trained for (it shares that target's embedding / lm_head and taps
-    /// its hidden states). `basertd --speculate auto` pairs an installed
+    /// its hidden states). superfluid's `--speculate auto` pairs an installed
     /// drafter with its target through this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speculator_for: Option<String>,
@@ -144,6 +151,21 @@ impl Catalog {
             }
             None => Self::cache_or_bundled(&cache),
         }
+    }
+
+    /// The hosted catalog fetched past the cache, and written to it: for a
+    /// caller with reason to think the cache is behind the Hub — a pull whose
+    /// bytes fail the cached row's sha256, when a bundle's row and file changed
+    /// together and the cache, under its TTL, has not looked since. None
+    /// offline (`BASERT_CATALOG_OFFLINE`) or when the fetch fails; the caller
+    /// then keeps what it had.
+    pub fn load_fresh(cache_dir: &Path) -> Option<Self> {
+        if std::env::var_os("BASERT_CATALOG_OFFLINE").is_some() {
+            return None;
+        }
+        let c = Self::fetch(&catalog_url())?;
+        let _ = Self::write_cache(&cache_dir.join(CACHE_FILE), &c);
+        Some(c)
     }
 
     /// Parse the cache regardless of age, then fall back to the bundled copy,

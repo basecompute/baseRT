@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "base-arch"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base-format",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "base-awq"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base-format",
@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "base-convert"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base-arch",
@@ -191,6 +191,7 @@ dependencies = [
  "ed25519-dalek",
  "half",
  "indicatif",
+ "libc",
  "memmap2",
  "rand_core 0.6.4",
  "serde_json",
@@ -201,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "base-format"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -217,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "base-hub"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base-format",
@@ -236,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "base-quant"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base-format",
@@ -248,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "base-readers"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base-format",
@@ -262,7 +263,7 @@ dependencies = [
 
 [[package]]
 name = "base-sign"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base-format",

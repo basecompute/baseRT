@@ -13,12 +13,20 @@
 //! names none.
 //!
 //! Where superfluid is looked for, in order: `$BASERT_SUPERFLUID_DIR`;
-//! `superfluid/` beside basert, the one-shot installer's layout; a directory
-//! of the user's own, where basert installs when the one beside it cannot be
-//! written (a package manager's, an app bundle's). Each holds superfluid's
-//! own layout (`bin/superfluid`, the runtime workers in `libexec/superfluid/`)
-//! off PATH: a superfluid the user installed for themselves is neither
-//! shadowed nor run in its place.
+//! `superfluid/` beside basert, the one-shot installer's layout (and a
+//! release bundle's, or a build's); basert's data directory
+//! ([`user_data_dir`]), where basert installs when the one beside it cannot be
+//! written (an app bundle's). A basert a package manager placed (Homebrew,
+//! npm, pip, pipx, uv, cargo) installs only into its data directory, looked
+//! in first: a package's folder is its manager's, replaced by an upgrade and
+//! left behind by an uninstall. A superfluid already beside such a basert is
+//! looked for after it and runs while it can serve, but nothing is installed
+//! there. Each holds superfluid's own layout (`bin/superfluid`, the runtime
+//! workers in `libexec/superfluid/`) off PATH: a superfluid the user
+//! installed for themselves is neither shadowed nor run in its place.
+//! An install replaces the directory whole, so one that holds anything but
+//! superfluid (a prefix such as `~/.local`, which superfluid's own install
+//! script fills) is never replaced.
 //!
 //! A download at a start is asked for on a terminal and made without asking
 //! otherwise, since an older Local calls `basert serve` without knowing
@@ -42,7 +50,7 @@ use sha2::{Digest, Sha256};
 /// <https://github.com/basecompute/superfluid/releases>: installed instead
 /// of the newest when the release listing cannot be read or names no release
 /// for this engine, and the release a `$BASERT_SUPERFLUID_SOURCE` holds.
-pub const RELEASE: &str = "v0.1.3";
+pub const RELEASE: &str = "v0.1.6";
 
 /// `BASERT_ABI_VERSION` of the engine shipped beside this basert, which a
 /// superfluid release names when it serves it (`superfluid-basert-abi-<N>.txt`).
@@ -63,6 +71,12 @@ pub const SOURCE_ENV: &str = "BASERT_SUPERFLUID_SOURCE";
 pub const AUTO_INSTALL_ENV: &str = "BASERT_SUPERFLUID_AUTO_INSTALL";
 /// Written into an install with the release it holds.
 const STAMP: &str = ".release";
+/// Written into an install basert made, as a package manager's copy carries
+/// one: superfluid's own `self update` then leaves the copy to basert, which
+/// picks the release that serves its engine, instead of moving it under
+/// `~/.superfluid` and checking it against an engine that is not basert's.
+const INSTALLED_BY: &str = "installed-by";
+const OWNED_BY: &str = "basert: basert superfluid install";
 /// The name superfluid's basert runtime answers to in `runtimes --json`.
 const RUNTIME_ID: &str = "basert";
 
@@ -83,9 +97,9 @@ pub enum Action {
         force: bool,
     },
     /// Show the release this basert was tested with, what is installed where,
-    /// and whether it can serve the engine beside basert. Exits 0 when an
-    /// installed superfluid can, 1 when none is installed, 2 when the
-    /// installed one cannot.
+    /// and whether it can serve the engine beside basert: the install a start
+    /// would run, the first that can. Exits 0 when an installed superfluid
+    /// can, 1 when none is installed, 2 when none installed can.
     Status,
 }
 
@@ -108,16 +122,22 @@ pub fn cmd(args: SuperfluidArgs) -> Result<()> {
                     );
                     return Ok(());
                 }
-                Some(i) if i.writable() => i,
+                Some(i) if i.takes_installs() && i.writable() => i,
                 _ => Install::for_install()?,
             };
+            // A server's workers start from this directory: replaced under
+            // it, the next one would be another release's. Looked at before
+            // the download, and again at the swap.
+            drop(dest.unused()?);
             dest.install(&source, &release, &mut |line| eprintln!("{line}"))?;
             println!("superfluid {tag} is installed at {}", dest.root.display());
             Ok(())
         }
         Action::Status => {
             println!("tested:    {RELEASE}");
-            let code = match Install::locate()? {
+            let engine = crate::serve::engine_dir().ok().flatten();
+            let home = crate::serve::superfluid_home().ok();
+            let code = match Install::choose(engine.as_deref(), home.as_deref())? {
                 None => {
                     let dest = Install::for_install()?;
                     println!(
@@ -126,7 +146,8 @@ pub fn cmd(args: SuperfluidArgs) -> Result<()> {
                     );
                     1
                 }
-                Some(i) => {
+                Some((i, ready)) => {
+                    i.claim();
                     let have = i
                         .installed_release()
                         .unwrap_or_else(|| "a release that does not say".to_string());
@@ -135,9 +156,7 @@ pub fn cmd(args: SuperfluidArgs) -> Result<()> {
                         i.root.display(),
                         i.origin.said()
                     );
-                    let engine = crate::serve::engine_dir().ok().flatten();
-                    let home = crate::serve::superfluid_home().ok();
-                    match i.probe(engine.as_deref(), home.as_deref()).ready {
+                    match ready {
                         Ok(()) => {
                             println!("engine:    ready to serve");
                             0
@@ -167,10 +186,11 @@ pub fn target() -> Result<&'static str> {
     }
 }
 
-/// basert's own place for a superfluid it installs when the directory beside
-/// it cannot be written: under the user's local data directory
-/// (`~/Library/Application Support/baseRT` on macOS, `$XDG_DATA_HOME/baseRT`
-/// or `~/.local/share/baseRT` on Linux).
+/// basert's own place for a superfluid it installs for a basert a package
+/// manager placed, or when the directory beside basert cannot be written:
+/// under the user's local data directory (`~/Library/Application
+/// Support/baseRT` on macOS, `$XDG_DATA_HOME/baseRT` or `~/.local/share/baseRT`
+/// on Linux).
 pub fn user_data_dir() -> Result<PathBuf> {
     let data = dirs::data_local_dir()
         .context("no data directory to install superfluid in (set BASERT_SUPERFLUID_DIR)")?;
@@ -184,6 +204,9 @@ pub enum Origin {
     Env,
     /// `superfluid/` beside basert: the one-shot installer's layout.
     BesideBasert,
+    /// `superfluid/` beside a basert a package manager placed: run when it
+    /// is there, never installed into.
+    BesidePackage,
     /// [`user_data_dir`].
     UserData,
 }
@@ -193,7 +216,7 @@ impl Origin {
     fn said(self) -> &'static str {
         match self {
             Origin::Env => "named by BASERT_SUPERFLUID_DIR",
-            Origin::BesideBasert => "beside basert",
+            Origin::BesideBasert | Origin::BesidePackage => "beside basert",
             Origin::UserData => "basert's data directory",
         }
     }
@@ -209,7 +232,8 @@ pub struct Install {
 
 impl Install {
     /// Where superfluid is looked for, in order: `$BASERT_SUPERFLUID_DIR`
-    /// alone when set; else beside basert, then the user's data directory.
+    /// alone when set; else beside basert, then the user's data directory;
+    /// for a basert a package manager placed, the other way round.
     pub fn candidates() -> Result<Vec<Install>> {
         if let Some(dir) = std::env::var_os(DIR_ENV).filter(|d| !d.is_empty()) {
             return Ok(vec![Install {
@@ -217,17 +241,33 @@ impl Install {
                 origin: Origin::Env,
             }]);
         }
+        // The install directory, not the version a versions-layout basert
+        // runs from: superfluid stays put while basert's versions change.
+        let beside = crate::selfupdate::install_dir()?.join("superfluid");
+        let data = Install {
+            root: user_data_dir()?,
+            origin: Origin::UserData,
+        };
         let exe = std::env::current_exe().context("this program's own path")?;
-        let dir = exe.parent().context("this program's own directory")?;
+        if crate::selfupdate::installed_as(&exe).by_package_manager() {
+            // A package's folder is its manager's: Homebrew's keg and npm's
+            // package are replaced by an upgrade, pip's is left behind by an
+            // uninstall, cargo's is ~/.cargo/bin. One installed there before
+            // still runs, after the data directory's.
+            return Ok(vec![
+                data,
+                Install {
+                    root: beside,
+                    origin: Origin::BesidePackage,
+                },
+            ]);
+        }
         Ok(vec![
             Install {
-                root: dir.join("superfluid"),
+                root: beside,
                 origin: Origin::BesideBasert,
             },
-            Install {
-                root: user_data_dir()?,
-                origin: Origin::UserData,
-            },
+            data,
         ])
     }
 
@@ -236,17 +276,25 @@ impl Install {
         Ok(Self::candidates()?.into_iter().find(Install::is_installed))
     }
 
-    /// Where an install goes: the first place that can be written, else the
-    /// last, whose own error then says why not.
+    /// Where an install goes: the first place that takes one and can be
+    /// written, else the last that takes one, whose own error then says why not.
     pub fn for_install() -> Result<Install> {
-        let candidates = Self::candidates()?;
-        let last = candidates.len() - 1;
-        Ok(candidates
+        let places: Vec<Install> = Self::candidates()?
+            .into_iter()
+            .filter(Install::takes_installs)
+            .collect();
+        let last = places.len() - 1;
+        Ok(places
             .into_iter()
             .enumerate()
             .find(|(k, c)| *k == last || c.writable())
             .map(|(_, c)| c)
             .expect("at least one candidate"))
+    }
+
+    /// Whether basert installs here: everywhere but a package's folder.
+    pub fn takes_installs(&self) -> bool {
+        self.origin != Origin::BesidePackage
     }
 
     /// Whether an install can be made or replaced here: its parent takes a
@@ -275,6 +323,58 @@ impl Install {
 
     pub fn is_installed(&self) -> bool {
         is_executable(&self.binary())
+    }
+
+    /// Mark an install basert made (beside it or in its data directory, not
+    /// one `$BASERT_SUPERFLUID_DIR` names) as basert's, for a copy installed
+    /// before installs carried the file. Best effort: a directory that cannot
+    /// be written stays as it is.
+    pub fn claim(&self) {
+        if self.origin != Origin::Env
+            && self.is_installed()
+            && !self.root.join(INSTALLED_BY).exists()
+        {
+            let _ = fs::write(self.root.join(INSTALLED_BY), format!("{OWNED_BY}\n"));
+        }
+    }
+
+    /// That this install's directory may be replaced whole, as an install
+    /// replaces it: it holds superfluid alone (see [`not_superfluids`]), or
+    /// nothing yet. A prefix such as `~/.local`, which superfluid's own install
+    /// script fills and `$BASERT_SUPERFLUID_DIR` may name, holds the user's
+    /// other files, which would be removed with it. `fresh` is the release
+    /// about to take its place.
+    pub fn replaceable(&self, fresh: &Path) -> Result<()> {
+        if fs::symlink_metadata(&self.root).is_err() {
+            return Ok(());
+        }
+        // A program of superfluid's name (a `cargo install superfluid`) is
+        // not a directory to look in.
+        let found = match fs::metadata(&self.root).is_ok_and(|m| m.is_dir()) {
+            true => match not_superfluids(&self.root, fresh, Level::Top) {
+                Some(found) => found,
+                None => return Ok(()),
+            },
+            false => self.root.clone(),
+        };
+        let what = match found == self.root {
+            true => format!(
+                "{} is a file, not superfluid's directory",
+                self.root.display()
+            ),
+            false => format!(
+                "{} holds {}, which is not superfluid's",
+                self.root.display(),
+                found.display()
+            ),
+        };
+        let then = match self.origin {
+            Origin::Env => format!(
+                "name a directory of superfluid's own in {DIR_ENV} (a new one: basert installs superfluid there)"
+            ),
+            _ => format!("move {} aside", found.display()),
+        };
+        bail!("{what}, and replacing superfluid there would remove it: nothing is changed; {then}")
     }
 
     /// The release installed here: the stamp an install writes, else what the
@@ -332,6 +432,110 @@ impl Install {
         release: &Release,
         say: &mut dyn FnMut(&str),
     ) -> Result<()> {
+        let _turn = self.take_turn(say)?;
+        let staged = self.stage(source, release, say)?;
+        self.swap_in(staged, say)
+    }
+
+    /// The lock file `kind` beside this install, made when missing; `None`
+    /// where it cannot be (a directory basert cannot write, where it
+    /// installs nothing either).
+    fn lock(&self, kind: &str) -> Option<fs::File> {
+        let name = self.root.file_name()?.to_string_lossy();
+        let parent = self.parent();
+        // Not there before a first install.
+        let _ = fs::create_dir_all(&parent);
+        let path = parent.join(format!(".{}.{kind}.lock", name.trim_start_matches('.')));
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .ok()
+    }
+
+    /// Installs into this directory take turns: one that finds another under
+    /// way says so and waits for it, then looks again at what is there.
+    pub fn take_turn(&self, say: &mut dyn FnMut(&str)) -> Result<Option<Held>> {
+        let Some(file) = self.lock("install") else {
+            return Ok(None);
+        };
+        if !flock(&file, libc::LOCK_EX | libc::LOCK_NB)? {
+            say(&format!(
+                "waiting for another basert installing superfluid into {}",
+                self.root.display()
+            ));
+            flock(&file, libc::LOCK_EX)?;
+        }
+        Ok(Some(Held(file)))
+    }
+
+    /// Held by a start from asking this install until its server stops: no
+    /// install swaps it in between. Waits only while one swaps.
+    pub fn hold(&self) -> Option<Held> {
+        let file = self.lock("use")?;
+        flock(&file, libc::LOCK_SH).ok()?.then_some(Held(file))
+    }
+
+    /// That no server runs from this install (one `basert serve` started
+    /// holds it; others are found by what runs from the directory) and none
+    /// starts while the returned lock is held.
+    pub fn unused(&self) -> Result<Option<Held>> {
+        let file = self.lock("use");
+        let free = match &file {
+            Some(file) => flock(file, libc::LOCK_EX | libc::LOCK_NB)?,
+            None => true,
+        };
+        let pids = crate::selfupdate::running_from(&self.root);
+        if free && pids.is_empty() {
+            return Ok(file.map(Held));
+        }
+        let who = match pids.is_empty() {
+            true => "one basert serve started".to_string(),
+            false => format!(
+                "pid {}",
+                pids.iter()
+                    .map(i32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        bail!(
+            "a server runs from {} ({who}): stop it, then run this again",
+            self.root.display()
+        )
+    }
+
+    /// The install a start would run for the engine in `engine`, asked as a
+    /// start asks but nothing installed: the first found that can serve,
+    /// else the first found, with why it cannot.
+    pub fn choose(
+        engine: Option<&Path>,
+        home: Option<&Path>,
+    ) -> Result<Option<(Install, Result<(), String>)>> {
+        let mut first = None;
+        for install in Self::candidates()?
+            .into_iter()
+            .filter(Install::is_installed)
+        {
+            let ready = install.probe(engine, home).ready;
+            if ready.is_ok() {
+                return Ok(Some((install, ready)));
+            }
+            first.get_or_insert((install, ready));
+        }
+        Ok(first)
+    }
+
+    /// The first half of [`Install::install`]: `release` downloaded, checked
+    /// and unpacked beside this install, where it can be asked whether it
+    /// serves an engine before it takes this one's place.
+    pub fn stage(
+        &self,
+        source: &Source,
+        release: &Release,
+        say: &mut dyn FnMut(&str),
+    ) -> Result<Staged> {
         let tag = &release.tag;
         let name = format!("superfluid-{}", target()?);
         let parent = self.parent();
@@ -350,38 +554,49 @@ impl Install {
         ));
         source.fetch(release, &format!("{name}.tar.gz"), &tarball)?;
         source.fetch(release, &format!("{name}.tar.gz.sha256"), &checksum)?;
-        let want = fs::read_to_string(&checksum)
-            .with_context(|| format!("reading {}", checksum.display()))?
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let have = sha256_of(&tarball)?;
-        if want.len() != 64 || want != have {
-            bail!(
-                "{name}.tar.gz: SHA-256 is {have}, the release's checksum file says {want:?}: \
-                 the download is not the published file"
-            );
-        }
+        check_sha256(&tarball, &checksum)?;
 
         let unpacked = stage.path().join("unpacked");
         fs::create_dir(&unpacked)?;
-        let status = Command::new("tar")
-            .arg("-xzf")
-            .arg(&tarball)
-            .arg("-C")
-            .arg(&unpacked)
-            .status()
-            .context("running tar")?;
-        if !status.success() {
-            bail!("tar -xzf {} failed ({status})", tarball.display());
-        }
+        untar(&tarball, &unpacked)?;
         let fresh = unpacked.join(&name);
         if !is_executable(&fresh.join("bin").join("superfluid")) {
             bail!("{name}.tar.gz holds no {name}/bin/superfluid");
         }
         fs::write(fresh.join(STAMP), format!("{tag}\n"))?;
+        fs::write(fresh.join(INSTALLED_BY), format!("{OWNED_BY}\n"))?;
+        Ok(Staged {
+            _dir: stage,
+            fresh: Install {
+                root: fresh,
+                origin: self.origin,
+            },
+            tag: tag.clone(),
+            replacing: self.installed_release(),
+        })
+    }
 
+    /// The second half of [`Install::install`]: the staged release takes this
+    /// install's place.
+    pub fn swap_in(&self, staged: Staged, say: &mut dyn FnMut(&str)) -> Result<()> {
+        let tag = &staged.tag;
+        let fresh = &staged.fresh.root;
+        self.replaceable(fresh)?;
+        // The last look, held through the swap: no server runs from it, and
+        // none starts until it is done; and it holds what it held when the
+        // release was staged.
+        let _swapping = self.unused()?;
+        let now = self.installed_release();
+        if now != staged.replacing {
+            bail!(
+                "{} changed while superfluid {tag} was fetched (it holds {}, not {}): nothing \
+                 is changed; run this again",
+                self.root.display(),
+                now.as_deref().unwrap_or("no superfluid"),
+                staged.replacing.as_deref().unwrap_or("none")
+            );
+        }
+        let parent = self.parent();
         let old = parent.join(format!(".superfluid-old-{}", std::process::id()));
         let had_old = self.root.exists();
         if had_old {
@@ -392,7 +607,7 @@ impl Install {
                 )
             })?;
         }
-        if let Err(e) = fs::rename(&fresh, &self.root) {
+        if let Err(e) = fs::rename(fresh, &self.root) {
             if had_old {
                 let _ = fs::rename(&old, &self.root);
             }
@@ -408,6 +623,171 @@ impl Install {
         ));
         Ok(())
     }
+}
+
+/// A release [`Install::stage`] unpacked beside an install: `fresh` can be
+/// probed as an install of its own until [`Install::swap_in`] moves it into
+/// place. Dropped instead, it is removed.
+pub struct Staged {
+    _dir: tempfile::TempDir,
+    pub fresh: Install,
+    pub tag: String,
+    /// The release installed where it goes when it was staged.
+    replacing: Option<String>,
+}
+
+/// A lock on an install, in a file beside its directory (which an install
+/// replaces whole). Installs into the directory take turns on one
+/// ([`Install::take_turn`]); a start holds the other shared from asking the
+/// install until its server stops ([`Install::hold`],
+/// [`Serving::hold_through_exec`]), and an install holds it exclusive while
+/// it swaps ([`Install::unused`]).
+pub struct Held(fs::File);
+
+/// `flock(op)` on `file`: false when `LOCK_NB` is asked and another holds it.
+fn flock(file: &fs::File, op: libc::c_int) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // SAFETY: flock on a descriptor this process holds open.
+        if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => return Ok(false),
+            _ => return Err(e),
+        }
+    }
+}
+
+/// The superfluid a start runs, and its hold on it.
+pub struct Serving {
+    pub binary: PathBuf,
+    /// The release the install says it is (`vX.Y.Z`), when it says.
+    pub release: Option<String>,
+    held: Option<Held>,
+}
+
+impl Serving {
+    /// The hold kept open across the `exec` that makes this process the
+    /// server, and by each process the server starts: no install swaps
+    /// superfluid under it while it runs.
+    pub fn hold_through_exec(self) {
+        use std::os::fd::IntoRawFd;
+        if let Some(Held(file)) = self.held {
+            let fd = file.into_raw_fd();
+            // SAFETY: fcntl on a descriptor this process holds open.
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                }
+            }
+        }
+    }
+}
+
+/// Where in a release [`not_superfluids`] looks.
+#[derive(Debug, Clone, Copy)]
+enum Level {
+    Top,
+    Bin,
+    Libexec,
+    Other,
+}
+
+/// The first entry under `dir` that is not superfluid's, `at` that level of a
+/// release: superfluid's is a name `fresh` (the same level of the release
+/// about to replace it) has too, or one of superfluid's layout (`bin/` holding
+/// `superfluid*`, `libexec/superfluid/`, the release's `LICENSE`, `NOTICE`,
+/// `README.md` and `compat.json`, the `.release` and `installed-by` basert
+/// writes). A link is superfluid's only where `fresh` has one (a release holds
+/// none; superfluid's own install script links `bin/superfluid` to its
+/// versions); a directory that cannot be read is not.
+fn not_superfluids(dir: &Path, fresh: &Path, at: Level) -> Option<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Some(dir.to_path_buf());
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Some(dir.to_path_buf());
+        };
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            return Some(path);
+        };
+        let theirs = fs::symlink_metadata(fresh.join(&name));
+        if meta.file_type().is_symlink() {
+            if !theirs.is_ok_and(|m| m.file_type().is_symlink()) {
+                return Some(path);
+            }
+            continue;
+        }
+        let layout = match at {
+            Level::Top => {
+                matches!(
+                    name.as_str(),
+                    "bin" | "libexec" | "LICENSE" | "NOTICE" | "README.md" | "compat.json"
+                ) || name == STAMP
+                    || name == INSTALLED_BY
+            }
+            Level::Bin => name.starts_with("superfluid"),
+            Level::Libexec => name == "superfluid",
+            Level::Other => false,
+        };
+        if !layout && theirs.is_err() {
+            return Some(path);
+        }
+        if meta.is_dir() {
+            let inner = match (at, name.as_str()) {
+                // superfluid's own directory: its workers and libraries.
+                (Level::Libexec, "superfluid") => continue,
+                (Level::Top, "bin") => Level::Bin,
+                (Level::Top, "libexec") => Level::Libexec,
+                _ => Level::Other,
+            };
+            if let Some(found) = not_superfluids(&path, &fresh.join(&name), inner) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// That `tarball` is the file whose SHA-256 the release's `checksum` file
+/// (`<hex>  <name>`) states.
+pub(crate) fn check_sha256(tarball: &Path, checksum: &Path) -> Result<()> {
+    let name = tarball.file_name().unwrap_or_default().to_string_lossy();
+    let want = fs::read_to_string(checksum)
+        .with_context(|| format!("reading {}", checksum.display()))?
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let have = sha256_of(tarball)?;
+    if want.len() != 64 || want != have {
+        bail!(
+            "{name}: SHA-256 is {have}, the release's checksum file says {want:?}: \
+             the download is not the published file"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn untar(tarball: &Path, into: &Path) -> Result<()> {
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(tarball)
+        .arg("-C")
+        .arg(into)
+        .status()
+        .context("running tar")?;
+    if !status.success() {
+        bail!("tar -xzf {} failed ({status})", tarball.display());
+    }
+    Ok(())
 }
 
 /// What a superfluid says of its basert runtime against an engine.
@@ -520,22 +900,29 @@ impl Source {
                     .with_context(|| format!("copying {}", from.display()))
                     .map(|_| ())
             }
-            Source::GitHub => {
-                let url = release.url(file);
-                // GitHub answers an asset with a redirect to its storage, which
-                // the agent follows.
-                let response = agent(Duration::from_secs(600))
-                    .get(&url)
-                    .call()
-                    .with_context(|| format!("downloading {url}"))?;
-                let mut body = response.into_body().into_reader();
-                let mut out = fs::File::create(dest)
-                    .with_context(|| format!("creating {}", dest.display()))?;
-                std::io::copy(&mut body, &mut out).with_context(|| format!("reading {url}"))?;
-                Ok(())
-            }
+            Source::GitHub => download(&release.url(file), dest),
         }
     }
+}
+
+/// `url` into the file `dest`. A listing in a file (a mirror's, the tests')
+/// may name its assets by path instead.
+pub(crate) fn download(url: &str, dest: &Path) -> Result<()> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return fs::copy(url, dest)
+            .with_context(|| format!("copying {url}"))
+            .map(|_| ());
+    }
+    // GitHub answers an asset with a redirect to its storage, which the
+    // agent follows.
+    let response = agent(Duration::from_secs(600))
+        .get(url)
+        .call()
+        .with_context(|| format!("downloading {url}"))?;
+    let mut body = response.into_body().into_reader();
+    let mut out = fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+    std::io::copy(&mut body, &mut out).with_context(|| format!("reading {url}"))?;
+    Ok(())
 }
 
 impl Source {
@@ -581,9 +968,20 @@ pub fn wanted(source: &Source, say: &mut dyn FnMut(&str)) -> Release {
 }
 
 /// superfluid's release listing, or the one `$BASERT_SUPERFLUID_RELEASES` names.
-fn releases() -> Result<serde_json::Value> {
+pub(crate) fn releases() -> Result<serde_json::Value> {
     let named = std::env::var(RELEASES_ENV).ok().filter(|v| !v.is_empty());
-    let at = named.as_deref().unwrap_or(RELEASES);
+    read_listing(named.as_deref().unwrap_or(RELEASES))
+}
+
+/// The newest superfluid release that serves engine ABI `abi` here, from
+/// [`releases`]: `None` when the listing names none.
+pub fn newest_for(abi: u32) -> Result<Option<Release>> {
+    let target = target()?;
+    Ok(newest_in(&releases()?, target, abi))
+}
+
+/// A release listing in GitHub's form, from a URL or a file.
+pub(crate) fn read_listing(at: &str) -> Result<serde_json::Value> {
     let text = if at.starts_with("https://") || at.starts_with("http://") {
         agent(Duration::from_secs(60))
             .get(at)
@@ -601,6 +999,16 @@ fn releases() -> Result<serde_json::Value> {
 /// nor a pre-release and publishes, for `target`, the tarball, its checksum
 /// and the marker of engine ABI `abi`.
 pub fn newest_in(listing: &serde_json::Value, target: &str, abi: u32) -> Option<Release> {
+    newest_where(listing, target, abi, &|_| true)
+}
+
+/// [`newest_in`] among the releases `keep` accepts (by their listing entry).
+pub fn newest_where(
+    listing: &serde_json::Value,
+    target: &str,
+    abi: u32,
+    keep: &dyn Fn(&serde_json::Value) -> bool,
+) -> Option<Release> {
     let tarball = format!("superfluid-{target}.tar.gz");
     let checksum = format!("{tarball}.sha256");
     let marker = format!("superfluid-basert-abi-{abi}.txt");
@@ -609,6 +1017,7 @@ pub fn newest_in(listing: &serde_json::Value, target: &str, abi: u32) -> Option<
         .iter()
         .filter(|r| !r["draft"].as_bool().unwrap_or(false))
         .filter(|r| !r["prerelease"].as_bool().unwrap_or(false))
+        .filter(|r| keep(r))
         .filter_map(|r| {
             let tag = r["tag_name"].as_str()?;
             let assets = r["assets"].as_array()?;
@@ -637,7 +1046,7 @@ fn release_key(tag: &str) -> Option<Vec<u64>> {
 }
 
 /// Whether the release `have` is newer than `than`.
-fn newer(have: Option<&str>, than: &str) -> bool {
+pub(crate) fn newer(have: Option<&str>, than: &str) -> bool {
     match (have.and_then(release_key), release_key(than)) {
         (Some(have), Some(than)) => have > than,
         _ => false,
@@ -673,11 +1082,11 @@ pub fn policy() -> Download {
     }
 }
 
-/// The superfluid a `basert serve` start runs, as a path to its binary: the
+/// The superfluid a `basert serve` start runs, with its hold on it: the
 /// first install whose basert runtime superfluid itself reports ready for
 /// the engine in `engine`, under `home` as its `SUPERFLUID_HOME`. `say` gets
 /// a line for each step taken on the user's behalf.
-pub fn ensure(engine: Option<&Path>, home: &Path, say: &mut dyn FnMut(&str)) -> Result<PathBuf> {
+pub fn ensure(engine: Option<&Path>, home: &Path, say: &mut dyn FnMut(&str)) -> Result<Serving> {
     ensure_with(policy(), &Source::locate(), engine, home, say)
 }
 
@@ -687,15 +1096,24 @@ pub fn ensure_with(
     engine: Option<&Path>,
     home: &Path,
     say: &mut dyn FnMut(&str),
-) -> Result<PathBuf> {
-    // Every install found is asked; the first that can serve runs.
+) -> Result<Serving> {
+    // Every install found is asked; the first that can serve runs. Each is
+    // held while asked, and the one that runs until its server stops.
     let mut unready: Vec<(Install, Option<String>, String)> = Vec::new();
     for install in Install::candidates()?
         .into_iter()
         .filter(Install::is_installed)
     {
+        install.claim();
+        let held = install.hold();
         match install.probe(engine, Some(home)).ready {
-            Ok(()) => return Ok(install.binary()),
+            Ok(()) => {
+                return Ok(Serving {
+                    binary: install.binary(),
+                    release: install.installed_release(),
+                    held,
+                })
+            }
             Err(why) => {
                 let have = install.installed_release();
                 unready.push((install, have, why));
@@ -732,9 +1150,43 @@ pub fn ensure_with(
             }
         ));
     }
-    let dest = match unready.iter().map(|(i, _, _)| i).find(|i| i.writable()) {
+    let dest = match unready
+        .iter()
+        .map(|(i, _, _)| i)
+        .find(|i| i.takes_installs() && i.writable())
+    {
         Some(found) => found.clone(),
         None => Install::for_install()?,
+    };
+    // A server's workers start from that directory: replaced under it, its
+    // next one would be another release's. Two baserts on engines that need
+    // different releases share one (a package's basert installs in its data
+    // directory), so the other's server may run from it. Looked at before
+    // the download, and again at the swap.
+    if let Err(e) = dest.unused() {
+        bail!(
+            "superfluid at {} cannot serve this engine and {tag} can, but {e:#}",
+            dest.root.display()
+        );
+    }
+    // Installs into it take turns: one that finished while this waited may
+    // serve this engine, and then runs.
+    let turn = match (policy, &release) {
+        (Download::Never, _) | (_, None) => None,
+        _ => {
+            let turn = dest.take_turn(say)?;
+            if dest.is_installed() {
+                let held = dest.hold();
+                if dest.probe(engine, Some(home)).ready.is_ok() {
+                    return Ok(Serving {
+                        binary: dest.binary(),
+                        release: dest.installed_release(),
+                        held,
+                    });
+                }
+            }
+            turn
+        }
     };
     let hint = format!(
         "install it with\n  basert superfluid install\n(the newest superfluid release that serves \
@@ -768,9 +1220,16 @@ pub fn ensure_with(
             release
         }
     };
-    dest.install(source, &release, say)?;
+    let staged = dest.stage(source, &release, say)?;
+    dest.swap_in(staged, say)?;
+    let held = dest.hold();
+    drop(turn);
     match dest.probe(engine, Some(home)).ready {
-        Ok(()) => Ok(dest.binary()),
+        Ok(()) => Ok(Serving {
+            binary: dest.binary(),
+            release: dest.installed_release(),
+            held,
+        }),
         Err(why) => bail!(
             "superfluid {tag}, installed at {}, cannot serve this engine: {why}",
             dest.root.display()
@@ -779,7 +1238,7 @@ pub fn ensure_with(
 }
 
 /// A yes/no question on stderr, answered on stdin; an empty answer is yes.
-fn confirm(question: &str) -> Result<bool> {
+pub(crate) fn confirm(question: &str) -> Result<bool> {
     eprint!("{question}");
     std::io::stderr().flush()?;
     let mut answer = String::new();
@@ -790,14 +1249,14 @@ fn confirm(question: &str) -> Result<bool> {
     ))
 }
 
-fn sha256_of(path: &Path) -> Result<String> {
+pub(crate) fn sha256_of(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher)?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
@@ -876,6 +1335,49 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_basert_made_before_is_claimed_and_one_the_user_named_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (origin, claimed) in [
+            (Origin::BesideBasert, true),
+            (Origin::BesidePackage, true),
+            (Origin::UserData, true),
+            (Origin::Env, false),
+        ] {
+            let root = tmp.path().join(format!("{origin:?}"));
+            fs::create_dir_all(root.join("bin")).unwrap();
+            fs::write(
+                root.join("bin").join("superfluid"),
+                fake_superfluid("0.1.3"),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                root.join("bin").join("superfluid"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            let install = Install {
+                root: root.clone(),
+                origin,
+            };
+            install.claim();
+            assert_eq!(root.join(INSTALLED_BY).is_file(), claimed, "{origin:?}");
+        }
+        // A file already there is left as it is.
+        let root = tmp.path().join("BesideBasert");
+        fs::write(root.join(INSTALLED_BY), "someone: else\n").unwrap();
+        Install {
+            root: root.clone(),
+            origin: Origin::BesideBasert,
+        }
+        .claim();
+        assert_eq!(
+            fs::read_to_string(root.join(INSTALLED_BY)).unwrap(),
+            "someone: else\n"
+        );
+    }
+
+    #[test]
     fn an_install_unpacks_the_release_and_stamps_it() {
         let tmp = tempfile::tempdir().unwrap();
         let assets = release(tmp.path(), "0.1.3", true);
@@ -896,14 +1398,27 @@ mod tests {
             .join("superfluid-worker-basert")
             .is_file());
         assert_eq!(install.installed_release().as_deref(), Some(RELEASE));
+        // basert's own copy, which superfluid's `self update` leaves to basert.
+        assert_eq!(
+            fs::read_to_string(install.root.join(INSTALLED_BY)).unwrap(),
+            format!("{OWNED_BY}\n")
+        );
         assert_eq!(said.len(), 2, "{said:?}");
         assert!(said[0].starts_with(&format!("downloading superfluid {RELEASE} (")));
-        // Nothing of the staging is left behind.
-        let left: Vec<_> = fs::read_dir(tmp.path().join("bin"))
+        // Nothing of the staging is left behind; the locks beside it stay.
+        let mut left: Vec<_> = fs::read_dir(tmp.path().join("bin"))
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
-        assert_eq!(left, ["superfluid"]);
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                ".superfluid.install.lock",
+                ".superfluid.use.lock",
+                "superfluid"
+            ]
+        );
     }
 
     #[test]
@@ -929,6 +1444,194 @@ mod tests {
             "kept"
         );
         assert_eq!(install.installed_release().as_deref(), Some(RELEASE));
+    }
+
+    /// What `bin/superfluid` in `root` says it is.
+    fn says(root: &Path) -> String {
+        fs::read_to_string(root.join("bin").join("superfluid")).unwrap()
+    }
+
+    #[test]
+    fn a_directory_holding_more_than_superfluid_is_not_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = release(&tmp.path().join("first"), "0.1.3", true);
+        let next = release(&tmp.path().join("next"), "0.1.4", true);
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        // What each directory holds beside (or instead of) superfluid: a
+        // prefix such as ~/.local, which superfluid's own install script
+        // fills and `$BASERT_SUPERFLUID_DIR` may name, and a directory of
+        // the user's own named before anything was installed in it.
+        type Extra = fn(&Path, &Path);
+        let cases: [(&str, bool, Extra, &str); 4] = [
+            (
+                "share",
+                true,
+                |root, _| {
+                    fs::create_dir_all(root.join("share").join("app")).unwrap();
+                    fs::write(root.join("share").join("app").join("data.txt"), "mine").unwrap();
+                },
+                "share",
+            ),
+            (
+                "tool",
+                true,
+                |root, _| {
+                    fs::write(root.join("bin").join("other-tool"), "mine").unwrap();
+                },
+                "other-tool",
+            ),
+            (
+                "link",
+                true,
+                |root, elsewhere| {
+                    // superfluid's install script links bin/superfluid to its
+                    // own versions.
+                    fs::rename(
+                        root.join("bin").join("superfluid"),
+                        elsewhere.join("superfluid"),
+                    )
+                    .unwrap();
+                    std::os::unix::fs::symlink(
+                        elsewhere.join("superfluid"),
+                        root.join("bin").join("superfluid"),
+                    )
+                    .unwrap();
+                },
+                "superfluid",
+            ),
+            (
+                "mine",
+                false,
+                |root, _| {
+                    fs::create_dir_all(root).unwrap();
+                    fs::write(root.join("notes.txt"), "mine").unwrap();
+                },
+                "notes.txt",
+            ),
+        ];
+        for (name, with_superfluid, extra, named) in cases {
+            let install = install_at(tmp.path().join(name));
+            if with_superfluid {
+                install
+                    .install(&Source::Dir(first.clone()), &Release::tested(), &mut |_| {})
+                    .unwrap();
+            }
+            extra(&install.root, &elsewhere);
+            let before = says_all(&install.root);
+            let err = install
+                .install(&Source::Dir(next.clone()), &Release::tested(), &mut |_| {})
+                .unwrap_err();
+            let err = format!("{err:#}");
+            assert!(err.contains("which is not superfluid's"), "{name}: {err}");
+            assert!(err.contains(named), "{name}: {err}");
+            assert!(err.contains("BASERT_SUPERFLUID_DIR"), "{name}: {err}");
+            assert_eq!(says_all(&install.root), before, "{name}");
+            // Nothing staged is left beside it (the locks stay).
+            let left: Vec<_> = fs::read_dir(tmp.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|n| n.starts_with('.') && !n.ends_with(".lock"))
+                .collect();
+            assert!(left.is_empty(), "{name}: {left:?}");
+        }
+    }
+
+    /// Every file under `root` with what it holds, links as their targets.
+    fn says_all(root: &Path) -> Vec<(PathBuf, String)> {
+        let mut all = Vec::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                let meta = fs::symlink_metadata(&path).unwrap();
+                if meta.file_type().is_symlink() {
+                    all.push((
+                        path.clone(),
+                        format!("-> {}", fs::read_link(&path).unwrap().display()),
+                    ));
+                } else if meta.is_dir() {
+                    dirs.push(path);
+                } else {
+                    all.push((path.clone(), fs::read_to_string(&path).unwrap()));
+                }
+            }
+        }
+        all.sort();
+        all
+    }
+
+    #[test]
+    fn a_file_where_superfluid_would_go_is_left_alone_and_said_to_be_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let assets = release(tmp.path(), "0.1.4", true);
+        // A program of superfluid's name (`cargo install superfluid` puts one
+        // beside a basert cargo installed).
+        let install = Install {
+            root: tmp.path().join("superfluid"),
+            origin: Origin::BesideBasert,
+        };
+        fs::write(&install.root, "#!/bin/sh\n").unwrap();
+        let err = install
+            .install(&Source::Dir(assets), &Release::tested(), &mut |_| {})
+            .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains(&format!(
+                "{} is a file, not superfluid's directory",
+                install.root.display()
+            )),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("move {} aside", install.root.display())),
+            "{err}"
+        );
+        assert_eq!(fs::read_to_string(&install.root).unwrap(), "#!/bin/sh\n");
+    }
+
+    #[test]
+    fn what_the_next_release_also_holds_is_superfluids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, fresh) = (tmp.path().join("root"), tmp.path().join("fresh"));
+        for dir in [&root, &fresh] {
+            fs::create_dir_all(dir.join("share").join("superfluid")).unwrap();
+            fs::write(dir.join("share").join("superfluid").join("t.json"), "").unwrap();
+            fs::create_dir_all(dir.join("bin")).unwrap();
+            fs::write(dir.join("bin").join("sf-helper"), "").unwrap();
+        }
+        assert_eq!(not_superfluids(&root, &fresh, Level::Top), None);
+        fs::write(root.join("share").join("other.txt"), "").unwrap();
+        assert_eq!(
+            not_superfluids(&root, &fresh, Level::Top),
+            Some(root.join("share").join("other.txt"))
+        );
+    }
+
+    #[test]
+    fn a_directory_holding_superfluid_alone_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = release(&tmp.path().join("first"), "0.1.3", true);
+        let next = release(&tmp.path().join("next"), "0.1.4", true);
+        let install = install_at(tmp.path().join("superfluid"));
+        install
+            .install(&Source::Dir(first), &Release::tested(), &mut |_| {})
+            .unwrap();
+        // All a release holds, the release's own files included, and what
+        // basert writes beside them.
+        for file in ["LICENSE", "NOTICE", "README.md", "compat.json"] {
+            fs::write(install.root.join(file), "release").unwrap();
+        }
+        for tool in ["superfluid-noded", "superfluid-workerd"] {
+            fs::write(install.root.join("bin").join(tool), "release").unwrap();
+        }
+        assert!(install.root.join(STAMP).is_file());
+        assert!(install.root.join(INSTALLED_BY).is_file());
+        install
+            .install(&Source::Dir(next), &Release::tested(), &mut |_| {})
+            .unwrap();
+        assert!(says(&install.root).contains("superfluid 0.1.4"));
+        assert!(!install.root.join("LICENSE").exists());
     }
 
     #[test]

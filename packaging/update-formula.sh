@@ -63,6 +63,8 @@ class Basert < Formula
     # basert-* runtime tools next to itself, and they find their kernel files
     # the same way. bin/basert is a small script that runs libexec/basert.
     libexec.install Dir["*"]
+    # basert self update leaves this copy to Homebrew and names the command.
+    (libexec/"installed-by").write "Homebrew: brew upgrade basert\n"
     bin.write_exec_script libexec/"basert"
     # For the Rust / Python / Node bindings and C API users.
     lib.install_symlink Dir[libexec/"libbaseRT*"]

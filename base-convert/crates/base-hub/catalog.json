@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-09-24",
+  "updated": "2026-10-30",
   "models": [
     {
       "id": "basecompute/Llama-3.1-8B-Instruct",
@@ -716,8 +716,10 @@
       "revision": "main",
       "arch": "gemma4",
       "quant": "default-q4",
-      "size": 2941140992,
-      "sha256": "785c3527ab6d33e4d2a1976e63ecc2bf13ceb0cab5b00ce375fd9cec2a971bc0"
+      "size": 3095953408,
+      "sha256": "9f1af96cfa1e4b1e2402a5493266be78b4f1330abd9d301e0f90626ee3c0155d",
+      "speculator": "gemma4-mtp",
+      "speculator_version": "1"
     },
     {
       "id": "basecompute/gemma-4-E2B-it",
@@ -726,8 +728,10 @@
       "revision": "main",
       "arch": "gemma4",
       "quant": "default-q8",
-      "size": 5334106112,
-      "sha256": "3e9a9c8629756b2513cf2de35e6a3c18604374085b999b7841c128d542af52d9"
+      "size": 5488918528,
+      "sha256": "511c4e05778de12646b622339286577223feed46577b7961b8a8cc26b961e3d5",
+      "speculator": "gemma4-mtp",
+      "speculator_version": "1"
     },
     {
       "id": "basecompute/gemma-4-E2B-it",
@@ -736,9 +740,11 @@
       "revision": "main",
       "arch": "gemma4",
       "quant": "cuda-q4mix",
-      "size": 4298522624,
-      "sha256": "47e5da7e8d4d339bacdaf82b0550b5de53506fcbf1effd52e0fe8b680b68e214",
-      "backend": "cuda"
+      "size": 4453335040,
+      "sha256": "bef4c080b67e7dd64a55e44e109f58f32bb3afacc3f866b9decfa7b1af1730f7",
+      "backend": "cuda",
+      "speculator": "gemma4-mtp",
+      "speculator_version": "1"
     },
     {
       "id": "basecompute/gemma-4-E2B-it",
@@ -747,9 +753,11 @@
       "revision": "main",
       "arch": "gemma4",
       "quant": "cuda-q8",
-      "size": 5350326272,
-      "sha256": "115c4ae330c2b4acd9dfc586a3ebe6a2080efb9de10f893f8d42eaf960a8e5d4",
-      "backend": "cuda"
+      "size": 5505138688,
+      "sha256": "62ed6171de32f6ab850c2e0d4d5b008e89acd85d546ba5d3dfead7e0e8ea3ac2",
+      "backend": "cuda",
+      "speculator": "gemma4-mtp",
+      "speculator_version": "1"
     },
     {
       "id": "basecompute/gemma-4-E4B-it",
@@ -758,8 +766,10 @@
       "revision": "main",
       "arch": "gemma4",
       "quant": "default-q4",
-      "size": 4558422016,
-      "sha256": "68348e8a9d4d0a00f9fe9e3ea80835f9d45d2165e1fc407f68366bf72b64bb8f"
+      "size": 4714807296,
+      "sha256": "8b9ed714236cab79117bef245038085125a22bc94a827022be14e61af6ba87b2",
+      "speculator": "gemma4-mtp",
+      "speculator_version": "1"
     },
     {
       "id": "basecompute/gemma-4-E4B-it",
@@ -768,8 +778,10 @@
       "revision": "main",
       "arch": "gemma4",
       "quant": "default-q8",
-      "size": 8297676800,
-      "sha256": "c293bd1e3479b293fab353783af6d96dc285d3b07b688034eb544e36c99c9ef7"
+      "size": 8454062080,
+      "sha256": "7765fb9d5ec1430df5e03e270b082e41bcc3aa17d0e7b47c5b0075b3c51380dc",
+      "speculator": "gemma4-mtp",
+      "speculator_version": "1"
     },
     {
       "id": "basecompute/nomic-embed-text-v1.5",

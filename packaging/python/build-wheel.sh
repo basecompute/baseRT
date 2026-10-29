@@ -36,7 +36,7 @@ cp "$root"/bindings/python/baseRT/*.py "$stage/baseRT/"
 cp "$here/_cli.py" "$stage/baseRT/_cli.py"
 cp "$here/pyproject.toml" "$here/README.md" "$stage/"
 cp "$root/LICENSE" "$root/NOTICE" "$stage/"
-"$root/packaging/stage-engine.sh" "$bundle" "$stage/baseRT/_engine"
+"$root/packaging/stage-engine.sh" "$bundle" "$stage/baseRT/_engine" "pip: pip install --upgrade basert"
 
 tag=$(python3 "$here/platform_tag.py" "$stage/baseRT/_engine")
 

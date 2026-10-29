@@ -141,8 +141,9 @@ pub fn entry_from_header(
         backend,
         // The selectable strategy kind: a target's in-bundle head says so in
         // `speculator.config.kind` ("mtp"; its `arch` is model-specific, e.g.
-        // qwen35-mtp), a sidecar IS the drafter, so its own architecture is
-        // the kind (dflash / dspark / eagle3).
+        // qwen35-mtp; "gemma4-mtp" for Gemma 4's separate head embedded by
+        // `basert add-speculator`), a sidecar IS the drafter, so its own
+        // architecture is the kind (dflash / dspark / eagle3).
         speculator: header
             .speculator
             .as_ref()
@@ -156,6 +157,12 @@ pub fn entry_from_header(
                 "dflash" | "dspark" | "eagle3" => Some(header.arch.clone()),
                 _ => None,
             }),
+        speculator_version: header.speculator.as_ref().and_then(|s| {
+            s.config
+                .get("head_version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        }),
         speculator_for: None,
         speculator_rank: None,
     })
