@@ -33,6 +33,8 @@ tempfile.workspace = true
 dirs.workspace = true
 # `basert superfluid install` fetches superfluid's release tarball from GitHub.
 ureq = "3"
+# `basert self`: whether a process is alive, and (macOS) what each runs.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

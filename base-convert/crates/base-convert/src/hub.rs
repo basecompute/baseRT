@@ -449,7 +449,101 @@ fn auto_pull_and_resolve(
 /// with several installed without naming one). An uninstalled model is fetched
 /// on demand — preferring the pre-converted basecompute mirror, else converting
 /// the source repo — so `basert chat`/`serve <id>` Just Works.
-fn resolve_hub_model(token: &str, default_variant: Option<&str>) -> Result<PathBuf> {
+/// What `--speculate` asks of the model's own MTP head in a runtime
+/// command's args: bare `mtp-head`, or `auto`, which takes that head before
+/// any drafter. None when speculation is off or not asked for, a drafter is
+/// named, or the strategy needs no head (`prompt-lookup`).
+pub(crate) fn mtp_speculation_asked(rest: &[String]) -> Option<&str> {
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let v = if a == "--speculate" {
+            it.next().map(String::as_str)
+        } else {
+            a.strip_prefix("--speculate=")
+        };
+        if let Some(v) = v {
+            return matches!(v, "mtp-head" | "auto").then_some(v);
+        }
+    }
+    None
+}
+
+/// An installed catalog file that cannot serve the speculation asked for,
+/// though the catalog's current file could: it carries no MTP head, or one
+/// of another version than the row's `speculator_version`, while the row for
+/// the same id and variant says the published file has one (`speculator:
+/// mtp`, or `gemma4-mtp` for Gemma 4's embedded head) and is another file
+/// (its sha256 differs). Only a file the catalog installed qualifies —
+/// pulling it again replaces like with like; a conversion or a file from
+/// elsewhere is left alone. Returns the variant to pull again.
+fn stale_head_variant(reg: &MergedRegistry, id: &str, path: &Path) -> Option<String> {
+    let sidecar = cache::read_sidecar(path.parent()?).ok()??;
+    if sidecar.source_kind != "catalog" {
+        return None;
+    }
+    let row = reg.catalog.rows(id).find(|e| e.quant == sidecar.variant)?;
+    if !matches!(row.speculator.as_deref(), Some("mtp" | "gemma4-mtp")) {
+        return None;
+    }
+    let same_file = matches!((&row.sha256, &sidecar.base_sha256), (Some(want), Some(got)) if want.eq_ignore_ascii_case(got));
+    if same_file {
+        return None;
+    }
+    let header = base_format::BaseReader::read_header(path).ok()?;
+    let stale = match (&header.speculator, &row.speculator_version) {
+        // No head at all.
+        (None, _) => true,
+        // A head of another version than the one the catalog publishes.
+        (Some(have), Some(want)) => {
+            have.config.get("head_version").and_then(|v| v.as_str()) != Some(want.as_str())
+        }
+        // A head, and the catalog names no version to hold it to.
+        (Some(_), None) => false,
+    };
+    stale.then_some(sidecar.variant)
+}
+
+/// The installed artifact to serve, pulled again first when `--speculate
+/// <directive>` asks for its MTP head and the catalog's current file has one
+/// this file lacks (stale_head_variant). Without a speculation request the
+/// file is served as it is, with no word said.
+fn serve_ready(
+    reg: &MergedRegistry,
+    id: &str,
+    path: PathBuf,
+    mtp: Option<&str>,
+) -> Result<PathBuf> {
+    let Some(directive) = mtp else {
+        return Ok(path);
+    };
+    let Some(variant) = stale_head_variant(reg, id, &path) else {
+        return Ok(path);
+    };
+    eprintln!(
+        "{id} [{variant}]: the installed file carries no MTP head and the catalog's current one does — \
+         pulling it again for --speculate {directive}"
+    );
+    cmd_pull(PullArgs {
+        id: format!("{id}:{variant}"),
+        profile: None,
+        target: TargetScheme::BaseQ4,
+        revision: "main".to_string(),
+        file: None,
+        force: true,
+        dry_run: false,
+    })
+    .with_context(|| format!("pulling {id}:{variant} again"))?;
+    let reg2 = MergedRegistry::load()?;
+    installed_best_variant(&reg2, id, &variant).with_context(|| {
+        format!("pulled {id}:{variant} again but could not locate the installed artifact")
+    })
+}
+
+fn resolve_hub_model(
+    token: &str,
+    default_variant: Option<&str>,
+    mtp: Option<&str>,
+) -> Result<PathBuf> {
     let (id, inline) = token
         .split_once(':')
         .map_or((token, None), |(i, v)| (i, Some(v)));
@@ -470,13 +564,13 @@ fn resolve_hub_model(token: &str, default_variant: Option<&str>) -> Result<PathB
 
     if let Some(v) = variant {
         if let Some(p) = installed_best_variant(&reg, id, v) {
-            return Ok(p);
+            return serve_ready(&reg, id, p, mtp);
         }
         return auto_pull_and_resolve(&reg, id, Some(v));
     }
 
     if let Some(p) = installed_single_path(&reg, id)? {
-        return Ok(p);
+        return serve_ready(&reg, id, p, mtp);
     }
     auto_pull_and_resolve(&reg, id, None)
 }
@@ -487,10 +581,13 @@ fn resolve_hub_model(token: &str, default_variant: Option<&str>) -> Result<PathB
 /// comes from the `--variant` launcher flag and applies to ids without an
 /// inline `:variant`.
 fn resolve_model_args(rest: &[String], default_variant: Option<&str>) -> Result<Vec<String>> {
+    // `--speculate mtp-head` / `auto` asks for the model's own head: a stale
+    // catalog file without one is pulled again on the way (serve_ready).
+    let mtp = mtp_speculation_asked(rest);
     rest.iter()
         .map(|arg| {
             if looks_like_hub_id(arg) {
-                Ok(resolve_hub_model(arg, default_variant)?
+                Ok(resolve_hub_model(arg, default_variant, mtp)?
                     .to_string_lossy()
                     .into_owned())
             } else if let Some((kind, id)) = speculate_drafter_id(arg) {
@@ -498,7 +595,7 @@ fn resolve_model_args(rest: &[String], default_variant: Option<&str>) -> Result<
                 // it drafts for: catalogue lookup, pull, convert-on-pull,
                 // variant selection, hub cache. A drafter was the one model a
                 // user had to fetch and convert by hand and then name by path.
-                let path = resolve_hub_model(id, default_variant)?;
+                let path = resolve_hub_model(id, default_variant, None)?;
                 Ok(format!("{kind}:{}", path.to_string_lossy()))
             } else {
                 Ok(arg.clone())
@@ -615,11 +712,10 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
         (vec![format!("basert-{cmd}"), format!("baseRT_{cmd}")], rest)
     };
 
-    // Prefer a binary sitting next to `basert` (how the release ships); fall
-    // back to a bare name, which `Command` resolves against `PATH`.
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf));
+    // Prefer a binary sitting next to `basert` (how the release ships; for the
+    // versions layout, in the version this launcher runs from); fall back to a
+    // bare name, which `Command` resolves against `PATH`.
+    let exe_dir = crate::selfupdate::bundle_dir().ok();
     let harness_environment_override = std::env::var_os(COMPUTEARENA_HARNESS_ENV).is_some()
         || std::env::var_os(LEGACY_COMPUTEARENA_HARNESS_ENV).is_some();
     let bundled_harness = if is_computearena {
@@ -674,11 +770,15 @@ const RUNTIME_COMMANDS: [&str; 5] = ["chat", "complete", "bench", "transcribe", 
 
 pub fn cmd_pull(args: PullArgs) -> Result<()> {
     let reg = MergedRegistry::load()?;
-    if let Some((id, variant)) = args.id.split_once(':') {
-        let fetcher = HfFetcher::new(cache::hf_staging_dir(&reg.root))?;
-        return pull_variant(&reg, &args, id, variant, &fetcher);
-    }
-    pull_id(&reg, &args)
+    // Resolved against whichever catalog the attempt is given: the cached one
+    // first, the live one if the cached rows prove to be behind the Hub.
+    with_fresh_catalog_on_mismatch(&reg, MergedRegistry::load_fresh, |reg| {
+        if let Some((id, variant)) = args.id.split_once(':') {
+            let fetcher = HfFetcher::new(cache::hf_staging_dir(&reg.root))?;
+            return pull_variant(reg, &args, id, variant, &fetcher);
+        }
+        pull_id(reg, &args)
+    })
 }
 
 /// Where `basert pull <id>:<variant>` gets the variant from (see
@@ -1230,6 +1330,78 @@ fn print_plan(r: &ModelRef, want: &str) {
 }
 
 /// Fast path: download a pre-converted `.base` from the catalog.
+/// A pulled file whose bytes are not the catalog row's (`expected`): typed,
+/// so a caller can tell a catalog that is behind the Hub from a bad download
+/// (with_fresh_catalog_on_mismatch).
+#[derive(Debug)]
+struct ShaMismatch {
+    id: String,
+    file: String,
+    expected: String,
+    got: String,
+}
+
+impl std::fmt::Display for ShaMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sha256 mismatch for {} ({}): expected {}, got {}",
+            self.id, self.file, self.expected, self.got
+        )
+    }
+}
+
+impl std::error::Error for ShaMismatch {}
+
+/// Runs `attempt` against `reg`; when it fails because the file's bytes are
+/// not the row's sha256, fetches the live catalog past the cache (`refetch`)
+/// and runs it once more if the live row names another sha256. The cached
+/// catalog is served under its TTL without a look at the hosted one, and a
+/// bundle's row and file change together on the Hub, so between that change
+/// and the cache's expiry a fresh pull downloads the new bytes and checks
+/// them against the old row. The live catalog settles it: a Hub file that
+/// disagrees with the live row too stays an error, as does a cache that
+/// cannot be refreshed.
+fn with_fresh_catalog_on_mismatch(
+    reg: &MergedRegistry,
+    refetch: impl FnOnce() -> Option<MergedRegistry>,
+    attempt: impl Fn(&MergedRegistry) -> Result<()>,
+) -> Result<()> {
+    let err = match attempt(reg) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    let Some(m) = err.downcast_ref::<ShaMismatch>() else {
+        return Err(err);
+    };
+    let Some(fresh) = refetch() else {
+        return Err(err);
+    };
+    let changed = fresh.catalog.rows(&m.id).any(|e| {
+        e.file == m.file
+            && e.sha256
+                .as_deref()
+                .is_some_and(|s| !s.eq_ignore_ascii_case(&m.expected))
+    });
+    if !changed {
+        return Err(err);
+    }
+    eprintln!(
+        "  catalog: the cached catalog was behind the Hub ({}'s sha256 changed); pulling again from the live one",
+        m.file
+    );
+    attempt(&fresh)
+}
+
+/// Where a pull puts the downloaded `.base` until it has passed the checks
+/// that make it the installed one: beside it (`model.base.pending`), on the
+/// same filesystem, so the final move is a rename.
+fn pending_path(out: &Path) -> PathBuf {
+    let mut p = out.as_os_str().to_owned();
+    p.push(".pending");
+    PathBuf::from(p)
+}
+
 fn pull_catalog(root: &Path, r: &ModelRef, fetcher: &dyn Fetcher) -> Result<()> {
     let ModelRef::Catalog {
         id,
@@ -1254,28 +1426,40 @@ fn pull_catalog(root: &Path, r: &ModelRef, fetcher: &dyn Fetcher) -> Result<()> 
     std::fs::create_dir_all(&vdir)?;
     let out = cache::base_artifact_path(&vdir);
     announce_parts(&artifact, &out);
-    // Moves the staged download into place (same filesystem), so the pulled
-    // artifact exists exactly once on disk.
+    // The download lands beside the installed file (same filesystem, moved
+    // from the staging area, so it exists once on disk) and replaces it only
+    // once its sha256 is the row's: a forced pull that fails the check — a
+    // `basert serve` refreshing a file for its head, `pull --force` — leaves
+    // the file and its sidecar as they were rather than an empty slot.
+    let pending = pending_path(&out);
     parts::install(
         fetcher,
         hf_repo,
         revision,
         &artifact,
-        &out,
+        &pending,
         parts_sha256.as_deref(),
     )?;
 
-    let got_sha = crate::compute_sha256_streaming(&out)?;
+    let got_sha = crate::compute_sha256_streaming(&pending)?;
     if let Some(expected) = sha256 {
         if !got_sha.eq_ignore_ascii_case(expected) {
-            std::fs::remove_file(&out).ok();
+            std::fs::remove_file(&pending).ok();
             // The staged bytes are equally bad — no resume value in them, so
             // clear them and let a retry start from scratch.
             fetch::cleanup_staging(fetcher, hf_repo);
-            bail!("sha256 mismatch for {id}: expected {expected}, got {got_sha}");
+            return Err(ShaMismatch {
+                id: id.clone(),
+                file: file.clone(),
+                expected: expected.clone(),
+                got: got_sha,
+            }
+            .into());
         }
         eprintln!("  sha256:  verified");
     }
+    std::fs::rename(&pending, &out)
+        .with_context(|| format!("moving {} into place", pending.display()))?;
 
     write_sidecar_for(
         &vdir,
@@ -1336,22 +1520,32 @@ fn pull_base_direct(
     let out = cache::base_artifact_path(&vdir);
     announce_parts(artifact, &out);
 
-    // Moves the staged download into place (same filesystem), so the pulled
-    // artifact exists exactly once on disk. A part set is reassembled beside
-    // `out` and renamed into place once complete.
+    // As pull_catalog: the download lands beside the installed file (moved
+    // from the staging area; a part set is reassembled there first) and
+    // replaces it only once it passes the catalog's sha256, so a failed
+    // forced pull leaves the installed file and its sidecar as they were.
     let parts_sha256 = listed.and_then(|e| e.parts_sha256.as_deref());
-    parts::install(fetcher, repo, revision, artifact, &out, parts_sha256)?;
+    let pending = pending_path(&out);
+    parts::install(fetcher, repo, revision, artifact, &pending, parts_sha256)?;
 
-    let sha = crate::compute_sha256_streaming(&out).ok();
+    let sha = crate::compute_sha256_streaming(&pending).ok();
     if let Some(expected) = listed.and_then(|e| e.sha256.as_deref()) {
         let got = sha.as_deref().unwrap_or("nothing readable");
         if !got.eq_ignore_ascii_case(expected) {
-            std::fs::remove_file(&out).ok();
+            std::fs::remove_file(&pending).ok();
             fetch::cleanup_staging(fetcher, repo);
-            bail!("sha256 mismatch for {id} ({file}): expected {expected}, got {got}");
+            return Err(ShaMismatch {
+                id: id.to_string(),
+                file: file.clone(),
+                expected: expected.to_string(),
+                got: got.to_string(),
+            }
+            .into());
         }
         eprintln!("  sha256:  verified");
     }
+    std::fs::rename(&pending, &out)
+        .with_context(|| format!("moving {} into place", pending.display()))?;
     write_sidecar_for(
         &vdir,
         id,
@@ -1434,6 +1628,8 @@ fn pull_and_convert(
     let conv = ConvertArgs {
         input: snapshot,
         output: Some(out.clone()),
+        mtp_head: None,
+        mtp_head_version: None,
         target: args.target,
         calib: None,
         calib_tokens: 512,
@@ -2793,6 +2989,149 @@ mod tests {
         );
     }
 
+    /// A cached catalog behind the Hub — the row's sha256 is the old file's,
+    /// the Hub serves the new one — fails a fresh pull's checksum; the pull
+    /// then fetches the live catalog and, when the live row names the new
+    /// sha256, pulls once more against it. A live row that agrees with the
+    /// stale one (the Hub really disagrees), or no live catalog at all, leaves
+    /// the error, after one attempt.
+    #[test]
+    fn a_stale_catalog_row_is_retried_from_the_live_catalog() {
+        use sha2::{Digest, Sha256};
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_repo(
+            tmp.path(),
+            "basecompute/cat-files",
+            &[("cat-Medium.base", b"medium")],
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let real = format!("{:x}", Sha256::digest(b"medium"));
+        let row = |sha: &str| {
+            catalog(&format!(
+                r#"{{"id":"basecompute/cat","hf_repo":"basecompute/cat-files","quant":"default-medium","file":"cat-Medium.base","sha256":"{sha}"}}"#
+            ))
+        };
+        let root = tmp.path().join("hub");
+        let stale = MergedRegistry::new(root.clone(), row(&"0".repeat(64)));
+        let out = root.join("basecompute/cat/default-medium/model.base");
+        let attempts = std::cell::Cell::new(0);
+        let attempt = |reg: &MergedRegistry| {
+            attempts.set(attempts.get() + 1);
+            let r = reg
+                .resolve("basecompute/cat", "main", Some("default-medium"), false)
+                .unwrap();
+            pull_catalog(&reg.root, &r, &fetcher)
+        };
+
+        // The live catalog knows the new file: the retry installs it.
+        with_fresh_catalog_on_mismatch(
+            &stale,
+            || Some(MergedRegistry::new(root.clone(), row(&real))),
+            attempt,
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(std::fs::read(&out).unwrap(), b"medium");
+        let s = cache::read_sidecar(out.parent().unwrap()).unwrap().unwrap();
+        assert_eq!(s.base_sha256.as_deref(), Some(real.as_str()));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // The live row agrees with the stale one: the Hub is wrong, one attempt.
+        attempts.set(0);
+        let err = with_fresh_catalog_on_mismatch(
+            &stale,
+            || Some(MergedRegistry::new(root.clone(), row(&"0".repeat(64)))),
+            attempt,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"), "{err}");
+        assert_eq!(attempts.get(), 1);
+        assert!(!out.exists());
+
+        // No live catalog to be had: the error as it was.
+        attempts.set(0);
+        let err = with_fresh_catalog_on_mismatch(&stale, || None, attempt).unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"), "{err}");
+        assert_eq!(attempts.get(), 1);
+    }
+
+    /// A pull that fails the catalog's sha256 leaves an installed file and
+    /// its sidecar as they were, on both pull paths: the download is checked
+    /// beside them and moved into place only when it is the row's file. A
+    /// forced pull is what `basert serve` runs to refresh a file for its MTP
+    /// head, so a catalog and a Hub file that disagree must not cost the
+    /// model that was being served.
+    #[test]
+    fn a_failed_checksum_leaves_the_installed_file_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_repo(
+            tmp.path(),
+            "basecompute/cat-files",
+            &[("cat-Medium.base", b"medium")],
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let reg = MergedRegistry::new(
+            tmp.path().join("hub"),
+            catalog(&format!(
+                r#"{{"id":"basecompute/cat","hf_repo":"basecompute/cat-files","quant":"default-medium","file":"cat-Medium.base","sha256":"{}"}}"#,
+                "0".repeat(64)
+            )),
+        );
+        // What an earlier pull installed, with the sidecar it recorded.
+        let vdir = cache::variant_dir(&reg.root, "basecompute/cat", "default-medium").unwrap();
+        std::fs::create_dir_all(&vdir).unwrap();
+        let out = cache::base_artifact_path(&vdir);
+        std::fs::write(&out, b"the installed one").unwrap();
+        write_sidecar_for(
+            &vdir,
+            "basecompute/cat",
+            "catalog",
+            "basecompute/cat-files",
+            None,
+            "main",
+            "default-medium",
+            None,
+            Some("installed-sha".into()),
+            Some("cat-Medium.base"),
+        )
+        .unwrap();
+        let untouched = |what: &str| {
+            assert_eq!(
+                std::fs::read(&out).unwrap(),
+                b"the installed one",
+                "{what}: the file"
+            );
+            let s = cache::read_sidecar(&vdir).unwrap().unwrap();
+            assert_eq!(
+                s.base_sha256.as_deref(),
+                Some("installed-sha"),
+                "{what}: the sidecar"
+            );
+            assert!(
+                !pending_path(&out).exists(),
+                "{what}: no download left beside it"
+            );
+        };
+
+        // The catalog path, forced (the refresh `basert serve` runs).
+        let r = reg
+            .resolve("basecompute/cat", "main", Some("default-medium"), true)
+            .unwrap();
+        assert!(matches!(r, ModelRef::Catalog { .. }));
+        let err = pull_catalog(&reg.root, &r, &fetcher).unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"), "{err}");
+        untouched("catalog path");
+
+        // The direct path, by file name, forced.
+        let args = PullArgs {
+            force: true,
+            ..named("cat-Medium.base", false, "basecompute/cat")
+        };
+        let err = pull_named(&reg, &fetcher, &args).unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"), "{err}");
+        untouched("direct path");
+    }
+
     /// The catalog's own file is held to the catalog's sha256 when named.
     #[test]
     fn a_named_catalog_file_is_checked_against_the_catalog() {
@@ -3500,7 +3839,7 @@ mod tests {
     fn resolve_hub_model_rejects_empty_variant() {
         // A trailing `:` (empty variant) is a typo — error before any pull,
         // rather than silently resolving to the q4 default.
-        let err = resolve_hub_model("basecompute/Gemma-4-E2B-it:", None)
+        let err = resolve_hub_model("basecompute/Gemma-4-E2B-it:", None, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("empty variant"), "{err}");
@@ -3562,5 +3901,172 @@ mod tests {
         let (variant, path, guard) = choose_profile(&mk(TargetScheme::Bf16)).unwrap();
         assert_eq!(variant, "bf16");
         assert!(path.is_none() && guard.is_none());
+    }
+
+    #[test]
+    fn mtp_speculation_is_asked_by_mtp_head_or_auto() {
+        let asked = |v: &[&str]| {
+            mtp_speculation_asked(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            asked(&["m.base", "--speculate", "mtp-head"]).as_deref(),
+            Some("mtp-head")
+        );
+        assert_eq!(
+            asked(&["--speculate=auto", "m.base"]).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(asked(&["m.base", "--speculate", "dflash:org/d"]), None);
+        assert_eq!(asked(&["m.base", "--speculate", "off"]), None);
+        assert_eq!(asked(&["m.base", "--speculate", "prompt-lookup"]), None);
+        assert_eq!(asked(&["m.base", "--speculate"]), None);
+        assert_eq!(asked(&["m.base"]), None);
+    }
+
+    /// A catalog file without the head its row now promises is pulled again
+    /// for speculation; one with a head, one the catalog promises no head
+    /// for, the catalog's own file, or an install from elsewhere are not.
+    #[test]
+    fn a_catalog_file_without_the_head_its_row_promises_is_stale() {
+        use base_format::{SpeculatorBundle, FORMAT_VERSION, MAGIC};
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let id = "basecompute/gemma-4-E4B-it";
+        let (old, new) = ("b".repeat(64), "a".repeat(64));
+        // A header-only bundle (read_header never reaches the blob) and the
+        // sidecar a pull records beside it.
+        // `head`: None for no head, Some(version) for one (None = unversioned).
+        let install = |variant: &str, head: Option<Option<&str>>, source_kind: &str| -> PathBuf {
+            let vdir = cache::variant_dir(&root, id, variant).unwrap();
+            std::fs::create_dir_all(&vdir).unwrap();
+            let path = cache::base_artifact_path(&vdir);
+            let mut h =
+                crate::embed::fixtures::header("gemma4", serde_json::json!({"hidden_size": 8}));
+            if let Some(version) = head {
+                let mut config: std::collections::BTreeMap<String, serde_json::Value> =
+                    [("kind".to_string(), serde_json::json!("gemma4-mtp"))]
+                        .into_iter()
+                        .collect();
+                if let Some(v) = version {
+                    config.insert("head_version".to_string(), serde_json::json!(v));
+                }
+                h.speculator = Some(SpeculatorBundle {
+                    arch: "gemma4-mtp".into(),
+                    config,
+                    tensors: vec![],
+                });
+            }
+            let json = h.to_canonical_json().unwrap();
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&MAGIC).unwrap();
+            f.write_all(&FORMAT_VERSION.to_le_bytes()).unwrap();
+            f.write_all(&(json.len() as u64).to_le_bytes()).unwrap();
+            f.write_all(&json).unwrap();
+            cache::write_sidecar(
+                &vdir,
+                &HubSidecar {
+                    id: id.into(),
+                    source_kind: source_kind.into(),
+                    hf_repo: id.into(),
+                    source_repo: None,
+                    revision: "main".into(),
+                    variant: variant.into(),
+                    profile: None,
+                    pulled_at: "0".into(),
+                    base_sha256: Some(old.clone()),
+                    file: Some(format!("{variant}.base")),
+                },
+            )
+            .unwrap();
+            path
+        };
+        let reg = |variant: &str, speculator: &str, sha: &str| {
+            MergedRegistry::new(
+                root.clone(),
+                catalog(&format!(
+                    r#"{{"id":"{id}","hf_repo":"{id}","file":"{variant}.base","quant":"{variant}","sha256":"{sha}"{speculator}}}"#
+                )),
+            )
+        };
+        let promised = r#","speculator":"gemma4-mtp""#;
+
+        let headless = install("default-q8", None, "catalog");
+        assert_eq!(
+            stale_head_variant(&reg("default-q8", promised, &new), id, &headless).as_deref(),
+            Some("default-q8")
+        );
+        assert_eq!(
+            stale_head_variant(
+                &reg("default-q8", r#","speculator":"mtp""#, &new),
+                id,
+                &headless
+            )
+            .as_deref(),
+            Some("default-q8")
+        );
+        assert_eq!(
+            stale_head_variant(&reg("default-q8", "", &new), id, &headless),
+            None,
+            "the catalog promises no head"
+        );
+        assert_eq!(
+            stale_head_variant(&reg("default-q8", promised, &old), id, &headless),
+            None,
+            "the catalog's file is this one"
+        );
+        assert_eq!(
+            stale_head_variant(&reg("default-q4", promised, &new), id, &headless),
+            None,
+            "another variant's row"
+        );
+
+        let with_head = install("default-q4", Some(None), "catalog");
+        assert_eq!(
+            stale_head_variant(&reg("default-q4", promised, &new), id, &with_head),
+            None,
+            "it has its head"
+        );
+
+        // A versioned head: stale only when the catalog names another version.
+        let v1 = install("cuda-q8", Some(Some("1")), "catalog");
+        let versioned =
+            |v: &str| format!(r#","speculator":"gemma4-mtp","speculator_version":"{v}""#);
+        assert_eq!(
+            stale_head_variant(&reg("cuda-q8", &versioned("1"), &new), id, &v1),
+            None,
+            "the catalog's head is this version"
+        );
+        assert_eq!(
+            stale_head_variant(&reg("cuda-q8", &versioned("2"), &new), id, &v1).as_deref(),
+            Some("cuda-q8"),
+            "the catalog's head is a newer version"
+        );
+        assert_eq!(
+            stale_head_variant(&reg("cuda-q8", promised, &new), id, &v1),
+            None,
+            "the catalog names no version to hold it to"
+        );
+        assert_eq!(
+            stale_head_variant(&reg("default-q4", &versioned("1"), &new), id, &with_head)
+                .as_deref(),
+            Some("default-q4"),
+            "an unversioned head against a versioned row"
+        );
+
+        let converted = install("default-f16", None, "huggingface");
+        assert_eq!(
+            stale_head_variant(&reg("default-f16", promised, &new), id, &converted),
+            None,
+            "not the catalog's install"
+        );
+
+        // Without a speculation request the file is served as it is.
+        let r = reg("default-q8", promised, &new);
+        assert_eq!(
+            serve_ready(&r, id, headless.clone(), None).unwrap(),
+            headless
+        );
     }
 }

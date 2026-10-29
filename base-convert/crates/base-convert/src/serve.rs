@@ -94,7 +94,8 @@ Accepted so that existing command lines keep working, and no longer used:
 State (the request log, uploaded files) is kept under $BASERT_STATE_DIR, by
 default the serve/ directory beside the model cache, one directory per port.
 The engine library is found beside basert (or in ../lib); BASERT_LIB names
-another directory. BASERT_SUPERFLUID_DIR names where superfluid is installed;
+another directory. BASERT_SUPERFLUID_DIR names a directory of superfluid's
+own to run and install it in (one holding other files is never replaced);
 BASERT_SUPERFLUID_RELEASES another release listing (a URL or a file);
 BASERT_SUPERFLUID_SOURCE a directory holding the tested release's tarball,
 read instead of GitHub; BASERT_SUPERFLUID_AUTO_INSTALL=0 forbids a download
@@ -427,8 +428,11 @@ pub fn run(rest: &[String]) -> Result<()> {
     let parsed = parse(rest);
     if parsed == Ok(Parsed::Version) {
         println!("basert serve {}", env!("CARGO_PKG_VERSION"));
-        match superfluid::Install::locate()? {
-            Some(i) => println!(
+        // The superfluid a start would run.
+        let engine = engine_dir().ok().flatten();
+        let home = superfluid_home().ok();
+        match superfluid::Install::choose(engine.as_deref(), home.as_deref())? {
+            Some((i, _)) => println!(
                 "superfluid {} ({})",
                 i.installed_release()
                     .unwrap_or_else(|| "of a release it does not say".to_string()),
@@ -505,8 +509,8 @@ pub fn run(rest: &[String]) -> Result<()> {
         tail.push(dir.display().to_string());
     }
     if o.print_command {
-        let binary = match superfluid::Install::locate()? {
-            Some(i) => i.binary().display().to_string(),
+        let binary = match superfluid::Install::choose(engine.as_deref(), Some(&home))? {
+            Some((i, _)) => i.binary().display().to_string(),
             None => "superfluid (not installed; the newest release would be)".to_string(),
         };
         let mut words = vec![binary, "serve".to_string()];
@@ -528,9 +532,22 @@ pub fn run(rest: &[String]) -> Result<()> {
         );
         return Ok(());
     }
-    let binary = superfluid::ensure(engine.as_deref(), &home, &mut |line| {
+    let serving = superfluid::ensure(engine.as_deref(), &home, &mut |line| {
         eprintln!("basert serve: {line}")
     })?;
+    let binary = serving.binary.clone();
+    // A superfluid from before 0.1.6 serves a bundle with Google's Gemma 4
+    // head inside but cannot use the head, and its own words do not say what
+    // to do: for `mtp-head`, which it would refuse, the start stops here with
+    // the way out; under `auto`, which it would quietly decode plainly, the
+    // start goes on with the notice said.
+    let directive = crate::hub::mtp_speculation_asked(&o.passthrough);
+    if let Some(note) = embedded_head_notice(&o.models, directive, serving.release.as_deref()) {
+        if directive == Some("mtp-head") {
+            fail(&format!("basert serve: {note}"));
+        }
+        eprintln!("basert serve: {note}");
+    }
     std::fs::create_dir_all(&home)
         .with_context(|| format!("Error: could not create {}", home.display()))?;
 
@@ -547,6 +564,18 @@ pub fn run(rest: &[String]) -> Result<()> {
     if o.verbose {
         command.env("SUPERFLUID_ENGINE_VERBOSE", "1");
     }
+    // This process becomes the server: its pid marks the engine's version as
+    // in use, which no update removes while it runs. That engine is
+    // `$BASERT_LIB`'s when it names one (superfluid reads it itself).
+    let serving_engine = engine.clone().or_else(|| {
+        std::env::var_os("BASERT_LIB")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    });
+    crate::selfupdate::note_serving(serving_engine.as_deref());
+    // The server keeps the start's hold on its superfluid, so no install
+    // swaps it under the server.
+    serving.hold_through_exec();
     use std::os::unix::process::CommandExt;
     let err = command.exec();
     Err(err).with_context(|| format!("launching {}", binary.display()))
@@ -561,6 +590,58 @@ fn shell_word(word: &str) -> String {
     }
 }
 
+/// What `basert serve` says before launching a superfluid that cannot use
+/// the Gemma 4 head embedded in a model: `--speculate mtp-head` or `auto` was
+/// asked, a model's header carries a `gemma4-mtp` head, and `release` — the
+/// superfluid about to run, as `vX.Y.Z` — predates 0.1.6, the first release
+/// that takes that kind. Earlier ones serve the bundle but answer `mtp-head`
+/// with "not an MTP head" and `auto` with nothing, so the way out is said
+/// here. None when there is nothing to say, or the release is not a version
+/// this can compare.
+pub(crate) fn embedded_head_notice(
+    models: &[String],
+    speculate: Option<&str>,
+    release: Option<&str>,
+) -> Option<String> {
+    let directive = speculate.filter(|d| matches!(*d, "mtp-head" | "auto"))?;
+    let release = release?;
+    if !release_predates(release, (0, 1, 6))? {
+        return None;
+    }
+    let model = models
+        .iter()
+        .find(|m| embedded_head_kind(Path::new(m)).as_deref() == Some("gemma4-mtp"))?;
+    Some(format!(
+        "superfluid {release} cannot use the Gemma 4 head in {model}: `--speculate {directive}` needs \
+         superfluid 0.1.6 or later (this one {}); run `basert superfluid install --force`, or \
+         `basert self update`",
+        if directive == "mtp-head" {
+            "refuses the head"
+        } else {
+            "decodes plainly"
+        }
+    ))
+}
+
+/// The `kind` of the head a bundle's header carries, if any.
+fn embedded_head_kind(path: &Path) -> Option<String> {
+    let h = base_format::BaseReader::read_header(path).ok()?;
+    h.speculator?
+        .config
+        .get("kind")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Whether `release` (`v0.1.5`, `0.1.5`) is older than `want`; None when it
+/// is not three numbers.
+fn release_predates(release: &str, want: (u64, u64, u64)) -> Option<bool> {
+    let mut it = release.trim().trim_start_matches('v').split('.');
+    let mut num = || it.next()?.parse::<u64>().ok();
+    let v = (num()?, num()?, num()?);
+    Some(v < want)
+}
+
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
     std::process::exit(1);
@@ -572,7 +653,7 @@ pub(crate) fn superfluid_home() -> Result<PathBuf> {
     Ok(state_dir()?.join("superfluid"))
 }
 
-fn state_dir() -> Result<PathBuf> {
+pub(crate) fn state_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("BASERT_STATE_DIR").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
@@ -594,7 +675,11 @@ pub(crate) fn engine_dir() -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let exe = std::env::current_exe().context("this program's own path")?;
-    let dir = exe.parent().context("this program's own directory")?;
+    // For the versions layout, the version this launcher runs from by its real
+    // path, not the install directory's links through `current`: an update
+    // turns those under a running server, whose workers load the engine
+    // again with each model.
+    let dir = &crate::selfupdate::bundle_dir()?;
     let mut candidates = vec![dir.to_path_buf(), dir.join("..").join("lib")];
     candidates.extend(
         dir.ancestors()
@@ -637,6 +722,83 @@ fn first_model_under(dir: &Path, depth: usize) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `basert serve` says, before a superfluid from before 0.1.6 starts,
+    /// that it cannot use a model's embedded Gemma 4 head — only when
+    /// speculation is asked for, a model carries that head, and the release
+    /// is one it can compare and predates 0.1.6.
+    #[test]
+    fn a_superfluid_before_0_1_6_is_told_about_an_embedded_head() {
+        use base_format::{SpeculatorBundle, FORMAT_VERSION, MAGIC};
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        // A header-only bundle (read_header never reaches the blob).
+        let bundle = |name: &str, kind: Option<&str>| -> String {
+            let mut h =
+                crate::embed::fixtures::header("gemma4", serde_json::json!({"hidden_size": 8}));
+            if let Some(k) = kind {
+                h.speculator = Some(SpeculatorBundle {
+                    arch: k.into(),
+                    config: [("kind".to_string(), serde_json::json!(k))]
+                        .into_iter()
+                        .collect(),
+                    tensors: vec![],
+                });
+            }
+            let path = tmp.path().join(name);
+            let json = h.to_canonical_json().unwrap();
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&MAGIC).unwrap();
+            f.write_all(&FORMAT_VERSION.to_le_bytes()).unwrap();
+            f.write_all(&(json.len() as u64).to_le_bytes()).unwrap();
+            f.write_all(&json).unwrap();
+            path.display().to_string()
+        };
+        let gemma = bundle("gemma.base", Some("gemma4-mtp"));
+        let qwen = bundle("qwen.base", Some("mtp"));
+        let plain = bundle("plain.base", None);
+        let note = |models: &[&str], spec: Option<&str>, rel: Option<&str>| {
+            let models: Vec<String> = models.iter().map(|m| m.to_string()).collect();
+            embedded_head_notice(&models, spec, rel)
+        };
+
+        let said = note(&[&gemma], Some("mtp-head"), Some("v0.1.5")).unwrap();
+        assert!(
+            said.contains("v0.1.5")
+                && said.contains("gemma.base")
+                && said.contains("install --force")
+                && said.contains("refuses the head"),
+            "{said}"
+        );
+        let said = note(&[&plain, &gemma], Some("auto"), Some("0.1.5")).unwrap();
+        assert!(said.contains("decodes plainly"), "{said}");
+
+        let quiet: [(&[&str], Option<&str>, Option<&str>); 9] = [
+            (&[&gemma], Some("mtp-head"), Some("v0.1.6")),
+            (&[&gemma], Some("auto"), Some("v0.2.0")),
+            (&[&gemma], Some("off"), Some("v0.1.5")),
+            (&[&gemma], Some("prompt-lookup"), Some("v0.1.5")),
+            (&[&gemma], None, Some("v0.1.5")),
+            (&[&qwen], Some("mtp-head"), Some("v0.1.5")),
+            (&[&plain], Some("mtp-head"), Some("v0.1.5")),
+            (&[&gemma], Some("mtp-head"), None),
+            (
+                &[&gemma],
+                Some("mtp-head"),
+                Some("of a release it does not say"),
+            ),
+        ];
+        for (models, spec, rel) in quiet {
+            assert!(
+                note(models, spec, rel).is_none(),
+                "{models:?} {spec:?} {rel:?}"
+            );
+        }
+        assert_eq!(release_predates("v0.1.5", (0, 1, 6)), Some(true));
+        assert_eq!(release_predates("0.1.6", (0, 1, 6)), Some(false));
+        assert_eq!(release_predates("v0.10.0", (0, 1, 6)), Some(false));
+        assert_eq!(release_predates("0.1.6-rc1", (0, 1, 6)), None);
+    }
 
     fn line(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()

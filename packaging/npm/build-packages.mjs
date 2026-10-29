@@ -101,7 +101,11 @@ try {
       throw new Error(`missing ${bundle} (bindings/node is at ${version}; has release v${version} been published?)`);
     }
     const dir = path.join(stage, p.name.split("/")[1]);
-    run(path.join(root, "packaging/stage-engine.sh"), [bundle, path.join(dir, "engine")]);
+    run(path.join(root, "packaging/stage-engine.sh"), [
+      bundle,
+      path.join(dir, "engine"),
+      `npm: npm install --global ${SCOPE}/basert@latest`,
+    ]);
     fs.copyFileSync(path.join(dir, "engine/LICENSE"), path.join(dir, "LICENSE"));
     fs.writeFileSync(
       path.join(dir, "README.md"),

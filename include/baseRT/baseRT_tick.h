@@ -1,4 +1,6 @@
-// baseRT_tick.h — the basertd engine ABI additions (basertd §10 items 1–3, 8).
+// baseRT_tick.h — the tick engine ABI superfluid drives (designed for the
+// retired basertd daemon: docs/design/basertd.md §10 items 1–3, 8; "basertd §N"
+// below cites that document).
 //
 // Normative reference: docs/design/basertd-tick-schema.md (draft 7).
 // This header is the in-process ABI between a Rust engine-worker and the
@@ -9,7 +11,7 @@
 // Layout rules (normative):
 //   - Every struct is 8-byte aligned with EXPLICIT padding; no field relies
 //     on implicit compiler padding. Layouts are identical across the
-//     compilers we target; basertd-abi's layout probe test enforces parity
+//     compilers we target; superfluid-abi's layout probe test enforces parity
 //     with the Rust #[repr(C)] mirrors.
 //   - Top-level structs carry `struct_size` and grow append-only.
 //   - Every record array is a BaseRTArray; decoding follows the four
@@ -563,7 +565,7 @@ baseRT_status baseRT_tick(baseRT_model_t bundle, const BaseRTTickPlan *plan, con
 // ---------------------------------------------------------------------------
 //
 // The worker owns the shm mappings; the engine is handed base pointers.
-// Ring memory layout (normative; basertd-shm's `SharedRing` is the
+// Ring memory layout (normative; superfluid-shm's `SharedRing` is the
 // reference implementation and the interop test):
 //
 //   [64-byte ring header]  magic u64 = BASERT_RING_MAGIC ("BRTRING1" LE)

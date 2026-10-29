@@ -50,10 +50,25 @@ fn fc_transform(canonical: &str) -> Option<ValueTransform> {
 
 pub struct DflashHfMapper;
 pub struct DsparkHfMapper;
+/// Google's Gemma 4 MTP drafter (`Gemma4AssistantForCausalLM`, the
+/// `*-assistant` repos): a few dense Gemma 4 layers with QUERY projections
+/// only — they attend over the target's KV cache (`num_kv_shared_layers` =
+/// every layer, `attention_k_eq_v`) — fed by `pre_projection` from
+/// [target token embedding ; target post-norm hidden] (2 x backbone hidden)
+/// and projected back to the backbone width by `post_projection` as the next
+/// draft step's hidden. Its own `embed_tokens` is the DRAFT logit head
+/// (hidden-width rows); the input embedding is the target's.
+pub struct Gemma4MtpHfMapper;
 
 /// Canonical arch strings of the block-drafter family.
 pub fn is_block_drafter_arch(arch: &str) -> bool {
     arch == "dflash" || arch == "dspark"
+}
+
+/// The Gemma 4 MTP head sidecar (not a block drafter: one draft per step,
+/// recurrent through `post_projection`, no block / mask token).
+pub fn is_mtp_sidecar_arch(arch: &str) -> bool {
+    arch == "gemma4-mtp"
 }
 
 /// Pick a drafter mapper from `config.json`'s `architectures`; None for an
@@ -66,6 +81,9 @@ pub fn hf_mapper_for_architectures(config: &serde_json::Value) -> Option<&'stati
         }
         if a.contains("DSpark") {
             return Some(&DsparkHfMapper);
+        }
+        if a.starts_with("Gemma4Assistant") {
+            return Some(&Gemma4MtpHfMapper);
         }
     }
     None
@@ -503,6 +521,57 @@ impl HfMapper for DflashHfMapper {
     }
     fn value_transform(&self, canonical: &str) -> Option<ValueTransform> {
         fc_transform(canonical)
+    }
+}
+
+impl HfMapper for Gemma4MtpHfMapper {
+    fn canonical_arch(&self) -> &'static str {
+        "gemma4-mtp"
+    }
+    fn config_from_hf(&self, c: &serde_json::Value) -> Result<ArchConfig> {
+        // The head's layer config is a Gemma 4 text config (nested under
+        // text_config): per-layer SWA pattern, head dims, global KV heads,
+        // both rope thetas and the partial rotary factor come out of the
+        // Gemma 4 mapper unchanged.
+        let mut cfg = crate::gemma::Gemma4HfMapper.config_from_hf(c)?;
+        let text = c.get("text_config").unwrap_or(c);
+        let n_layers = cfg.num_hidden_layers;
+        let shared = text
+            .get("num_kv_shared_layers")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        if shared != n_layers {
+            bail!(
+                "Gemma 4 assistant config.json: num_kv_shared_layers {shared} != num_hidden_layers {n_layers} — \
+                 the runtime runs this head with every layer reading the target's KV"
+            );
+        }
+        // Whether the target's global layers keep one K=V bank (the 26B-A4B)
+        // or separate K and V (the E4B): recorded, not required — the head
+        // projects queries only and reads whichever banks the target wrote.
+        let k_eq_v = text
+            .get("attention_k_eq_v")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let backbone = c
+            .get("backbone_hidden_size")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                anyhow!("Gemma 4 assistant config.json: backbone_hidden_size missing")
+            })?;
+        // No layer owns KV: the Gemma 4 mapper's rule (`shared < n_layers`)
+        // would have left every layer with its own.
+        cfg.n_layer_kv_from_start = 0;
+        // Its embed_tokens is the draft logit head, never tied to an input
+        // embedding of its own (the input embedding is the target's).
+        cfg.tie_word_embeddings = false;
+        let x = &mut cfg.extra_config;
+        x.insert("speculator_kind".into(), serde_json::json!("mtp-shared-kv"));
+        x.insert("num_layers".into(), serde_json::json!(n_layers));
+        x.insert("backbone_hidden_size".into(), serde_json::json!(backbone));
+        x.insert("num_kv_shared_layers".into(), serde_json::json!(shared));
+        x.insert("attention_k_eq_v".into(), serde_json::json!(k_eq_v));
+        Ok(cfg)
     }
 }
 
@@ -1178,6 +1247,58 @@ mod eagle3_tests {
         assert!(
             Eagle3HfMapper.config_from_hf(&bad).is_err(),
             "Eagle 3.1 post-norm chaining"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gemma4_mtp_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// google/gemma-4-E4B-it-assistant's config.json (HF bookkeeping fields
+    /// dropped).
+    fn e4b_assistant() -> serde_json::Value {
+        serde_json::from_str(r#"{"architectures": ["Gemma4AssistantForCausalLM"], "model_type": "gemma4_assistant", "backbone_hidden_size": 2560, "tie_word_embeddings": true, "num_centroids": 2048, "use_ordered_embeddings": true, "text_config": {"architectures": null, "attention_bias": false, "attention_k_eq_v": false, "bos_token_id": 2, "enable_moe_block": false, "eos_token_id": 1, "final_logit_softcapping": null, "global_head_dim": 512, "head_dim": 256, "hidden_activation": "gelu_pytorch_tanh", "hidden_size": 256, "hidden_size_per_layer_input": 0, "intermediate_size": 2048, "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"], "max_position_embeddings": 131072, "model_type": "gemma4_text", "moe_intermediate_size": null, "num_attention_heads": 4, "num_experts": null, "num_global_key_value_heads": null, "num_hidden_layers": 4, "num_key_value_heads": 2, "num_kv_shared_layers": 4, "pad_token_id": 0, "rms_norm_eps": 1e-06, "rope_parameters": {"full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional"}, "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}}, "sliding_window": 512, "tie_word_embeddings": true, "top_k_experts": null, "use_bidirectional_attention": null, "use_cache": true, "use_double_wide_mlp": false, "vocab_size": 262144, "vocab_size_per_layer_input": 0}}"#)
+        .unwrap()
+    }
+
+    #[test]
+    fn the_assistant_architecture_picks_the_mtp_mapper() {
+        let c = e4b_assistant();
+        let m = hf_mapper_for_architectures(&c).map(|m| m.canonical_arch());
+        assert_eq!(m, Some("gemma4-mtp"));
+        assert!(is_mtp_sidecar_arch("gemma4-mtp"));
+        assert!(!is_block_drafter_arch("gemma4-mtp"));
+    }
+
+    #[test]
+    fn the_head_owns_no_kv_and_records_its_backbone() {
+        let cfg = Gemma4MtpHfMapper.config_from_hf(&e4b_assistant()).unwrap();
+        assert_eq!(cfg.num_hidden_layers, 4);
+        // Every layer reads the target's KV: none may own one (the Gemma 4
+        // mapper's rule would have given all four their own).
+        assert_eq!(cfg.n_layer_kv_from_start, 0);
+        // Its embed_tokens is the draft logit head, not an input embedding.
+        assert!(!cfg.tie_word_embeddings);
+        assert_eq!(cfg.extra_config["backbone_hidden_size"], json!(2560));
+        assert_eq!(cfg.extra_config["speculator_kind"], json!("mtp-shared-kv"));
+        assert_eq!(cfg.extra_config["attention_k_eq_v"], json!(false));
+    }
+
+    #[test]
+    fn a_head_with_its_own_kv_layers_or_no_backbone_width_is_refused() {
+        let mut c = e4b_assistant();
+        c["text_config"]["num_kv_shared_layers"] = json!(2);
+        assert!(
+            Gemma4MtpHfMapper.config_from_hf(&c).is_err(),
+            "two layers would own KV"
+        );
+        let mut c = e4b_assistant();
+        c.as_object_mut().unwrap().remove("backbone_hidden_size");
+        assert!(
+            Gemma4MtpHfMapper.config_from_hf(&c).is_err(),
+            "no backbone_hidden_size"
         );
     }
 }

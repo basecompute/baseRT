@@ -492,6 +492,15 @@ impl MergedRegistry {
         Ok(Self::new(root, catalog))
     }
 
+    /// Build from the cache root + the hosted catalog fetched past the cache
+    /// ([`Catalog::load_fresh`]): what a pull turns to when the cached rows
+    /// look behind the Hub. None when it cannot be fetched.
+    pub fn load_fresh() -> Option<Self> {
+        let root = cache::models_dir().ok()?;
+        let catalog = Catalog::load_fresh(&root)?;
+        Some(Self::new(root, CatalogRegistry::from_catalog(catalog)))
+    }
+
     /// Resolve an id to a concrete [`ModelRef`].
     ///
     /// `want_quant` is the quant the caller is after (`q4`, `q8`, …); when set,

@@ -2,9 +2,11 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+mod embed;
 mod gpt_oss;
 mod hub;
 mod lora;
+mod selfupdate;
 mod serve;
 mod superfluid;
 
@@ -34,6 +36,9 @@ Convert & author:
   sign        Sign a `.base` file
   verify      Verify a signed `.base` file
   keygen      Generate a signing keypair
+
+Keep up to date:
+  self        Update basert (`basert self update`), or switch between installed versions
 
 Options:
   -h, --help     Print help
@@ -67,6 +72,9 @@ enum Cmd {
     Verify(VerifyArgs),
     /// Inspect a `.base` file (summary of header + tensors + slots).
     Inspect(InspectArgs),
+    /// Embed a converted MTP head sidecar in a bundle as its built-in
+    /// speculator head (Gemma 4's separate `-assistant` checkpoint).
+    AddSpeculator(embed::AddSpeculatorArgs),
     /// Generate an ed25519 keypair for signing.
     Keygen(KeygenArgs),
     /// Download a model into the local hub cache (pre-converted `.base` from
@@ -80,6 +88,9 @@ enum Cmd {
     CatalogManifest(CatalogManifestArgs),
     /// Install or check superfluid, the server `basert serve` runs.
     Superfluid(superfluid::SuperfluidArgs),
+    /// Update basert itself, or switch between the versions installed here.
+    #[command(name = "self")]
+    SelfUpdate(selfupdate::SelfArgs),
     /// Runtime commands — `serve`, `chat`, `complete`, `bench`, … — handled
     /// by the BaseRT runtime (dispatched in `hub::dispatch_external`).
     #[command(external_subcommand)]
@@ -117,6 +128,18 @@ struct ConvertArgs {
     /// in CI without depending on HuggingFace downloads.
     #[arg(long)]
     synthetic: bool,
+
+    /// Embed this converted Gemma 4 MTP head (a `gemma4-mtp` sidecar:
+    /// `basert convert google/gemma-4-<size>-it-assistant`) in the bundle as
+    /// its speculator head, as `basert add-speculator` does to an existing
+    /// bundle. The output must not exist yet.
+    #[arg(long, value_name = "HEAD.base")]
+    mtp_head: Option<PathBuf>,
+
+    /// With `--mtp-head`: the head's version, recorded in the bundle
+    /// (`add-speculator --head-version`).
+    #[arg(long, value_name = "V", requires = "mtp_head")]
+    mtp_head_version: Option<String>,
 
     /// Canonical-quant profile JSON (e.g.
     /// `tools/base-convert/profiles/dense-q4mix.json`). When set,
@@ -499,6 +522,7 @@ fn main() -> Result<()> {
     {
         print_banner();
     }
+    selfupdate::at_launch(raw_arg1.as_deref());
     let args = Args::parse();
     match args.cmd {
         Cmd::Convert(a) => cmd_convert(a),
@@ -506,12 +530,14 @@ fn main() -> Result<()> {
         Cmd::Sign(a) => cmd_sign(a),
         Cmd::Verify(a) => cmd_verify(a),
         Cmd::Inspect(a) => cmd_inspect(a),
+        Cmd::AddSpeculator(a) => embed::cmd_add_speculator(a),
         Cmd::Keygen(a) => cmd_keygen(a),
         Cmd::Pull(a) => hub::cmd_pull(a),
         Cmd::List(a) => hub::cmd_list(a),
         Cmd::CatalogScan(a) => hub::cmd_catalog_scan(a.org, a.out, a.dry_run),
         Cmd::CatalogManifest(a) => hub::cmd_catalog_manifest(a.bundle),
         Cmd::Superfluid(a) => superfluid::cmd(a),
+        Cmd::SelfUpdate(a) => selfupdate::cmd(a),
         Cmd::External(argv) => hub::dispatch_external(argv),
     }
 }
@@ -532,14 +558,51 @@ fn cmd_keygen(args: KeygenArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_convert(args: ConvertArgs) -> Result<()> {
+fn cmd_convert(mut args: ConvertArgs) -> Result<()> {
+    let Some(head) = args.mtp_head.take() else {
+        return cmd_convert_bundle(args);
+    };
+    let args_head_version = args.mtp_head_version.take();
+    // `--mtp-head`: the model is converted beside its final name, then the
+    // head is embedded behind it into the final file (add_speculator copies
+    // the blob), and the headless conversion goes — briefly the one extra
+    // copy on disk, as the writer's own temp blob is.
+    let output = args
+        .output
+        .clone()
+        .unwrap_or_else(|| default_output(&args.input));
+    let headless = output.with_extension("headless.base");
+    for p in [&output, &headless] {
+        if p.exists() {
+            bail!("{}: exists; refusing to overwrite it", p.display());
+        }
+    }
+    args.output = Some(headless.clone());
+    cmd_convert_bundle(args)?;
+    let embedded = embed::add_speculator(&headless, &head, &output, args_head_version.as_deref());
+    let _ = std::fs::remove_file(&headless);
+    let s = embedded?;
+    eprintln!(
+        "  mtp:     {} head ({} tensors, {} bytes) embedded as `{}`",
+        s.head_arch, s.n_head_tensors, s.head_bytes, s.kind
+    );
+    Ok(())
+}
+
+/// `<input>.base`, the output `convert` writes when none is named.
+fn default_output(input: &std::path::Path) -> PathBuf {
+    let mut p = input.to_path_buf();
+    p.set_extension("base");
+    p
+}
+
+fn cmd_convert_bundle(args: ConvertArgs) -> Result<()> {
     eprintln!("base-convert v{}", env!("CARGO_PKG_VERSION"));
     eprintln!("  input:   {}", args.input.display());
-    let output = args.output.clone().unwrap_or_else(|| {
-        let mut p = args.input.clone();
-        p.set_extension("base");
-        p
-    });
+    let output = args
+        .output
+        .clone()
+        .unwrap_or_else(|| default_output(&args.input));
     eprintln!("  output:  {}", output.display());
 
     let ctx = QuantContext::from_args(&args)?;
@@ -1763,11 +1826,12 @@ fn convert_hf(input: &std::path::Path, output: &std::path::Path, ctx: &QuantCont
     let mapper: &dyn base_arch::HfMapper = if let Some(m) =
         base_arch::dflash::hf_mapper_for_architectures(&hf.config)
     {
-        eprintln!(
-            "  arch:    {} (block drafter sidecar: {})",
-            model_type,
-            m.canonical_arch()
-        );
+        let kind = if base_arch::dflash::is_mtp_sidecar_arch(m.canonical_arch()) {
+            "MTP head sidecar"
+        } else {
+            "block drafter sidecar"
+        };
+        eprintln!("  arch:    {} ({kind}: {})", model_type, m.canonical_arch());
         m
     } else if let Some(m) = base_arch::dflash::hf_mapper_for_eagle3(&hf.config) {
         eprintln!("  arch:    {} (EAGLE-3 head sidecar)", model_type);
@@ -3554,6 +3618,7 @@ impl<'a> FcSplitProvider<'a> {
         let mut splits = std::collections::BTreeMap::new();
         let mut rewritten = Vec::with_capacity(source_names.len());
         let mtp = canonical_arch.starts_with("qwen35");
+        let mtp_sidecar = base_arch::dflash::is_mtp_sidecar_arch(canonical_arch);
         let eagle3 = base_arch::dflash::is_eagle3_arch(canonical_arch);
         let drafter = base_arch::dflash::is_block_drafter_arch(canonical_arch) || eagle3;
         for n in source_names {
@@ -3585,6 +3650,18 @@ impl<'a> FcSplitProvider<'a> {
                 splits.insert(h.clone(), (n.clone(), 1, 2));
                 rewritten.push(e);
                 rewritten.push(h);
+            } else if mtp_sidecar && n == "pre_projection.weight" {
+                // [hidden, 2 * backbone]: the reference concatenates
+                // (token embedding, target hidden) on the input axis, so
+                // column half 0 is the embedding projection.
+                let shape = inner.source_shape(n)?;
+                if shape.len() != 2 || shape[1] % 2 != 0 {
+                    bail!("{n}: expected a [hidden, 2 * backbone] Gemma 4 MTP pre_projection, got {shape:?}");
+                }
+                splits.insert("fc_embed.weight".to_string(), (n.clone(), 0, 2));
+                splits.insert("fc_hidden.weight".to_string(), (n.clone(), 1, 2));
+                rewritten.push("fc_embed.weight".to_string());
+                rewritten.push("fc_hidden.weight".to_string());
             } else if drafter && n == "fc.weight" {
                 let shape = inner.source_shape(n)?;
                 if shape.len() != 2
@@ -3890,6 +3967,7 @@ fn convert_generic(
     if !fcs.splits.is_empty() {
         if base_arch::dflash::is_block_drafter_arch(canonical_arch)
             || base_arch::dflash::is_eagle3_arch(canonical_arch)
+            || base_arch::dflash::is_mtp_sidecar_arch(canonical_arch)
         {
             eprintln!(
                 "  drafter: split fused projections into {} column blocks (f16)",
@@ -4214,9 +4292,20 @@ fn convert_generic(
     // block step is small next to the target's verify) except for what
     // --quantize-drafter names: see drafter_tensor_stays_f16.
     let is_drafter_arch = base_arch::dflash::is_block_drafter_arch(canonical_arch)
-        || base_arch::dflash::is_eagle3_arch(canonical_arch);
+        || base_arch::dflash::is_eagle3_arch(canonical_arch)
+        || base_arch::dflash::is_mtp_sidecar_arch(canonical_arch);
     for (src_name, canonical) in &mapped {
+        // The Gemma 4 MTP sidecar scores with its own 262k-row table at the
+        // head's width (`output.weight`, read on every chained draft: 134 MB
+        // f16 on the E4B head, 537 MB on the 26B-A4B's): under
+        // --quantize-drafter it follows --target too, as the embedded heads'
+        // `mtp.lm_head.weight` does; its fc_embed / fc_hidden / post_fc and
+        // norms stay f16 (drafter_tensor_stays_f16 quantizes `layers.*` only,
+        // and `fc.*` taps, which the head has none of).
+        let mtp_sidecar_head =
+            base_arch::dflash::is_mtp_sidecar_arch(canonical_arch) && canonical == "output.weight";
         let drafter_f16 = is_drafter_arch
+            && !(ctx.quantize_drafter && mtp_sidecar_head)
             && drafter_tensor_stays_f16(ctx.quantize_drafter, ctx.keep_drafter_fc_f16, canonical);
         let is_spec = spec_names.contains(canonical);
         // --quantize-drafter also quantizes an in-bundle speculator's transformer
@@ -5250,6 +5339,41 @@ fn eagle3_canonical(name: &str) -> Option<String> {
     })
 }
 
+/// Gemma 4 MTP head sidecar tensor → runtime name. The decoder layers take
+/// the Gemma 4 layer rules (four norms, layer_scalar, q-only attention). The
+/// head's own tensors get names that do NOT collide with the target's, since
+/// the runtime resolves what the sidecar lacks through the target: its
+/// `embed_tokens` is the DRAFT logit projection (`output.weight`, hidden-width
+/// rows — the INPUT embedding stays the target's `token_embedding.weight`),
+/// `model.norm` is the head's final norm (`output_norm.weight`, the name the
+/// encoder's output stage reads; the target's final norm is applied to the
+/// tapped hidden in the prologue through the target's store), and
+/// `pre_projection` is split by input column into the embedding half and the
+/// hidden half (`fc_embed.weight` / `fc_hidden.weight`, as the Qwen MTP fc).
+fn gemma4_mtp_canonical(name: &str) -> Option<String> {
+    match name {
+        "model.embed_tokens.weight" => Some("output.weight".to_string()),
+        // The head's final norm takes the encoder's output-stage name: the
+        // runtime norms the head's own residual with it before `output.weight`
+        // (the TARGET's final norm is applied to the tapped hidden in the
+        // prologue, reached through the target's own store).
+        "model.norm.weight" => Some("output_norm.weight".to_string()),
+        "fc_embed.weight" | "fc_hidden.weight" => Some(name.to_string()),
+        "post_projection.weight" => Some("post_fc.weight".to_string()),
+        "pre_projection.weight" => None, // split into fc_embed / fc_hidden by FcSplitProvider
+        _ => {
+            if name.starts_with("model.layers.") {
+                match to_canonical_name(name, "gemma4")? {
+                    Canonical::Main(c) => Some(c),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Block-drafter (DFlash / DSpark) sidecar tensor → canonical name. The
 /// decoder layer goes through the qwen3 main-layer rules (so the runtime's
 /// per-layer aliases apply as for the target's own layers); `norm.weight`
@@ -5379,6 +5503,9 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
     }
     if base_arch::dflash::is_eagle3_arch(arch) {
         return eagle3_canonical(name).map(Canonical::Main);
+    }
+    if base_arch::dflash::is_mtp_sidecar_arch(arch) {
+        return gemma4_mtp_canonical(name).map(Canonical::Main);
     }
     // Qwen3.5/3.6/3.8 checkpoints ship a Multi-Token-Prediction head (`mtp.*`
     // — one extra decoder layer + fc / pre-fc norms / output norm, its own
@@ -6833,6 +6960,35 @@ mod canonical_name_tests {
             Canonical::Main(s) => Some(s),
             Canonical::Mmproj(_) | Canonical::Speculator(_) => None,
         }
+    }
+
+    #[test]
+    fn gemma4_mtp_head_tensors_take_names_apart_from_the_targets() {
+        // The runtime resolves what the sidecar lacks through the target, so
+        // the head's own embedding / norm must not take the target's names.
+        let a = "gemma4-mtp";
+        for (src, want) in [
+            ("model.embed_tokens.weight", "output.weight"),
+            ("model.norm.weight", "output_norm.weight"),
+            ("post_projection.weight", "post_fc.weight"),
+            ("fc_embed.weight", "fc_embed.weight"),
+            ("fc_hidden.weight", "fc_hidden.weight"),
+        ] {
+            assert_eq!(main_canon(src, a).as_deref(), Some(want), "{src}");
+        }
+        // pre_projection is split into fc_embed / fc_hidden before naming;
+        // the clustered vocabulary is not read.
+        for src in [
+            "pre_projection.weight",
+            "masked_embedding.centroids.weight",
+            "masked_embedding.token_ordering",
+        ] {
+            assert_eq!(main_canon(src, a), None, "{src}");
+        }
+        // The layers take the Gemma 4 rules.
+        let q = "model.layers.3.self_attn.q_proj.weight";
+        assert!(main_canon(q, a).is_some());
+        assert_eq!(main_canon(q, a), main_canon(q, "gemma4"));
     }
 
     #[test]
