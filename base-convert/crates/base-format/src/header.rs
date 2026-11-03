@@ -399,6 +399,10 @@ impl TensorDtype {
 pub struct TensorEntry {
     pub name: String,
     pub dtype: TensorDtype,
+    /// Logical shape, outermost axis first: a linear weight is `[out, in]`
+    /// (an expert stack `[E, out, in]`) and its bytes are row-major in that
+    /// order. This holds for every dtype and layout, `gguf_super` included;
+    /// readers of other formats (GGUF lists `ne` fastest-first) convert.
     pub shape: Vec<u64>,
     pub offset: u64,
     pub length: u64,
