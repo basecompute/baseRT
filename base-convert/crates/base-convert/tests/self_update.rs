@@ -324,6 +324,8 @@ fn an_in_place_install_updates_into_the_versions_layout_and_goes_back_and_forwar
     assert_eq!(code, 0, "{err}");
     assert!(err.contains(&format!("basert {HERE} -> {next}")), "{err}");
     assert!(err.contains("dry run: nothing fetched or changed"), "{err}");
+    // No newer superfluid states the engine's ABI: it is not named.
+    assert!(!err.contains("superfluid v0.1.3 ->"), "{err}");
     assert!(f.current().is_none() && !f.version_dir(&next).exists());
 
     let (code, out2, err) = f.run(&f.root.join("basert"), &["update"]);
@@ -538,6 +540,127 @@ fn a_newer_superfluid_comes_as_well_when_basert_is_up_to_date() {
     assert!(fs::symlink_metadata(f.root.join("basert"))
         .unwrap()
         .is_file());
+}
+
+#[test]
+fn a_dry_run_names_the_superfluid_an_update_would_bring() {
+    let mut f = Fixture::in_place();
+    f.release(HERE, 1);
+    f.superfluid_release("v0.1.4", 1);
+    let installed_by = f.root.join("superfluid").join("installed-by");
+
+    // basert up to date: the update would still bring the newer superfluid.
+    let (code, out, err) = f.run(&f.root.join("basert"), &["update", "--dry-run"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        err.contains(&format!("basert {HERE} is in use, the newest release")),
+        "{err}"
+    );
+    assert!(err.contains("superfluid v0.1.3 -> v0.1.4 as well"), "{err}");
+    assert!(err.contains("dry run: nothing fetched or changed"), "{err}");
+    assert_eq!(f.superfluid_release_installed(), "v0.1.3");
+    assert!(!installed_by.exists());
+    assert!(!f.root.join("versions").exists());
+
+    // A newer basert not fetched yet: superfluid cannot be asked about its
+    // engine, so the newest release for its ABI is named.
+    let next = next_version();
+    f.release(&next, 2);
+    f.superfluid_release("v0.1.5", 2);
+    let (code, out, err) = f.run(&f.root.join("basert"), &["update", "--dry-run"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(err.contains(&format!("basert {HERE} -> {next}")), "{err}");
+    assert!(
+        err.contains("superfluid v0.1.3 -> v0.1.5 as well, the newest that states engine ABI 2"),
+        "{err}"
+    );
+    assert!(err.contains("dry run: nothing fetched or changed"), "{err}");
+    assert_eq!(f.superfluid_release_installed(), "v0.1.3");
+    assert!(!installed_by.exists());
+    assert!(!f.version_dir(&next).exists());
+
+    // The version in use, named: its superfluid as when it is the newest.
+    let (code, out, err) = f.run(
+        &f.root.join("basert"),
+        &["update", "--dry-run", "--version", HERE],
+    );
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        err.contains(&format!("basert {HERE} is in use, the release named")),
+        "{err}"
+    );
+    assert!(err.contains("superfluid v0.1.3 -> v0.1.4 as well"), "{err}");
+}
+
+/// The line of `text` that says `what`.
+fn line_with<'a>(text: &'a str, what: &str) -> Option<&'a str> {
+    text.lines().find(|l| l.contains(what))
+}
+
+#[test]
+fn a_dry_run_says_a_superfluid_dir_that_holds_other_files_keeps_its_superfluid() {
+    let mut f = Fixture::in_place();
+    f.release(HERE, 1);
+    f.superfluid_release("v0.1.4", 1);
+    let prefix = shared_prefix(&f, "0.1.3", 1);
+    let env = [("BASERT_SUPERFLUID_DIR", prefix.as_path())];
+    let kept = "superfluid v0.1.4 is out, but v0.1.3 stays";
+
+    let (code, out, dry) = f.launch_with(
+        &f.root.join("basert"),
+        &["self", "update", "--dry-run"],
+        &env,
+    );
+    assert_eq!(code, 0, "{out}{dry}");
+    assert!(dry.contains(kept), "{dry}");
+    assert!(dry.contains("which is not superfluid's"), "{dry}");
+    assert!(!dry.contains("superfluid v0.1.3 -> v0.1.4"), "{dry}");
+    assert!(dry.contains("dry run: nothing fetched or changed"), "{dry}");
+    prefix_untouched(&prefix, "0.1.3");
+
+    // The update itself says the same.
+    let (code, out, err) = f.launch_with(&f.root.join("basert"), &["self", "update"], &env);
+    assert_eq!(code, 0, "{out}{err}");
+    assert_eq!(line_with(&dry, kept), line_with(&err, kept), "{err}");
+    prefix_untouched(&prefix, "0.1.3");
+}
+
+#[test]
+fn a_dry_run_to_a_basert_not_fetched_says_a_superfluid_dir_that_holds_other_files_keeps_its_superfluid(
+) {
+    let mut f = Fixture::in_place();
+    let next = next_version();
+    f.release(&next, 2);
+    f.superfluid_release("v0.1.4", 2);
+    // It serves the new engine as well: the update keeps it and goes on.
+    let prefix = shared_prefix(&f, "0.1.3", 2);
+    let env = [("BASERT_SUPERFLUID_DIR", prefix.as_path())];
+    let kept = "superfluid v0.1.4 is out, but v0.1.3 stays";
+
+    let (code, out, dry) = f.launch_with(
+        &f.root.join("basert"),
+        &["self", "update", "--dry-run"],
+        &env,
+    );
+    assert_eq!(code, 0, "{out}{dry}");
+    assert!(dry.contains(&format!("basert {HERE} -> {next}")), "{dry}");
+    assert!(dry.contains(kept), "{dry}");
+    assert!(!dry.contains("superfluid v0.1.3 -> v0.1.4"), "{dry}");
+    // Its engine not fetched, superfluid cannot be asked whether it serves it.
+    assert!(
+        dry.contains(&format!(
+            "basert {next} is made the one in use only if superfluid v0.1.3 serves it"
+        )),
+        "{dry}"
+    );
+    assert!(!f.version_dir(&next).exists());
+    prefix_untouched(&prefix, "0.1.3");
+
+    let (code, out, err) = f.launch_with(&f.root.join("basert"), &["self", "update"], &env);
+    assert_eq!(code, 0, "{out}{err}");
+    assert_eq!(line_with(&dry, kept), line_with(&err, kept), "{err}");
+    assert_eq!(f.current().as_deref(), Some(next.as_str()));
+    prefix_untouched(&prefix, "0.1.3");
 }
 
 #[test]

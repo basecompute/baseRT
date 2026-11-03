@@ -1089,7 +1089,7 @@ fn convert_gguf(
             let mut entry = base_format::TensorEntry {
                 name: canonical,
                 dtype: TensorDtype::F32,
-                shape: info.shape.clone(),
+                shape: base_shape(info),
                 offset: 0,
                 length: 0,
                 scale_offset: None,
@@ -1127,7 +1127,7 @@ fn convert_gguf(
             let entry = base_format::TensorEntry {
                 name: canonical,
                 dtype,
-                shape: info.shape.clone(),
+                shape: base_shape(info),
                 offset: 0,
                 length: bytes.len() as u64,
                 scale_offset: None,
@@ -1154,7 +1154,8 @@ fn convert_gguf(
             // (Llama-3.2-1B at MLX-direct ships embed at 4-bit ≈ 131 MB —
             // cache-friendly). Quantizing embed matches the source format
             // and is what the embedding_lookup_q4 kernel expects.
-            let in_features = info.shape.last().copied().map(|d| d as usize);
+            // ne[0]: the row length (GGUF lists the fastest axis first).
+            let in_features = info.shape.first().copied().map(|d| d as usize);
             let (packed, dtype) = if ctx.profile.is_some() {
                 ctx.pack_tensor(&canonical, &f32s, in_features)?
             } else {
@@ -1171,7 +1172,7 @@ fn convert_gguf(
             let mut entry = base_format::TensorEntry {
                 name: canonical,
                 dtype,
-                shape: info.shape.clone(),
+                shape: base_shape(info),
                 offset: 0,
                 length: 0,
                 scale_offset: if !packed.scales.is_empty() {
@@ -1214,7 +1215,8 @@ fn convert_gguf(
             (entry, data)
         } else {
             // Quantize to target scheme, Accelerator region.
-            let in_features = info.shape.last().copied().map(|d| d as usize);
+            // ne[0]: the row length (GGUF lists the fastest axis first).
+            let in_features = info.shape.first().copied().map(|d| d as usize);
             let (packed, dtype) = if ctx.profile.is_some() {
                 ctx.pack_tensor(&canonical, &f32s, in_features)?
             } else {
@@ -1232,7 +1234,7 @@ fn convert_gguf(
             let mut entry = base_format::TensorEntry {
                 name: canonical,
                 dtype,
-                shape: info.shape.clone(),
+                shape: base_shape(info),
                 offset: 0,
                 length: packed.packed_weights.len() as u64,
                 scale_offset: if !packed.scales.is_empty() {
@@ -1361,16 +1363,9 @@ fn convert_gguf(
             //
             // Evaluated BEFORE the passthrough branch so a k-quant tower
             // tensor cannot bypass it either.
-            // GGUF records ne innermost-first, so a Linear lands as
-            // [in, out] where the HF path records [out, in] — the SAME
-            // bytes, described in the opposite order. The vision encoder
-            // sizes its GEMMs from this shape, so it has to be normalized
-            // to the HF convention or every tower matmul is transposed.
-            let mm_shape: Vec<u64> = if info.shape.len() == 2 {
-                vec![info.shape[1], info.shape[0]]
-            } else {
-                info.shape.clone()
-            };
+            // The vision encoder sizes its GEMMs from this shape, so it must
+            // be the declared [out, in] (see `base_shape`).
+            let mm_shape = base_shape(info);
             let logical_count: usize = info.shape.iter().map(|d| *d as usize).product();
             let must_stay_raw = info.shape.len() != 2
                 || logical_count < 64
@@ -1662,6 +1657,16 @@ fn kquant_passes_through(t: &base_readers::gguf::TensorInfo) -> bool {
     is_passthrough_kquant(t.ggml_type) && !is_gguf_expert_stack(&t.name)
 }
 
+/// The declared `.base` shape of a GGUF tensor: its `ne` reversed. GGUF
+/// lists the fastest-varying axis first (`[in, out]` for a Linear); the
+/// header declares shapes outermost-first (`[out, in]`, experts
+/// `[E, out, in]`), as the HF path does. The bytes are the same row-major
+/// array either way, so only the declaration changes. `TensorInfo` itself
+/// stays in `ne` order — the dequant and rope un-permute read it that way.
+fn base_shape(info: &base_readers::gguf::TensorInfo) -> Vec<u64> {
+    info.shape.iter().rev().copied().collect()
+}
+
 /// Build the `.base` entry for a GGUF k-quant tensor copied through
 /// verbatim. The payload is the source super-block bytes unchanged.
 ///
@@ -1711,7 +1716,7 @@ fn kquant_passthrough_entry(
     let entry = base_format::TensorEntry {
         name: canonical,
         dtype,
-        shape: info.shape.clone(),
+        shape: base_shape(info),
         offset: 0,
         length: data.len() as u64,
         // Scales/mins live inside each super-block — no side regions.
@@ -8062,6 +8067,8 @@ mod gguf_passthrough_tests {
             assert_eq!(entry.scale_dtype, None);
             assert_eq!(entry.length, bytes.len() as u64);
             assert_eq!(entry.compute_region, ComputeRegion::Accelerator);
+            // Declared [out, in] like every other path, not GGUF's ne order.
+            assert_eq!(entry.shape, vec![4, 256]);
         }
     }
 
