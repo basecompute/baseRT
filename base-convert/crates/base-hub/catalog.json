@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-10-30",
+  "updated": "2026-11-03",
   "models": [
     {
       "id": "basecompute/Llama-3.1-8B-Instruct",
@@ -1872,6 +1872,34 @@
       "size": 265768960,
       "sha256": "56a5bc65f7019d08f231de8f51efb091c066fc9490c026d9188109c51921a485",
       "speculator": "dflash",
+      "speculator_for": "basecompute/Qwen3.6-35B-A3B",
+      "speculator_rank": 1
+    },
+    {
+      "id": "basecompute/Qwen3.6-35B-A3B-DFlash2",
+      "hf_repo": "basecompute/Qwen3.6-35B-A3B-DFlash2",
+      "file": "Qwen3.6-35B-A3B-DFlash2-F16.base",
+      "revision": "main",
+      "arch": "dflash",
+      "quant": "default-f16",
+      "size": 1052921856,
+      "sha256": "5594c12fd0832b47f24f66c1cc99fb0de17df0171d31b5eacbd464095ab811e4",
+      "speculator": "dflash",
+      "source_repo": "incoai/Qwen3.6-35B-A3B-DFlash2",
+      "speculator_for": "basecompute/Qwen3.6-35B-A3B",
+      "speculator_rank": 1
+    },
+    {
+      "id": "basecompute/Qwen3.6-35B-A3B-DFlash2",
+      "hf_repo": "basecompute/Qwen3.6-35B-A3B-DFlash2",
+      "file": "Qwen3.6-35B-A3B-DFlash2-Q4.base",
+      "revision": "main",
+      "arch": "dflash",
+      "quant": "default-q4",
+      "size": 480137216,
+      "sha256": "5a56db1e16adb4dbd73b1045911768732fe9a6014e22ea02920c524a93061a62",
+      "speculator": "dflash",
+      "source_repo": "incoai/Qwen3.6-35B-A3B-DFlash2",
       "speculator_for": "basecompute/Qwen3.6-35B-A3B",
       "speculator_rank": 1
     },

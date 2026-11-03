@@ -1284,20 +1284,28 @@ enum Pairing {
 /// number is downloaded and asked, whatever its order (going back to an older
 /// basert may take an older superfluid); that no release can is an error. With
 /// `forward`, a newer release that serves it is taken even when the installed
-/// one can. Nothing is replaced under a running server.
+/// one can. Nothing is replaced under a running server. A `dry_run` names the
+/// release that would come, or what keeps the installed one, and fetches,
+/// marks and changes nothing.
 fn pair_superfluid(
     engine: &Path,
     abi: Option<u32>,
     forward: bool,
+    dry_run: bool,
     say: &mut dyn FnMut(&str),
 ) -> Result<Pairing> {
     let Some(installed) = superfluid::Install::locate()? else {
         return Ok(Pairing::NotInstalled);
     };
-    installed.claim();
-    // Installs into it take turns; what is there is asked once this one's
-    // turn has come.
-    let turn = installed.take_turn(say)?;
+    let turn = match dry_run {
+        true => None,
+        false => {
+            installed.claim();
+            // Installs into it take turns; what is there is asked once this
+            // one's turn has come.
+            installed.take_turn(say)?
+        }
+    };
     let home = crate::serve::superfluid_home().ok();
     let have = installed
         .installed_release()
@@ -1327,55 +1335,34 @@ fn pair_superfluid(
         ),
     };
     let tag = release.tag.clone();
-    let busy = running_from(&installed.root);
-    if !busy.is_empty() {
-        let pids = busy
-            .iter()
-            .map(i32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        if let Err(why) = &ready {
-            bail!(
-                "superfluid {have} at {} cannot serve this engine ({why}) and {tag} can, but a \
-                 server runs from it (pid {pids}): stop it and run this again",
-                installed.root.display()
-            );
-        }
-        say(&format!(
-            "superfluid {tag} is out, but a server runs from {} (pid {pids}): {have} stays until the next update",
-            installed.root.display()
-        ));
+    if !free_to_replace(&installed, &have, &tag, &ready, say)? {
         return Ok(Pairing::Serves);
     }
-    if !installed.writable() {
-        if let Err(why) = &ready {
-            bail!(
-                "superfluid {have} at {} cannot serve this engine ({why}), and that directory \
-                 cannot be written to put {tag} in its place",
-                installed.root.display()
-            );
+    if dry_run {
+        // Not fetched, the release is not asked whether it serves the engine.
+        if goes_whole(&installed, None, &have, &tag, &ready, say)? {
+            say(&match &ready {
+                Ok(()) => format!("superfluid {have} -> {tag} as well"),
+                Err(why) => {
+                    format!("superfluid {have} -> {tag}: {have} cannot serve this engine ({why})")
+                }
+            });
         }
         return Ok(Pairing::Serves);
     }
     let staged = installed.stage(&superfluid::Source::GitHub, &release, say)?;
     match staged.fresh.probe(Some(engine), home.as_deref()).ready {
-        // Replaced, its directory goes whole: one that holds more than
-        // superfluid (a prefix `$BASERT_SUPERFLUID_DIR` names) stays.
-        Ok(()) => match (installed.replaceable(&staged.fresh.root), &ready) {
-            (Ok(()), _) => Ok(Pairing::Replace {
-                installed,
-                staged,
-                turn,
-            }),
-            (Err(e), Ok(())) => {
-                say(&format!("superfluid {tag} is out, but {have} stays: {e:#}"));
-                Ok(Pairing::Serves)
+        Ok(()) => {
+            let fresh = Some(staged.fresh.root.as_path());
+            match goes_whole(&installed, fresh, &have, &tag, &ready, say)? {
+                true => Ok(Pairing::Replace {
+                    installed,
+                    staged,
+                    turn,
+                }),
+                false => Ok(Pairing::Serves),
             }
-            (Err(e), Err(why)) => bail!(
-                "superfluid {have} at {} cannot serve this engine ({why}) and {tag} can, but {e:#}",
-                installed.root.display()
-            ),
-        },
+        }
         Err(why) if ready.is_err() => {
             bail!("superfluid {tag} cannot serve this engine either: {why}")
         }
@@ -1401,6 +1388,114 @@ fn apply(pairing: Pairing, say: &mut dyn FnMut(&str)) -> Result<()> {
         }
         Pairing::NotInstalled | Pairing::Serves => Ok(()),
     }
+}
+
+/// Whether superfluid `have` at `installed` may give way to release `tag`, as
+/// far as is known before it is fetched: no server runs from it, and its
+/// directory can be written. `ready` is whether `have` serves the engine, or
+/// why not: what keeps one that cannot is an error; one that can stays.
+fn free_to_replace(
+    installed: &superfluid::Install,
+    have: &str,
+    tag: &str,
+    ready: &Result<(), String>,
+    say: &mut dyn FnMut(&str),
+) -> Result<bool> {
+    let busy = running_from(&installed.root);
+    if !busy.is_empty() {
+        let pids = busy
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if let Err(why) = ready {
+            bail!(
+                "superfluid {have} at {} cannot serve this engine ({why}) and {tag} can, but a \
+                 server runs from it (pid {pids}): stop it and run this again",
+                installed.root.display()
+            );
+        }
+        say(&format!(
+            "superfluid {tag} is out, but a server runs from {} (pid {pids}): {have} stays until the next update",
+            installed.root.display()
+        ));
+        return Ok(false);
+    }
+    if !installed.writable() {
+        if let Err(why) = ready {
+            bail!(
+                "superfluid {have} at {} cannot serve this engine ({why}), and that directory \
+                 cannot be written to put {tag} in its place",
+                installed.root.display()
+            );
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Whether `installed`'s directory may go whole for release `tag`: `fresh` is
+/// the release staged, `None` before it is fetched. One that holds more than
+/// superfluid (a prefix `$BASERT_SUPERFLUID_DIR` names) keeps `have`: said
+/// when `have` serves the engine (`ready`), an error when it cannot.
+fn goes_whole(
+    installed: &superfluid::Install,
+    fresh: Option<&Path>,
+    have: &str,
+    tag: &str,
+    ready: &Result<(), String>,
+    say: &mut dyn FnMut(&str),
+) -> Result<bool> {
+    match (installed.replaceable(fresh), ready) {
+        (Ok(()), _) => Ok(true),
+        (Err(e), Ok(())) => {
+            say(&format!("superfluid {tag} is out, but {have} stays: {e:#}"));
+            Ok(false)
+        }
+        (Err(e), Err(why)) => bail!(
+            "superfluid {have} at {} cannot serve this engine ({why}) and {tag} can, but {e:#}",
+            installed.root.display()
+        ),
+    }
+}
+
+/// For a dry run to basert `v`, not fetched yet, whose engine superfluid
+/// cannot be asked about: the newest superfluid release that states its ABI
+/// number `abi`, when that is newer than the installed one, or what keeps
+/// the installed one in its place.
+fn name_newer_superfluid(v: &str, abi: Option<u32>, say: &mut dyn FnMut(&str)) -> Result<()> {
+    let (Some(installed), Some(abi)) = (superfluid::Install::locate()?, abi) else {
+        return Ok(());
+    };
+    let have = installed
+        .installed_release()
+        .unwrap_or_else(|| "of a release it does not say".to_string());
+    match superfluid::newest_for(abi) {
+        Ok(Some(release)) if superfluid::newer(Some(&release.tag), &have) => {
+            // What keeps it is said as for an engine it serves; one it
+            // cannot serve makes the update fail instead.
+            let (tag, serves) = (&release.tag, Ok(()));
+            match free_to_replace(&installed, &have, tag, &serves, say)?
+                && goes_whole(&installed, None, &have, tag, &serves, say)?
+            {
+                true => say(&format!(
+                    "superfluid {have} -> {tag} as well, the newest that states engine ABI {abi}"
+                )),
+                false => say(&format!(
+                    "basert {v} is made the one in use only if superfluid {have} serves it"
+                )),
+            }
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => say(&format!(
+            "no superfluid release states engine ABI {abi} yet: basert {v} is made the one in \
+             use only if superfluid {have} serves it"
+        )),
+        Err(e) => say(&format!(
+            "the superfluid releases were not looked up: {e:#}"
+        )),
+    }
+    Ok(())
 }
 
 // --- the commands --------------------------------------------------------------
@@ -1472,12 +1567,13 @@ fn update(
                 "the newest release"
             }
         ));
+        // superfluid as well: the newest release that serves this engine.
+        let abi = abi_in(&engine_here).or(chosen.abi);
+        let pairing = pair_superfluid(&engine_here, abi, true, dry_run, say)?;
         if dry_run {
+            say("dry run: nothing fetched or changed");
             return Ok(());
         }
-        // superfluid as well: the newest release that serves this engine.
-        let pairing =
-            pair_superfluid(&engine_here, abi_in(&engine_here).or(chosen.abi), true, say)?;
         return apply(pairing, say);
     }
     if version.is_none() && version_key(v) < version_key(&here) {
@@ -1493,6 +1589,14 @@ fn update(
         if on_disk { ", already here" } else { "" }
     ));
     if dry_run {
+        // superfluid is asked about an engine only once it is on disk.
+        match on_disk {
+            true => {
+                let engine = layout.version_dir(v);
+                pair_superfluid(&engine, abi_in(&engine).or(chosen.abi), true, true, say)?;
+            }
+            false => name_newer_superfluid(v, chosen.abi, say)?,
+        }
         say("dry run: nothing fetched or changed");
         return Ok(());
     }
@@ -1506,7 +1610,7 @@ fn update(
     };
     let placed = place(&layout, chosen, say)?;
     let engine = layout.version_dir(v);
-    let pairing = match pair_superfluid(&engine, abi_in(&engine).or(chosen.abi), true, say) {
+    let pairing = match pair_superfluid(&engine, abi_in(&engine).or(chosen.abi), true, false, say) {
         Ok(pairing) => pairing,
         Err(e) => {
             if placed {
@@ -1579,7 +1683,7 @@ fn use_version(v: &str, say: &mut dyn FnMut(&str)) -> Result<()> {
         return Ok(());
     }
     let engine = layout.version_dir(v);
-    let pairing = pair_superfluid(&engine, abi_in(&engine), false, say)
+    let pairing = pair_superfluid(&engine, abi_in(&engine), false, false, say)
         .with_context(|| format!("basert {v} was not made the one in use"))?;
     apply(pairing, say)?;
     let tag = fs::read_to_string(engine.join(STAMP))

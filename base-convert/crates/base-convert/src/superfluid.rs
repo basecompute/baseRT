@@ -343,8 +343,9 @@ impl Install {
     /// nothing yet. A prefix such as `~/.local`, which superfluid's own install
     /// script fills and `$BASERT_SUPERFLUID_DIR` may name, holds the user's
     /// other files, which would be removed with it. `fresh` is the release
-    /// about to take its place.
-    pub fn replaceable(&self, fresh: &Path) -> Result<()> {
+    /// about to take its place; with `None`, before one is fetched, what is
+    /// superfluid's is told by its layout alone (all a release holds today).
+    pub fn replaceable(&self, fresh: Option<&Path>) -> Result<()> {
         if fs::symlink_metadata(&self.root).is_err() {
             return Ok(());
         }
@@ -581,7 +582,7 @@ impl Install {
     pub fn swap_in(&self, staged: Staged, say: &mut dyn FnMut(&str)) -> Result<()> {
         let tag = &staged.tag;
         let fresh = &staged.fresh.root;
-        self.replaceable(fresh)?;
+        self.replaceable(Some(fresh))?;
         // The last look, held through the swap: no server runs from it, and
         // none starts until it is done; and it holds what it held when the
         // release was staged.
@@ -699,13 +700,13 @@ enum Level {
 
 /// The first entry under `dir` that is not superfluid's, `at` that level of a
 /// release: superfluid's is a name `fresh` (the same level of the release
-/// about to replace it) has too, or one of superfluid's layout (`bin/` holding
-/// `superfluid*`, `libexec/superfluid/`, the release's `LICENSE`, `NOTICE`,
-/// `README.md` and `compat.json`, the `.release` and `installed-by` basert
-/// writes). A link is superfluid's only where `fresh` has one (a release holds
-/// none; superfluid's own install script links `bin/superfluid` to its
-/// versions); a directory that cannot be read is not.
-fn not_superfluids(dir: &Path, fresh: &Path, at: Level) -> Option<PathBuf> {
+/// about to replace it, when there is one) has too, or one of superfluid's
+/// layout (`bin/` holding `superfluid*`, `libexec/superfluid/`, the release's
+/// `LICENSE`, `NOTICE`, `README.md` and `compat.json`, the `.release` and
+/// `installed-by` basert writes). A link is superfluid's only where `fresh`
+/// has one (a release holds none; superfluid's own install script links
+/// `bin/superfluid` to its versions); a directory that cannot be read is not.
+fn not_superfluids(dir: &Path, fresh: Option<&Path>, at: Level) -> Option<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Some(dir.to_path_buf());
     };
@@ -718,9 +719,10 @@ fn not_superfluids(dir: &Path, fresh: &Path, at: Level) -> Option<PathBuf> {
         let Ok(meta) = fs::symlink_metadata(&path) else {
             return Some(path);
         };
-        let theirs = fs::symlink_metadata(fresh.join(&name));
+        let there = fresh.map(|f| f.join(&name));
+        let theirs = there.as_ref().and_then(|f| fs::symlink_metadata(f).ok());
         if meta.file_type().is_symlink() {
-            if !theirs.is_ok_and(|m| m.file_type().is_symlink()) {
+            if !theirs.is_some_and(|m| m.file_type().is_symlink()) {
                 return Some(path);
             }
             continue;
@@ -737,7 +739,7 @@ fn not_superfluids(dir: &Path, fresh: &Path, at: Level) -> Option<PathBuf> {
             Level::Libexec => name == "superfluid",
             Level::Other => false,
         };
-        if !layout && theirs.is_err() {
+        if !layout && theirs.is_none() {
             return Some(path);
         }
         if meta.is_dir() {
@@ -748,7 +750,7 @@ fn not_superfluids(dir: &Path, fresh: &Path, at: Level) -> Option<PathBuf> {
                 (Level::Top, "libexec") => Level::Libexec,
                 _ => Level::Other,
             };
-            if let Some(found) = not_superfluids(&path, &fresh.join(&name), inner) {
+            if let Some(found) = not_superfluids(&path, there.as_deref(), inner) {
                 return Some(found);
             }
         }
@@ -1518,6 +1520,9 @@ mod tests {
                     .unwrap();
             }
             extra(&install.root, &elsewhere);
+            // Told before the release is fetched as well.
+            let early = format!("{:#}", install.replaceable(None).unwrap_err());
+            assert!(early.contains(named), "{name}: {early}");
             let before = says_all(&install.root);
             let err = install
                 .install(&Source::Dir(next.clone()), &Release::tested(), &mut |_| {})
@@ -1600,10 +1605,12 @@ mod tests {
             fs::create_dir_all(dir.join("bin")).unwrap();
             fs::write(dir.join("bin").join("sf-helper"), "").unwrap();
         }
-        assert_eq!(not_superfluids(&root, &fresh, Level::Top), None);
+        assert_eq!(not_superfluids(&root, Some(&fresh), Level::Top), None);
+        // With no release at hand, superfluid's layout alone is.
+        assert!(not_superfluids(&root, None, Level::Top).is_some());
         fs::write(root.join("share").join("other.txt"), "").unwrap();
         assert_eq!(
-            not_superfluids(&root, &fresh, Level::Top),
+            not_superfluids(&root, Some(&fresh), Level::Top),
             Some(root.join("share").join("other.txt"))
         );
     }
@@ -1627,6 +1634,8 @@ mod tests {
         }
         assert!(install.root.join(STAMP).is_file());
         assert!(install.root.join(INSTALLED_BY).is_file());
+        // Told so by its layout alone, before the next release is fetched.
+        install.replaceable(None).unwrap();
         install
             .install(&Source::Dir(next), &Release::tested(), &mut |_| {})
             .unwrap();
