@@ -406,22 +406,26 @@ struct PullArgs {
     /// Model id: `basecompute/<name>` (pre-converted, from the catalog) or
     /// `org/model` (a raw HF repo, downloaded + converted locally). Add
     /// `:<variant>` for that variant, as `basert list` names it
-    /// (`default-q8`, `cuda-q4mix`, `file-…`), or a quant (`q8`).
+    /// (`default-q8`, `cuda-q4mix`, `file-…`), a quant (`q8`), or a size
+    /// (`small`) of a release that comes in sizes (`-XS`, `-Small`,
+    /// `-Medium`, `-Large`, `-XL`); such a release's medium is the default.
     id: String,
     /// Override the auto-selected quant profile (path to a profile JSON).
     #[arg(long)]
     profile: Option<PathBuf>,
-    /// Target quant scheme for convert-on-pull when no profile applies.
-    #[arg(long, value_enum, default_value_t = TargetScheme::BaseQ4)]
-    target: TargetScheme,
+    /// Target quant scheme for convert-on-pull when no profile applies
+    /// (base-q4 when not given). Given, it names the quant a pre-converted
+    /// repo's file is picked by, so a release in sizes refuses it.
+    #[arg(long, value_enum)]
+    target: Option<TargetScheme>,
     /// HF revision / branch / tag.
     #[arg(long, default_value = "main")]
     revision: String,
     /// Take this `.base` file from the repo (e.g. `Foo-Medium.base`) rather
-    /// than picking one by quant — for repos whose `.base` files are not
-    /// named by quant. A file the catalog lists installs under its catalog
-    /// variant; any other under one of its own (`file-foo-medium-<hash>`),
-    /// which `basert list --json` shows beside the file.
+    /// than picking one by quant or size. A file the catalog lists installs
+    /// under its catalog variant; any other under one of its own
+    /// (`file-foo-medium-<hash>`), which `basert list --json` shows beside
+    /// the file.
     #[arg(long)]
     file: Option<String>,
     /// Re-download / re-convert even if already cached.
@@ -430,6 +434,13 @@ struct PullArgs {
     /// Resolve and print the plan without downloading anything.
     #[arg(long)]
     dry_run: bool,
+}
+
+impl PullArgs {
+    /// The quant scheme the pull converts to: the one named, else base-q4.
+    fn target_scheme(&self) -> TargetScheme {
+        self.target.unwrap_or(TargetScheme::BaseQ4)
+    }
 }
 
 #[derive(Parser, Debug)]

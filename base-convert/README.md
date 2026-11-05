@@ -47,6 +47,12 @@ basert pull Qwen/Qwen3-0.6B --target base-q8
 basert pull basecompute/<name>:default-q8
 basert pull Qwen/Qwen3-0.6B:q8
 
+# A release that comes in sizes (the BaseQuant repos' -XS/-Small/-Medium/
+# -Large/-XL files): its Medium by default, another by size or file name:
+basert pull basecompute/Qwen3.8-27B-BaseQuant-V1
+basert pull basecompute/Qwen3.8-27B-BaseQuant-V1:small
+basert pull basecompute/Qwen3.8-27B-BaseQuant-V1 --file Qwen3.8-27B-BaseQuant-V1-XL.base
+
 basert pull <id> --dry-run     # resolve + print the plan, download nothing
 basert list                    # installed models (table; --json for JSON)
 basert list --remote           # also show catalog models not yet installed
