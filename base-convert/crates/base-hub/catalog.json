@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-11-03",
+  "updated": "2026-11-05",
   "models": [
     {
       "id": "basecompute/Llama-3.1-8B-Instruct",
@@ -674,8 +674,10 @@
       "revision": "main",
       "arch": "gemma4",
       "quant": "default-q4",
-      "size": 16108079360,
-      "sha256": "efabbac27832f43d17eaac05c9a5c32545c9a02bea975836f038d32de8368782"
+      "size": 16947888128,
+      "sha256": "f1d32fe933e7321d4d389f8f99ed1d2826fda5d11a39fd3a538addabb5c699eb",
+      "speculator": "gemma4-mtp",
+      "speculator_version": "1"
     },
     {
       "id": "basecompute/gemma-4-26B-A4B-it",
@@ -684,8 +686,10 @@
       "revision": "main",
       "arch": "gemma4",
       "quant": "default-q8",
-      "size": 26656278784,
-      "sha256": "c2f13d6d299cb8a18e5c41929d974c348846214d37e2acbdf4865e8a71a4e411"
+      "size": 27496087552,
+      "sha256": "a6a7e3210ebf333dc66b283b56a694686867ff6ada2c32f121de5e6d01606cd9",
+      "speculator": "gemma4-mtp",
+      "speculator_version": "1"
     },
     {
       "id": "basecompute/gemma-4-26B-A4B-it",
@@ -694,9 +698,11 @@
       "revision": "main",
       "arch": "gemma4",
       "quant": "cuda-q4mix",
-      "size": 16108079360,
-      "sha256": "42175b1a0eb73da799e8a3745ec7d29d03803d5b3b61767fd7c77825ad9e7fef",
-      "backend": "cuda"
+      "size": 16947888128,
+      "sha256": "0a882f32bfdde8507b97a280f650fe3086d48ddd796fee745f1679f66215bd7e",
+      "backend": "cuda",
+      "speculator": "gemma4-mtp",
+      "speculator_version": "1"
     },
     {
       "id": "basecompute/gemma-4-26B-A4B-it",
@@ -705,9 +711,11 @@
       "revision": "main",
       "arch": "gemma4",
       "quant": "cuda-q8",
-      "size": 27029195008,
-      "sha256": "6f8c9ebeab8106c4b4489ae19c41cec9bffcd9ed1aaf8489833bd365a86200d5",
-      "backend": "cuda"
+      "size": 27869003776,
+      "sha256": "7bf3a9158053d6b8d5f57024d0af582134233c05b90dcea28fe4c11434a987aa",
+      "backend": "cuda",
+      "speculator": "gemma4-mtp",
+      "speculator_version": "1"
     },
     {
       "id": "basecompute/gemma-4-E2B-it",
