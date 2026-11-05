@@ -79,6 +79,85 @@ fn is_quant_tag(tag: &str) -> bool {
     )
 }
 
+/// The sizes a release names its `.base` files by instead of a quant (the
+/// BaseQuant repos' `-XS`/`-Small`/`-Medium`/`-Large`/`-XL`), smallest first.
+const SIZE_NAMES: [&str; 5] = ["xs", "small", "medium", "large", "xl"];
+
+/// The size a pull takes from such a release when nothing names one.
+const DEFAULT_SIZE: &str = "medium";
+
+/// The size `name` spells, case aside (`Medium` → `medium`).
+fn size_name(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    SIZE_NAMES.iter().copied().find(|s| *s == n)
+}
+
+/// The size a `.base` is named by (`Foo-Medium.base` → `medium`), if any.
+fn size_tag(file: &str) -> Option<&'static str> {
+    size_name(&quant_tag(&base_file_stem(file)))
+}
+
+/// The sizes a repo's `.base` files come in, smallest first, or None when
+/// none is named by size.
+fn sizes_offered(files: &Grouped) -> Option<String> {
+    let sizes: Vec<&str> = SIZE_NAMES
+        .iter()
+        .copied()
+        .filter(|s| files.artifacts.iter().any(|f| size_tag(&f.name) == Some(s)))
+        .collect();
+    (!sizes.is_empty()).then(|| sizes.join(", "))
+}
+
+/// The `.base` a plain pull takes from a repo whose files are named by size
+/// and none by quant: the one of [`DEFAULT_SIZE`], else the sole file.
+/// None when the repo is not such a release, so the quant rule applies; an
+/// incomplete part set of that size is an error saying why, never another
+/// size.
+fn default_size_file(files: &Grouped) -> Result<Option<String>> {
+    let quant_named = |n: &str| is_quant_tag(&quant_tag(&base_file_stem(n)));
+    let sized = files.artifacts.iter().any(|f| size_tag(&f.name).is_some())
+        || files.malformed.iter().any(|(n, _)| size_tag(n).is_some());
+    if !sized
+        || files.artifacts.iter().any(|f| quant_named(&f.name))
+        || files.malformed.iter().any(|(n, _)| quant_named(n))
+    {
+        return Ok(None);
+    }
+    let mediums: Vec<&Artifact> = files
+        .artifacts
+        .iter()
+        .filter(|f| size_tag(&f.name) == Some(DEFAULT_SIZE))
+        .collect();
+    match mediums.as_slice() {
+        [one] => return Ok(Some(one.name.clone())),
+        [] => {}
+        many => bail!(
+            "{DEFAULT_SIZE} names several files in this repo ({}); take one with --file",
+            many.iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+    if let Some((name, why)) = files
+        .malformed
+        .iter()
+        .find(|(n, _)| size_tag(n) == Some(DEFAULT_SIZE))
+    {
+        bail!("{name}: the {DEFAULT_SIZE} publication is incomplete ({why})");
+    }
+    if let ([only], []) = (files.artifacts.as_slice(), files.malformed.as_slice()) {
+        return Ok(Some(only.name.clone()));
+    }
+    Ok(None)
+}
+
+/// Whether the pull names a quant (`--profile`, `--target`) rather than
+/// taking the default one.
+fn quant_named(args: &PullArgs) -> bool {
+    args.profile.is_some() || args.target.is_some()
+}
+
 /// The quant the user is asking for, derived from `--profile` (its filename)
 /// or, failing that, `--target`.
 fn quant_token(args: &PullArgs) -> String {
@@ -87,7 +166,7 @@ fn quant_token(args: &PullArgs) -> String {
             return quant_tag(stem);
         }
     }
-    quant_tag(target_str(args.target))
+    quant_tag(target_str(args.target_scheme()))
 }
 
 /// `path/to/Foo-Q4.base` → `Foo-Q4`.
@@ -144,6 +223,13 @@ fn select_base_file<'a>(files: &'a Grouped, want: &str) -> Result<&'a Artifact> 
                 .map(|(n, _)| format!("{} (incomplete)", quant_tag(&base_file_stem(n)))),
         )
         .collect();
+    if let Some(sizes) = sizes_offered(files) {
+        bail!(
+            "no .base for quant {want:?} in this repo: its files are named by size \
+             ({sizes}); take one as `<id>:<size>` or by name with --file: {}",
+            file_names(files)
+        );
+    }
     bail!(
         "no pre-converted .base for quant {want:?} in this repo; it offers: {} \
          (or take one by name with --file: {})",
@@ -219,6 +305,9 @@ fn base_variant(file: &str, want: &str) -> String {
     let file_tag = quant_tag(&base_file_stem(file));
     if is_quant_tag(&file_tag) {
         format!("default-{file_tag}")
+    } else if size_tag(file).is_some() {
+        // a file named by size is its own variant, as `--file` installs it
+        named_variant(file)
     } else {
         format!("default-{want}")
     }
@@ -336,6 +425,16 @@ fn installed_single_path(reg: &MergedRegistry, id: &str) -> Result<Option<PathBu
             } else {
                 None
             };
+            // Files of a release in sizes, each under its own `file-…`
+            // variant: the default size, when it is the one installed.
+            let pick = pick.or_else(|| {
+                let sized: Vec<&ModelEntry> = many
+                    .iter()
+                    .copied()
+                    .filter(|r| r.file.as_deref().and_then(size_tag) == Some(DEFAULT_SIZE))
+                    .collect();
+                (sized.len() == 1).then(|| sized[0])
+            });
             if let Some(one) = pick {
                 return Ok(Some(one.path.clone().with_context(|| {
                     format!("installed model `{id}` has no artifact path")
@@ -361,6 +460,9 @@ fn installed_single_path(reg: &MergedRegistry, id: &str) -> Result<Option<PathBu
 fn installed_best_variant(reg: &MergedRegistry, id: &str, want: &str) -> Option<PathBuf> {
     if let Some(p) = reg.local.installed_path(id, want) {
         return Some(p); // exact variant name present
+    }
+    if let Some(size) = size_name(want) {
+        return installed_size_path(reg, id, size);
     }
     let want_bits = base_hub::registry::quant_bits(want).unwrap_or(want);
     let backend = base_hub::registry::CatalogRegistry::client_backend();
@@ -397,6 +499,23 @@ fn installed_best_variant(reg: &MergedRegistry, id: &str, want: &str) -> Option<
     matches[0].path.clone()
 }
 
+/// The install of `id` that holds the `.base` named by `size` (`:medium`):
+/// a file taken by name or as a release's default size installs under its
+/// own `file-…` variant, recording the file, which is the only way its size
+/// is known.
+fn installed_size_path(reg: &MergedRegistry, id: &str, size: &str) -> Option<PathBuf> {
+    reg.local
+        .list()
+        .ok()?
+        .into_iter()
+        .find(|r| {
+            r.id == id
+                && r.variant.starts_with(NAMED_VARIANT_PREFIX)
+                && r.file.as_deref().and_then(size_tag) == Some(size)
+        })
+        .and_then(|r| r.path)
+}
+
 /// Fetch a not-yet-installed model on demand, then return its artifact path.
 /// Prefers the pre-converted basecompute mirror; otherwise converts the source
 /// repo on pull. Progress (download + quantization) is shown by `cmd_pull`.
@@ -419,7 +538,7 @@ fn auto_pull_and_resolve(
     cmd_pull(PullArgs {
         id: want_variant.map_or_else(|| pull_id.clone(), |v| format!("{pull_id}:{v}")),
         profile: None,
-        target: TargetScheme::BaseQ4,
+        target: None,
         revision: "main".to_string(),
         file: None,
         force: false,
@@ -526,7 +645,7 @@ fn serve_ready(
     cmd_pull(PullArgs {
         id: format!("{id}:{variant}"),
         profile: None,
-        target: TargetScheme::BaseQ4,
+        target: None,
         revision: "main".to_string(),
         file: None,
         force: true,
@@ -773,11 +892,11 @@ pub fn cmd_pull(args: PullArgs) -> Result<()> {
     // Resolved against whichever catalog the attempt is given: the cached one
     // first, the live one if the cached rows prove to be behind the Hub.
     with_fresh_catalog_on_mismatch(&reg, MergedRegistry::load_fresh, |reg| {
+        let fetcher = HfFetcher::new(cache::hf_staging_dir(&reg.root))?;
         if let Some((id, variant)) = args.id.split_once(':') {
-            let fetcher = HfFetcher::new(cache::hf_staging_dir(&reg.root))?;
             return pull_variant(reg, &args, id, variant, &fetcher);
         }
-        pull_id(reg, &args)
+        pull_id(reg, &args, &fetcher)
     })
 }
 
@@ -831,7 +950,7 @@ fn pull_variant(
     let given = [
         args.file.as_ref().map(|_| "--file"),
         args.profile.as_ref().map(|_| "--profile"),
-        (args.target != TargetScheme::BaseQ4).then_some("--target"),
+        args.target.map(|_| "--target"),
     ];
     if let Some(flag) = given.into_iter().flatten().next() {
         bail!(
@@ -845,7 +964,7 @@ fn pull_variant(
             return Ok(());
         }
     }
-    let pull = |file: Option<String>, target: TargetScheme| PullArgs {
+    let pull = |file: Option<String>, target: Option<TargetScheme>| PullArgs {
         id: id.to_string(),
         profile: None,
         target,
@@ -860,7 +979,7 @@ fn pull_variant(
             let named = pull(Some(file.clone()), args.target);
             pull_named_file(reg, &named, &file, fetcher)
         }
-        VariantSource::Quant(target) => pull_id(reg, &pull(None, target)),
+        VariantSource::Quant(target) => pull_id(reg, &pull(None, Some(target)), fetcher),
     }
 }
 
@@ -953,6 +1072,11 @@ fn variant_source(
             (None, false) => {}
         }
     }
+    // A size (`medium`): the file of that size in the id's repo, pulled as
+    // `--file` pulls it.
+    if let Some(size) = size_name(variant) {
+        return size_variant_file(reg, id, size, revision, fetcher).map(VariantSource::File);
+    }
     if let Some(target) = target_alias(variant) {
         return Ok(VariantSource::Quant(target));
     }
@@ -969,8 +1093,68 @@ fn variant_source(
     };
     bail!(
         "{id} has no variant {variant:?}{listed}. Name one `basert list --remote` shows, \
-         a quant (q4, q8, bf16, …), or a file with --file"
+         a quant (q4, q8, bf16, …), a size (xs, small, medium, large, xl), or a file \
+         with --file"
     )
+}
+
+/// Where the files of `id` are: the repos (with revisions) its catalog rows
+/// use, else the id's own repo at `revision`.
+fn repo_sources(reg: &MergedRegistry, id: &str, revision: &str) -> Vec<(String, String)> {
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for e in reg.catalog.rows(id) {
+        let at = (e.hf_repo.clone(), e.revision.clone());
+        if !sources.contains(&at) {
+            sources.push(at);
+        }
+    }
+    if sources.is_empty() {
+        sources.push((id.to_string(), revision.to_string()));
+    }
+    sources
+}
+
+/// The `.base` of `id` named by `size` (`:medium` → `Foo-Medium.base`),
+/// looked for where `--file` looks. A size the release does not come in
+/// names the sizes it does; one found in several places must be given as a
+/// file with its path.
+fn size_variant_file(
+    reg: &MergedRegistry,
+    id: &str,
+    size: &str,
+    revision: &str,
+    fetcher: &dyn Fetcher,
+) -> Result<String> {
+    let sources = repo_sources(reg, id, revision);
+    let mut names = Vec::new();
+    let mut sizes = Vec::new();
+    for (repo, revision) in &sources {
+        let files = list_base_files(fetcher, repo, revision)?;
+        if let Some(offered) = sizes_offered(&files) {
+            sizes.push(offered);
+        }
+        names.extend(files.artifacts.iter().map(|f| f.name.clone()));
+    }
+    let hits: Vec<&String> = names.iter().filter(|n| size_tag(n) == Some(size)).collect();
+    match hits.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] if sizes.is_empty() => bail!(
+            "{id} has no {size} .base: its files are not named by size ({}); name a \
+             variant `basert list --remote` shows, a quant, or a file with --file",
+            names.join(", ")
+        ),
+        [] => bail!(
+            "{id} has no {size} .base; it comes in: {}",
+            sizes.join(", ")
+        ),
+        many => bail!(
+            "{size} names several files of {id} ({}); give one with --file and its path",
+            many.iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// The repo file the `file-…` variant `variant` was named for (see
@@ -984,16 +1168,7 @@ fn named_variant_file(
     revision: &str,
     fetcher: &dyn Fetcher,
 ) -> Result<String> {
-    let mut sources: Vec<(String, String)> = Vec::new();
-    for e in reg.catalog.rows(id) {
-        let at = (e.hf_repo.clone(), e.revision.clone());
-        if !sources.contains(&at) {
-            sources.push(at);
-        }
-    }
-    if sources.is_empty() {
-        sources.push((id.to_string(), revision.to_string()));
-    }
+    let sources = repo_sources(reg, id, revision);
     let mut names = Vec::new();
     for (repo, revision) in &sources {
         let files = list_base_files(fetcher, repo, revision)?;
@@ -1023,16 +1198,17 @@ fn named_variant_file(
 }
 
 /// `basert pull <id>`, with no `:variant`.
-fn pull_id(reg: &MergedRegistry, args: &PullArgs) -> Result<()> {
+fn pull_id(reg: &MergedRegistry, args: &PullArgs, fetcher: &dyn Fetcher) -> Result<()> {
     let root = reg.root.clone();
     let want = quant_token(args);
     if let Some(file) = &args.file {
-        let fetcher = HfFetcher::new(cache::hf_staging_dir(&root))?;
-        return pull_named_file(reg, args, file, &fetcher);
+        return pull_named_file(reg, args, file, fetcher);
     }
     let r = reg.resolve(&args.id, &args.revision, Some(&want), args.force)?;
 
-    if args.dry_run {
+    // A raw repo's plan is read off its listing (which file, or that none
+    // fits), as the pull would; the rest is settled here.
+    if args.dry_run && !matches!(r, ModelRef::HuggingFace { .. }) {
         print_plan(&r, &want);
         return Ok(());
     }
@@ -1065,18 +1241,16 @@ fn pull_id(reg: &MergedRegistry, args: &PullArgs) -> Result<()> {
             // installed_best_variant / the catalog resolver's bit-aware match.
             let want_bits = base_hub::registry::quant_bits(&want).unwrap_or(&want);
             if base_hub::registry::quant_bits(variant).unwrap_or(variant) == want_bits {
-                let fetcher = HfFetcher::new(cache::hf_staging_dir(&root))?;
-                pull_catalog(&root, &r, &fetcher)
+                pull_catalog(&root, &r, fetcher)
             } else {
-                let fetcher = HfFetcher::new(cache::hf_staging_dir(&root))?;
-                let base_files = list_base_files(&fetcher, hf_repo, revision)?;
+                let base_files = list_base_files(fetcher, hf_repo, revision)?;
                 pull_base_direct(
                     &root,
                     args,
                     id,
                     hf_repo,
                     revision,
-                    &fetcher,
+                    fetcher,
                     &base_files,
                     None,
                     None,
@@ -1087,28 +1261,78 @@ fn pull_id(reg: &MergedRegistry, args: &PullArgs) -> Result<()> {
         // (e.g. the basecompute org), download the matching one directly — no
         // local conversion. Otherwise treat it as source safetensors.
         ModelRef::HuggingFace { id, repo, revision } => {
-            let fetcher = HfFetcher::new(cache::hf_staging_dir(&root))?;
-            let base_files = list_base_files(&fetcher, repo, revision)?;
-            // A repo holding only a half-uploaded split bundle is still a
-            // `.base` repo: it gets the incomplete-publication error, not a
-            // conversion attempt.
-            if base_files.artifacts.is_empty() && base_files.malformed.is_empty() {
-                pull_and_convert(&root, args, id, repo, revision)
-            } else {
-                pull_base_direct(
-                    &root,
-                    args,
-                    id,
-                    repo,
-                    revision,
-                    &fetcher,
-                    &base_files,
-                    None,
-                    None,
-                )
-            }
+            pull_hf_repo(reg, args, id, repo, revision, fetcher)
         }
     }
+}
+
+/// `basert pull <id>` of a raw Hub repo: its pre-converted `.base` when it
+/// hosts any, else the source safetensors converted here.
+fn pull_hf_repo(
+    reg: &MergedRegistry,
+    args: &PullArgs,
+    id: &str,
+    repo: &str,
+    revision: &str,
+    fetcher: &dyn Fetcher,
+) -> Result<()> {
+    let base_files = list_base_files(fetcher, repo, revision)?;
+    // A repo holding only a half-uploaded split bundle is still a
+    // `.base` repo: it gets the incomplete-publication error, not a
+    // conversion attempt.
+    if base_files.artifacts.is_empty() && base_files.malformed.is_empty() {
+        if args.dry_run {
+            let r = ModelRef::HuggingFace {
+                id: id.to_string(),
+                repo: repo.to_string(),
+                revision: revision.to_string(),
+            };
+            print_plan(&r, &quant_token(args));
+            return Ok(());
+        }
+        return pull_and_convert(&reg.root, args, id, repo, revision);
+    }
+    // A release in sizes (the BaseQuant repos): with no file and no quant
+    // named, its default size, pulled as `--file` pulls it, so both land in
+    // one install.
+    if args.file.is_none() && !quant_named(args) {
+        if let Some(file) = default_size_file(&base_files)? {
+            eprintln!(
+                "{id}: a release in sizes; taking {file} (`{id}:<size>` or --file takes another)"
+            );
+            let named = PullArgs {
+                id: args.id.clone(),
+                profile: None,
+                target: args.target,
+                revision: args.revision.clone(),
+                file: Some(file.clone()),
+                force: args.force,
+                dry_run: args.dry_run,
+            };
+            return pull_named_file(reg, &named, &file, fetcher);
+        }
+    }
+    if args.dry_run {
+        let want = quant_token(args);
+        let artifact = select_base_file(&base_files, &want)?;
+        println!(
+            "plan: pull {} from {repo}@{revision} → {id} [{}] (no conversion)",
+            artifact.name,
+            base_variant(&artifact.name, &want)
+        );
+        return Ok(());
+    }
+    pull_base_direct(
+        &reg.root,
+        args,
+        id,
+        repo,
+        revision,
+        fetcher,
+        &base_files,
+        None,
+        None,
+    )
 }
 
 /// `pull --file`: download the named `.base` from the id's repo (the catalog's
@@ -1630,7 +1854,7 @@ fn pull_and_convert(
         output: Some(out.clone()),
         mtp_head: None,
         mtp_head_version: None,
-        target: args.target,
+        target: args.target_scheme(),
         calib: None,
         calib_tokens: 512,
         awq_mode: AwqMode::Full,
@@ -1725,7 +1949,7 @@ fn choose_profile(
             .to_string();
         return Ok((variant, Some(p.clone()), None));
     }
-    if let Some((name, json)) = bundled_profile_for_target(args.target) {
+    if let Some((name, json)) = bundled_profile_for_target(args.target_scheme()) {
         let mut tf = tempfile::Builder::new()
             .prefix("base-profile-")
             .suffix(".json")
@@ -1735,7 +1959,7 @@ fn choose_profile(
         return Ok((name.to_string(), Some(path), Some(tf)));
     }
     // No generic profile for this scheme → flat --target, variant = scheme.
-    Ok((target_str(args.target).to_string(), None, None))
+    Ok((target_str(args.target_scheme()).to_string(), None, None))
 }
 
 /// The drafter sidecar architecture the snapshot's `config.json` names
@@ -2344,7 +2568,7 @@ mod tests {
         let args = PullArgs {
             id: "basecompute/m".into(),
             profile: None,
-            target: TargetScheme::BaseQ4,
+            target: None,
             revision: "main".into(),
             file: None,
             force: false,
@@ -2414,7 +2638,7 @@ mod tests {
         let args = PullArgs {
             id: "basecompute/m".into(),
             profile: None,
-            target: TargetScheme::BaseQ8,
+            target: Some(TargetScheme::BaseQ8),
             revision: "main".into(),
             file: None,
             force: false,
@@ -2564,7 +2788,7 @@ mod tests {
         PullArgs {
             id: id.into(),
             profile: None,
-            target: TargetScheme::BaseQ4,
+            target: None,
             revision: "main".into(),
             file: Some(file.into()),
             force: false,
@@ -2648,7 +2872,10 @@ mod tests {
         let base_files = list_base_files(&fetcher, "basecompute/m", "main").unwrap();
         let err = select_base_file(&base_files, "q4").unwrap_err().to_string();
         assert!(
-            err.contains("--file") && err.contains("m-Medium.base"),
+            err.contains("named by size (small, medium)")
+                && err.contains("`<id>:<size>`")
+                && err.contains("--file")
+                && err.contains("m-Medium.base"),
             "{err}"
         );
 
@@ -2678,6 +2905,271 @@ mod tests {
         assert_eq!(files, ["m-Medium.base", "m-Small.base"]);
         // and a quant never reaches one by its bits
         assert!(installed_best_variant(&reg, "basecompute/m", "default-q4").is_none());
+    }
+
+    fn plain(id: &str) -> PullArgs {
+        with_variant(id, false)
+    }
+
+    fn pull_repo(reg: &MergedRegistry, fetcher: &dyn Fetcher, args: &PullArgs) -> Result<()> {
+        pull_hf_repo(reg, args, &args.id, &args.id, "main", fetcher)
+    }
+
+    /// A release in sizes (the BaseQuant repos): a plain pull takes its
+    /// medium, under the variant `--file` would install it in, so the two
+    /// share one install; a quant named instead is refused naming the sizes.
+    #[test]
+    fn a_release_in_sizes_pulls_its_medium_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "basecompute/m";
+        fixture_repo(
+            tmp.path(),
+            id,
+            &[
+                ("m-XS.base", b"xs"),
+                ("m-Small.base", b"small"),
+                ("m-Medium.base", b"medium"),
+                ("m-Large.base", b"large"),
+                ("m-XL.base", b"xl"),
+                ("m-Medium.gguf", b"gguf"),
+            ],
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let reg = MergedRegistry::new(tmp.path().join("cache"), catalog(""));
+        let medium = named_variant("m-Medium.base");
+
+        pull_repo(&reg, &fetcher, &plain(id)).unwrap();
+        let path = reg.local.installed_path(id, &medium).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"medium");
+        assert_eq!(held(&reg, id, &medium).as_deref(), Some("m-Medium.base"));
+        assert_eq!(reg.local.list().unwrap().len(), 1);
+
+        // installed: a second plain pull, a `--file` pull and a `:medium`
+        // pull all find it without a download
+        let listing = Listing(vec!["m-Small.base", "m-Medium.base", "m-Large.base"]);
+        pull_repo(&reg, &listing, &plain(id)).unwrap();
+        pull_repo(&reg, &listing, &with_variant(id, true)).unwrap();
+        pull_named(&reg, &listing, &named("m-Medium.base", false, id)).unwrap();
+        pull_with_variant(&reg, &listing, &with_variant("basecompute/m:medium", false)).unwrap();
+        pull_with_variant(&reg, &listing, &with_variant("basecompute/m:Medium", false)).unwrap();
+        assert_eq!(reg.local.list().unwrap().len(), 1);
+
+        // and `serve <id>` / `serve <id>:medium` resolve to it
+        assert_eq!(
+            installed_single_path(&reg, id).unwrap().as_deref(),
+            Some(path.as_path())
+        );
+        assert_eq!(
+            installed_best_variant(&reg, id, "medium").as_deref(),
+            Some(path.as_path())
+        );
+        assert_eq!(
+            installed_best_variant(&reg, id, "Medium").as_deref(),
+            Some(path.as_path())
+        );
+        assert!(installed_best_variant(&reg, id, "small").is_none());
+        assert!(installed_best_variant(&reg, id, "default-q4").is_none());
+
+        // a size names its file; one the release lacks names the sizes it has
+        assert_eq!(
+            variant_source(&reg, id, "small", "main", &fetcher).unwrap(),
+            VariantSource::File("m-Small.base".into())
+        );
+        pull_with_variant(&reg, &fetcher, &with_variant("basecompute/m:small", false)).unwrap();
+        let small = named_variant("m-Small.base");
+        assert_eq!(
+            std::fs::read(reg.local.installed_path(id, &small).unwrap()).unwrap(),
+            b"small"
+        );
+        assert_eq!(
+            installed_best_variant(&reg, id, "small").unwrap(),
+            reg.local.installed_path(id, &small).unwrap()
+        );
+        // with several sizes installed, the bare id is still the medium
+        assert_eq!(
+            installed_single_path(&reg, id).unwrap().as_deref(),
+            Some(path.as_path())
+        );
+
+        // a quant named instead of a size is refused, naming the sizes
+        let mut q8 = plain(id);
+        q8.target = Some(TargetScheme::BaseQ8);
+        let err = pull_repo(&reg, &fetcher, &q8).unwrap_err().to_string();
+        assert!(
+            err.contains("named by size (xs, small, medium, large, xl)")
+                && err.contains("`<id>:<size>`"),
+            "{err}"
+        );
+        q8.dry_run = true;
+        let err = pull_repo(&reg, &listing, &q8).unwrap_err().to_string();
+        assert!(err.contains("named by size"), "{err}");
+    }
+
+    /// A dry run of a raw repo reads its plan off the listing: the file a
+    /// pull would take and the variant it would land in, nothing fetched.
+    #[test]
+    fn a_dry_run_of_a_raw_repo_names_its_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = MergedRegistry::new(tmp.path().join("cache"), catalog(""));
+        let listing = Listing(vec!["m-Q4.base", "m-Q8.base"]);
+        let mut args = plain("org/m");
+        args.dry_run = true;
+        pull_repo(&reg, &listing, &args).unwrap();
+        args.target = Some(TargetScheme::BaseQ8);
+        pull_repo(&reg, &listing, &args).unwrap();
+        args.target = Some(TargetScheme::BaseQ6);
+        let err = pull_repo(&reg, &listing, &args).unwrap_err().to_string();
+        assert!(err.contains("it offers: q4, q8"), "{err}");
+        // a source repo's plan is the conversion it would run, nothing fetched
+        let sources = Listing(vec!["config.json", "model.safetensors"]);
+        pull_repo(&reg, &sources, &args).unwrap();
+        assert!(reg.local.list().unwrap().is_empty());
+    }
+
+    /// The sizes rule holds only for a release named by size and nothing
+    /// else: one file is taken whatever its size, no medium among several
+    /// is an error, a quant-named file beside a size keeps the quant rule,
+    /// and a half-uploaded medium is reported, never another size.
+    #[test]
+    fn a_release_in_sizes_without_a_medium_or_beside_quants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetcher = MockFetcher::new(tmp.path());
+        let reg = MergedRegistry::new(tmp.path().join("cache"), catalog(""));
+
+        fixture_repo(tmp.path(), "org/one", &[("one-Small.base", b"small")]);
+        pull_repo(&reg, &fetcher, &plain("org/one")).unwrap();
+        let small = named_variant("one-Small.base");
+        assert_eq!(
+            std::fs::read(reg.local.installed_path("org/one", &small).unwrap()).unwrap(),
+            b"small"
+        );
+        assert!(installed_best_variant(&reg, "org/one", "small").is_some());
+
+        fixture_repo(
+            tmp.path(),
+            "org/two",
+            &[("two-Small.base", b"small"), ("two-Large.base", b"large")],
+        );
+        let err = pull_repo(&reg, &fetcher, &plain("org/two"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("named by size (small, large)"), "{err}");
+        let err = variant_source(&reg, "org/two", "medium", "main", &fetcher)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("it comes in: small, large"), "{err}");
+
+        fixture_repo(
+            tmp.path(),
+            "org/mixed",
+            &[("mixed-Q4.base", b"q4"), ("mixed-Medium.base", b"medium")],
+        );
+        pull_repo(&reg, &fetcher, &plain("org/mixed")).unwrap();
+        assert_eq!(
+            std::fs::read(reg.local.installed_path("org/mixed", "default-q4").unwrap()).unwrap(),
+            b"q4"
+        );
+        // its medium is still reachable by size
+        assert_eq!(
+            variant_source(&reg, "org/mixed", "medium", "main", &fetcher).unwrap(),
+            VariantSource::File("mixed-Medium.base".into())
+        );
+
+        let files = Grouped {
+            artifacts: vec![Artifact::whole("m-Small.base")],
+            malformed: vec![("m-Medium.base".into(), "index 1 is missing".into())],
+        };
+        let err = default_size_file(&files).unwrap_err().to_string();
+        assert!(
+            err.contains("the medium publication is incomplete"),
+            "{err}"
+        );
+        let files = Grouped {
+            artifacts: vec![Artifact::whole("m-Q4.base"), Artifact::whole("m-Q8.base")],
+            malformed: vec![],
+        };
+        assert_eq!(default_size_file(&files).unwrap(), None);
+        let files = Grouped {
+            artifacts: vec![Artifact::whole("Foo.base")],
+            malformed: vec![],
+        };
+        assert_eq!(default_size_file(&files).unwrap(), None);
+    }
+
+    /// A quant named is a quant, the default one included: `--target base-q4`
+    /// and `:q4` ask for a q4, which a release in sizes has none of, and are
+    /// refused as any quant is; only a pull naming no quant takes the Medium.
+    #[test]
+    fn an_explicit_q4_is_a_quant_asked_for_not_the_default_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "basecompute/m";
+        fixture_repo(
+            tmp.path(),
+            id,
+            &[
+                ("m-Small.base", b"small"),
+                ("m-Medium.base", b"medium"),
+                ("m-Large.base", b"large"),
+            ],
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let reg = MergedRegistry::new(tmp.path().join("cache"), catalog(""));
+        // as the command line gives them: no --target is no quant named
+        let parse = |argv: &[&str]| <PullArgs as clap::Parser>::try_parse_from(argv).unwrap();
+        assert_eq!(parse(&["pull", id]).target, None);
+        let q4 = parse(&["pull", id, "--target", "base-q4"]);
+        assert_eq!(q4.target, Some(TargetScheme::BaseQ4));
+        let err = pull_repo(&reg, &fetcher, &q4).unwrap_err().to_string();
+        assert!(
+            err.contains("named by size (small, medium, large)"),
+            "{err}"
+        );
+        let err = pull_with_variant(&reg, &fetcher, &with_variant("basecompute/m:q4", false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("named by size"), "{err}");
+        assert!(reg.local.list().unwrap().is_empty());
+        pull_repo(&reg, &fetcher, &parse(&["pull", id])).unwrap();
+        assert_eq!(reg.local.list().unwrap().len(), 1);
+    }
+
+    /// Two models of one size in a repo are two: the default pick refuses to
+    /// choose between them, as `:medium` does, and asks for a file.
+    #[test]
+    fn two_mediums_are_refused_by_the_default_as_by_the_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "org/two";
+        fixture_repo(
+            tmp.path(),
+            id,
+            &[
+                ("model-A-Medium.base", b"a"),
+                ("model-B-Medium.base", b"b"),
+                ("model-A-Small.base", b"s"),
+            ],
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let reg = MergedRegistry::new(tmp.path().join("cache"), catalog(""));
+        let err = pull_repo(&reg, &fetcher, &plain(id))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("medium names several files")
+                && err.contains("model-A-Medium.base")
+                && err.contains("model-B-Medium.base")
+                && err.contains("--file"),
+            "{err}"
+        );
+        let err = variant_source(&reg, id, "medium", "main", &fetcher)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("medium names several files"), "{err}");
+        assert!(reg.local.list().unwrap().is_empty());
+        // the one Small is still its size's
+        assert_eq!(
+            variant_source(&reg, id, "small", "main", &fetcher).unwrap(),
+            VariantSource::File("model-A-Small.base".into())
+        );
     }
 
     /// A cached file answers only for itself: the name is resolved against
@@ -3191,7 +3683,7 @@ mod tests {
         PullArgs {
             id: id.into(),
             profile: None,
-            target: TargetScheme::BaseQ4,
+            target: None,
             revision: "main".into(),
             file: None,
             force: false,
@@ -3354,10 +3846,27 @@ mod tests {
                 VariantSource::Quant(t)
             );
         }
+        // a size is the file of that size in the id's repo; one the release
+        // lacks names the sizes it has
+        assert_eq!(
+            variant_source(&reg, "basecompute/cat", "medium", "main", &fetcher).unwrap(),
+            VariantSource::File("cat-Medium.base".into())
+        );
+        assert_eq!(
+            variant_source(&reg, "basecompute/cat", "Medium", "main", &fetcher).unwrap(),
+            VariantSource::File("cat-Medium.base".into())
+        );
+        let err = variant_source(&reg, "basecompute/cat", "large", "main", &fetcher)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("has no large .base; it comes in: medium"),
+            "{err}"
+        );
+
         // anything else names the variants this client can pull, a name
         // that merely contains or ends in a width included
         for v in [
-            "large",
             "default-q8-custom",
             "not-a-variant-f16",
             "typo-q8",
@@ -3379,7 +3888,7 @@ mod tests {
         let mut file = with_variant("basecompute/cat:default-q8", true);
         file.file = Some("cat-Q8.base".into());
         let mut target = with_variant("basecompute/cat:default-q8", true);
-        target.target = TargetScheme::BaseQ8;
+        target.target = Some(TargetScheme::BaseQ8);
         let mut profile = with_variant("basecompute/cat:default-q8", true);
         profile.profile = Some("default-q8.json".into());
         for (args, flag) in [
@@ -3511,7 +4020,7 @@ mod tests {
         let args = PullArgs {
             id: "basecompute/m".into(),
             profile: None,
-            target: TargetScheme::BaseQ4,
+            target: None,
             revision: "main".into(),
             file: None,
             force: false,
@@ -3880,7 +4389,7 @@ mod tests {
         let mk = |t| PullArgs {
             id: "x/y".into(),
             profile: None,
-            target: t,
+            target: Some(t),
             revision: "main".into(),
             file: None,
             force: false,

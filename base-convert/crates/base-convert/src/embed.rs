@@ -7,10 +7,17 @@
 //!
 //! Byte-level: the target's weights blob is copied verbatim, so every main
 //! and mmproj tensor keeps its bytes, offsets and checksums; the head's
-//! tensors are appended behind it, placed by the target's alignment rules
-//! exactly as the writer would place them; the header gains the section and
+//! tensors are appended behind it, each placed as the writer places a
+//! tensor of its region by the stricter of the two files' alignment rules,
+//! the first of them on a GPU page (the runtime wraps the section as one
+//! buffer from its first entry); the header gains the section and
 //! `HAS_SPECULATOR`. Nothing is re-quantized, and a reconverted target is
-//! not needed: the catalog's files are embedded as they are.
+//! not needed: the catalog's files are embedded as they are. The head is
+//! embedded as it was converted, f16 or quantized (`convert
+//! --quantize-drafter`): a quantized entry's scales and biases sit inside
+//! its own payload (`length` spans them, their offsets are relative to the
+//! entry's), so the entry moves whole and the runtime reads it from the
+//! section as it reads it from the sidecar.
 //!
 //! The section is the sidecar's own header, not a Qwen-style one: `arch` is
 //! the sidecar's (`gemma4-mtp`), `config` is the sidecar's whole config (the
@@ -34,7 +41,8 @@ pub struct AddSpeculatorArgs {
     /// Target `.base` bundle: the model the head drafts for.
     pub target: PathBuf,
     /// The head, converted on its own (`basert convert
-    /// google/gemma-4-E4B-it-assistant` writes a `gemma4-mtp` sidecar).
+    /// google/gemma-4-E4B-it-assistant` writes a `gemma4-mtp` sidecar), f16
+    /// or quantized (`--quantize-drafter --target base-q8`).
     #[arg(long)]
     pub head: PathBuf,
     /// Where to write the embedded bundle (refused if it exists).
@@ -139,19 +147,14 @@ fn u64_of(v: &serde_json::Value, key: &str) -> Option<u64> {
 }
 
 /// The last blob byte any tensor of the header (main, mmproj, speculator)
-/// or any of its sub-regions reaches.
+/// reaches. An entry's `length` spans its weights and, when quantized, its
+/// scales and biases (sub-region offsets are relative to the entry's), so
+/// the entry's own range is the whole of it.
 fn blob_end(header: &serde_json::Value) -> u64 {
     let mut end = 0u64;
     let mut visit = |t: &serde_json::Value| {
-        for (off, len) in [
-            ("offset", "length"),
-            ("scale_offset", "scale_length"),
-            ("bias_offset", "bias_length"),
-            ("awq_scale_offset", "awq_scale_length"),
-        ] {
-            if let (Some(o), Some(l)) = (u64_of(t, off), u64_of(t, len)) {
-                end = end.max(o + l);
-            }
+        if let (Some(o), Some(l)) = (u64_of(t, "offset"), u64_of(t, "length")) {
+            end = end.max(o + l);
         }
     };
     for t in tensors_of(header) {
@@ -174,10 +177,30 @@ fn parse_flags(header: &serde_json::Value) -> Result<HeaderFlags> {
     }
 }
 
-fn has_sub_regions(t: &serde_json::Value) -> bool {
-    ["scale_offset", "bias_offset", "awq_scale_offset"]
-        .iter()
-        .any(|k| t.get(k).is_some_and(|v| !v.is_null()))
+/// A quantized entry's sub-regions (scales, biases, AWQ scales), each
+/// `(offset, length)` relative to the entry's own payload.
+const SUB_REGIONS: [(&str, &str, &str); 3] = [
+    ("scale_offset", "scale_length", "scales"),
+    ("bias_offset", "bias_length", "biases"),
+    ("awq_scale_offset", "awq_scale_length", "AWQ scales"),
+];
+
+/// Why a sub-region of `t` reaches outside its payload, if one does: the
+/// runtime refuses such an entry when it opens the section, so refuse it
+/// before the copy. The sum is checked without overflowing.
+fn sub_region_overrun(t: &serde_json::Value) -> Option<String> {
+    let len = u64_of(t, "length").unwrap_or(0);
+    for (off, sub_len, what) in SUB_REGIONS {
+        if let (Some(o), Some(l)) = (u64_of(t, off), u64_of(t, sub_len)) {
+            if l > 0 && (l > len || o > len - l) {
+                return Some(format!(
+                    "{what} [{o}, {}) outside its payload of {len} bytes",
+                    o.saturating_add(l)
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Embed the head sidecar at `head` in the bundle at `target`, writing the
@@ -228,7 +251,7 @@ pub fn add_speculator(
         );
     }
 
-    // ── The head: an MTP sidecar of this target's backbone, unquantized ──
+    // ── The head: an MTP sidecar of this target's backbone, f16 or quantized ──
     let head_arch = h
         .header
         .get("arch")
@@ -282,12 +305,16 @@ pub fn add_speculator(
     if h_tensors.is_empty() {
         bail!("{}: no tensors", head.display());
     }
-    if let Some(q) = h_tensors.iter().find(|t| has_sub_regions(t)) {
-        bail!(
-            "{}: tensor {} is quantized (has sub-regions); a head is embedded unquantized — convert it f16",
-            head.display(),
-            q.get("name").and_then(|n| n.as_str()).unwrap_or("?")
-        );
+    // A quantized head's entries move whole (see the module doc); only a
+    // sub-region that reaches past its payload is refused.
+    for t in &h_tensors {
+        if let Some(why) = sub_region_overrun(t) {
+            bail!(
+                "{}: tensor {} has its {why}",
+                head.display(),
+                t.get("name").and_then(|n| n.as_str()).unwrap_or("?")
+            );
+        }
     }
     let h_blob_len = h.file_size - h.blob_start;
     if blob_end(&h.header) > h_blob_len {
@@ -298,13 +325,28 @@ pub fn add_speculator(
     }
 
     // ── Place the head's tensors behind the target's blob ──
-    let alignment: AlignmentConfig = match t.header.get("alignment") {
-        Some(a) => serde_json::from_value(a.clone()).context("target alignment")?,
-        None => AlignmentConfig::default(),
+    // Each by the stricter of the two files' rules for its region: the
+    // target's, which placed the target's own tensors, and the head's,
+    // which placed it as a sidecar (a Metal head's converter puts
+    // accelerator-region tensors on 16 KiB pages; a catalog target from an
+    // older converter asks 64 B of them). The first one starts a GPU page
+    // whatever the rules say: the runtime wraps the section as one buffer
+    // from its first entry, and Metal needs that base page-aligned — at
+    // 64 B the whole head falls back to per-tensor copies.
+    let alignment_of = |o: &Opened, what: &str| -> Result<AlignmentConfig> {
+        Ok(match o.header.get("alignment") {
+            Some(a) => {
+                serde_json::from_value(a.clone()).with_context(|| format!("{what} alignment"))?
+            }
+            None => AlignmentConfig::default(),
+        })
     };
+    let (t_align, h_align) = (alignment_of(&t, "target")?, alignment_of(&h, "head")?);
+    let align_for =
+        |region: ComputeRegion| t_align.align_for(region).max(h_align.align_for(region));
     let mut cursor = t_blob_len;
     let mut placed: Vec<(serde_json::Value, u64, u64, u64)> = Vec::with_capacity(h_tensors.len()); // (entry, src offset, dst offset, length)
-    for src in &h_tensors {
+    for (i, src) in h_tensors.iter().enumerate() {
         let region: ComputeRegion = match src.get("compute_region") {
             Some(r) => serde_json::from_value(r.clone()).context("head tensor compute_region")?,
             None => ComputeRegion::default(),
@@ -313,7 +355,11 @@ pub fn add_speculator(
             u64_of(src, "offset").context("head tensor offset")?,
             u64_of(src, "length").context("head tensor length")?,
         );
-        let dst = align_up(cursor, alignment.align_for(region));
+        let mut align = align_for(region);
+        if i == 0 {
+            align = align.max(align_for(ComputeRegion::Gpu));
+        }
+        let dst = align_up(cursor, align);
         let mut entry = (*src).clone();
         entry["offset"] = serde_json::json!(dst);
         placed.push((entry, off, dst, len));
@@ -526,7 +572,7 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
-    use base_format::{BaseReader, BaseWriter, TensorDtype, TensorEntry};
+    use base_format::{BaseReader, BaseWriter, TensorDtype, TensorEntry, TensorPayload};
 
     /// A tiny Gemma-4-shaped target (two main tensors, one mmproj tensor)
     /// and a head sidecar over it.
@@ -663,6 +709,110 @@ mod tests {
         );
     }
 
+    /// A head converted with `--quantize-drafter`: its entries carry scale
+    /// and bias sub-regions inside their payloads, and they are embedded as
+    /// they are — the entry equal apart from its new offset, the sub-region
+    /// offsets still relative to it, the bytes the sidecar's. Its
+    /// accelerator-region tensors keep the page alignment the head's own
+    /// converter gave them, though the (older) target asks only 64 B.
+    #[test]
+    fn embeds_a_quantized_head_with_its_sub_regions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, _) = fixtures(dir.path());
+        let head = dir.path().join("q8head.base");
+        let mut hdr = header(
+            "gemma4-mtp",
+            serde_json::json!({"hidden_size": 4, "backbone_hidden_size": 8, "vocab_size": 16, "num_hidden_layers": 4}),
+        );
+        hdr.alignment.accel_align_log2 = 14;
+        let mut w = BaseWriter::create(&head, hdr).unwrap();
+        // 64 q8 weights, then 8 bytes of scales and 8 of biases, one payload.
+        let q8 = |name: &str, first: u8| {
+            let mut p = TensorPayload {
+                entry: entry(name, vec![16, 4]),
+                data: (first..first + 80).collect(),
+            };
+            p.entry.dtype = TensorDtype::BaseQ8;
+            p.entry.compute_region = ComputeRegion::Accelerator;
+            p.entry.scale_offset = Some(64);
+            p.entry.scale_length = Some(8);
+            p.entry.bias_offset = Some(72);
+            p.entry.bias_length = Some(8);
+            p.entry.group_size = Some(128);
+            p
+        };
+        w.add_tensor(q8("output.weight", 0));
+        w.add_tensor(payload("output_norm.weight", 8, 0xC2));
+        w.add_tensor(q8("layers.0.mlp.down_proj.weight", 100));
+        w.finish().unwrap();
+
+        let out = dir.path().join("out.base");
+        let s = add_speculator(&target, &head, &out, Some("q8")).unwrap();
+        assert_eq!((s.n_head_tensors, s.head_bytes), (3, 168));
+        let hh = BaseReader::open(&head).unwrap();
+        let after = BaseReader::open(&out).unwrap();
+        let spec = after.header().speculator.as_ref().unwrap();
+        assert_eq!(spec.config["head_version"], serde_json::json!("q8"));
+        for (src, dst) in hh.header().tensors.iter().zip(&spec.tensors) {
+            let mut moved = src.clone();
+            moved.offset = dst.offset;
+            assert_eq!(
+                serde_json::to_string(&moved).unwrap(),
+                serde_json::to_string(dst).unwrap(),
+                "{}: the entry moves whole",
+                src.name
+            );
+            assert_eq!(
+                bytes_of(&head, hh.blob_offset(), src),
+                bytes_of(&out, after.blob_offset(), dst),
+                "{}",
+                dst.name
+            );
+            after.verify_tensor(&dst.name).unwrap();
+        }
+        let q = &spec.tensors[0];
+        assert_eq!(
+            (
+                q.dtype,
+                q.scale_offset,
+                q.scale_length,
+                q.bias_offset,
+                q.bias_length
+            ),
+            (TensorDtype::BaseQ8, Some(64), Some(8), Some(72), Some(8))
+        );
+        let bytes = bytes_of(&out, after.blob_offset(), q);
+        assert_eq!(
+            &bytes[64..72],
+            &(64u8..72).collect::<Vec<_>>()[..],
+            "the scales"
+        );
+        assert_eq!(
+            &bytes[72..80],
+            &(72u8..80).collect::<Vec<_>>()[..],
+            "the biases"
+        );
+        // The target's rule (64 B) would have put the second q8 entry right
+        // behind the norm; the head's (a page) wins, and so does the first
+        // entry's page start.
+        assert_eq!(after.header().alignment.accel_align_log2, 6);
+        assert_eq!(
+            spec.tensors[0].offset % 16384,
+            0,
+            "the first entry starts a GPU page"
+        );
+        assert_eq!(
+            spec.tensors[2].offset % 16384,
+            0,
+            "an accelerator tensor keeps the head's page alignment"
+        );
+        assert_eq!(
+            spec.tensors[1].offset,
+            spec.tensors[0].offset + 16384,
+            "the norm follows on the next page (gpu)"
+        );
+    }
+
     #[test]
     fn refuses_what_it_cannot_embed_into_or_from() {
         let dir = tempfile::tempdir().unwrap();
@@ -699,8 +849,8 @@ mod tests {
             .to_string()
             .contains("but the head drafts for"));
 
-        // A quantized head: the sidecar is embedded as it is, and a head
-        // with scale sub-regions is not the f16 one the rule keeps.
+        // A quantized head whose scales reach past the entry's payload: the
+        // runtime would refuse the section, so the embed refuses the head.
         let q = dir.path().join("q.base");
         let mut w = BaseWriter::create(
             &q,
@@ -712,14 +862,14 @@ mod tests {
         .unwrap();
         let mut p = payload("output.weight", 64, 1);
         p.entry.dtype = TensorDtype::BaseQ4;
-        p.entry.scale_offset = Some(0);
-        p.entry.scale_length = Some(0);
+        p.entry.scale_offset = Some(60);
+        p.entry.scale_length = Some(8);
         w.add_tensor(p);
         w.finish().unwrap();
         assert!(add_speculator(&target, &q, &out, None)
             .unwrap_err()
             .to_string()
-            .contains("quantized"));
+            .contains("scales [60, 68) outside its payload of 64 bytes"));
 
         // Embedding twice.
         add_speculator(&target, &head, &out, None).unwrap();
