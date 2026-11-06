@@ -230,6 +230,17 @@ fn inherited_speculator_rank(known: &Catalog, repo: &str) -> Option<u32> {
         .and_then(|m| m.speculator_rank)
 }
 
+/// Whether `--speculate auto` serves the target with this sidecar
+/// (`speculator_auto`) is curated beside its rank and carried across the same
+/// way.
+fn inherited_speculator_auto(known: &Catalog, repo: &str) -> Option<bool> {
+    known
+        .models
+        .iter()
+        .find(|m| m.hf_repo == repo && m.speculator_auto.is_some())
+        .and_then(|m| m.speculator_auto)
+}
+
 /// Read a published bundle's header without downloading the bundle.
 ///
 /// Two reads, because the header's length is in the header: the 16-byte prefix
@@ -604,6 +615,7 @@ pub fn scan_org(
                     entry.source_repo = inherited_source_repo(known, repo);
                     entry.speculator_for = inherited_speculator_for(known, repo);
                     entry.speculator_rank = inherited_speculator_rank(known, repo);
+                    entry.speculator_auto = inherited_speculator_auto(known, repo);
                     entry.parts_sha256 = parts_sha256;
                     report.entries.push(entry)
                 }
@@ -755,6 +767,7 @@ mod tests {
                 speculator_version: None,
                 speculator_for: None,
                 speculator_rank: None,
+                speculator_auto: None,
             }],
         };
         let r = scan_org(
@@ -824,6 +837,7 @@ mod tests {
                     speculator_version: None,
                     speculator_for: None,
                     speculator_rank: None,
+                    speculator_auto: None,
                 },
                 CatalogEntry {
                     id: "basecompute/other".into(),
@@ -841,6 +855,7 @@ mod tests {
                     speculator_version: None,
                     speculator_for: None,
                     speculator_rank: None,
+                    speculator_auto: None,
                 },
             ],
         };
@@ -880,6 +895,7 @@ mod tests {
                     speculator_version: None,
                     speculator_for: Some("basecompute/Qwen3-4B".into()),
                     speculator_rank: Some(2),
+                    speculator_auto: Some(true),
                 },
                 CatalogEntry {
                     id: "basecompute/Qwen3-4B".into(),
@@ -897,6 +913,7 @@ mod tests {
                     speculator_version: None,
                     speculator_for: None,
                     speculator_rank: None,
+                    speculator_auto: None,
                 },
             ],
         };
@@ -910,6 +927,14 @@ mod tests {
         );
         assert_eq!(
             inherited_speculator_rank(&known, "basecompute/Qwen3-4B"),
+            None
+        );
+        assert_eq!(
+            inherited_speculator_auto(&known, "basecompute/Qwen3-4B-DFlash"),
+            Some(true)
+        );
+        assert_eq!(
+            inherited_speculator_auto(&known, "basecompute/Qwen3-4B"),
             None
         );
         // A target repo never borrows a sidecar's association.
@@ -1231,6 +1256,7 @@ mod tests {
                 speculator_version: None,
                 speculator_for: None,
                 speculator_rank: None,
+                speculator_auto: None,
             }],
         };
         let r = scan_org(

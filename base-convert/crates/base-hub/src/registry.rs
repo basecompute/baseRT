@@ -329,6 +329,46 @@ impl CatalogRegistry {
         })
     }
 
+    /// The drafter `basert serve --speculate auto` serves `target_id` with:
+    /// the sidecar row marked `speculator_auto` that drafts for that target
+    /// (`speculator_for`) and runs on this client, lowest rank first, its
+    /// default-q4 file (the measured one) before any other. None when the
+    /// catalog marks none.
+    pub fn auto_drafter(&self, target_id: &str) -> Option<&crate::catalog::CatalogEntry> {
+        self.catalog
+            .models
+            .iter()
+            .filter(|e| {
+                e.speculator_auto == Some(true)
+                    && e.speculator_for
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case(target_id))
+                    && Self::backend_ok(e)
+            })
+            .min_by_key(|e| {
+                (
+                    e.speculator_rank.unwrap_or(u32::MAX),
+                    u8::from(e.quant != "default-q4"),
+                )
+            })
+    }
+
+    /// The id of the one catalog target that publishes a file named `file`
+    /// (`Qwen3.8-27B-Q4.base`): how a bundle served by path, outside the hub
+    /// cache, is matched to its catalog row. None when no target row, or
+    /// rows of more than one id, carry that name; a sidecar's file never
+    /// names a target.
+    pub fn target_id_of_file(&self, file: &str) -> Option<&str> {
+        let mut ids = self
+            .catalog
+            .models
+            .iter()
+            .filter(|e| e.speculator_for.is_none() && e.file == file)
+            .map(|e| e.id.as_str());
+        let first = ids.next()?;
+        ids.all(|id| id == first).then_some(first)
+    }
+
     /// Quant-agnostic, backend-aware resolve.
     pub fn resolve(&self, id: &str) -> Option<ModelRef> {
         self.resolve_variant(id, None)

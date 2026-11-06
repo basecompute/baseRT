@@ -635,6 +635,13 @@ fn serve_ready(
     let Some(directive) = mtp else {
         return Ok(path);
     };
+    // Under `auto` a target the catalog pairs with a drafter drafts with that
+    // drafter, which prepare_speculate_auto installs and superfluid's `auto`
+    // takes first: its own head is not what the start will use, so a file
+    // without one is not pulled again for it.
+    if directive == "auto" && auto_drafter_row(reg, id).is_some() {
+        return Ok(path);
+    }
     let Some(variant) = stale_head_variant(reg, id, &path) else {
         return Ok(path);
     };
@@ -721,6 +728,136 @@ fn resolve_model_args(rest: &[String], default_variant: Option<&str>) -> Result<
             }
         })
         .collect()
+}
+
+/// Whether a runtime command's args ask for `--speculate auto` (two words or
+/// `--speculate=auto`); false when speculation is not asked for, or is asked
+/// for by name.
+fn speculate_auto_asked(rest: &[String]) -> bool {
+    for (i, a) in rest.iter().enumerate() {
+        if a == "--speculate" {
+            return rest.get(i + 1).map(String::as_str) == Some("auto");
+        }
+        if let Some(v) = a.strip_prefix("--speculate=") {
+            return v == "auto";
+        }
+    }
+    false
+}
+
+/// The drafter the catalog has `--speculate auto` serve target `id` with
+/// (`speculator_auto` on a sidecar row of a kind `--speculate` takes), on a
+/// Metal client: the pairings marked so far were measured there (Qwen3.8-27B
+/// and Qwen3.6-35B-A3B with DFlash2 against their in-bundle heads, M5 Pro,
+/// 2026-11), so another backend keeps superfluid's own choice until measured.
+fn auto_drafter_row<'a>(
+    reg: &'a MergedRegistry,
+    id: &str,
+) -> Option<&'a base_hub::catalog::CatalogEntry> {
+    if base_hub::registry::CatalogRegistry::client_backend() != "metal" {
+        return None;
+    }
+    reg.catalog.auto_drafter(id).filter(|row| {
+        matches!(
+            row.speculator.as_deref(),
+            Some("dflash" | "dspark" | "eagle3")
+        )
+    })
+}
+
+/// The catalog id of the target a served `.base` is: the id its hub-cache
+/// sidecar records for a file the catalog installed, else — a bundle kept
+/// outside the cache and served by path — the one catalog target that
+/// publishes a file of that name. None for a conversion of the user's own.
+fn catalog_target_id(reg: &MergedRegistry, path: &Path) -> Option<String> {
+    if let Some(sidecar) = path
+        .parent()
+        .and_then(|dir| cache::read_sidecar(dir).ok().flatten())
+    {
+        return (sidecar.source_kind == "catalog").then_some(sidecar.id);
+    }
+    let file = path.file_name()?.to_str()?;
+    reg.catalog.target_id_of_file(file).map(str::to_string)
+}
+
+/// What `--speculate auto` becomes for the one model `basert serve` starts
+/// with, as `(--speculate value over catalog ids, the drafter's id)`: the
+/// drafter the catalog pairs with it (auto_drafter_row), at the file that
+/// row names. None when the choice stays superfluid's: the bundle carries
+/// Google's Gemma 4 head (`gemma4-mtp`, which `auto` takes first and no
+/// drafter replaces), the model is not a catalog target, or the catalog
+/// pairs it with nothing.
+fn speculate_auto_directive(reg: &MergedRegistry, model: &Path) -> Option<(String, String)> {
+    if crate::serve::embedded_head_kind(model).as_deref() == Some("gemma4-mtp") {
+        return None;
+    }
+    let id = catalog_target_id(reg, model)?;
+    let row = auto_drafter_row(reg, &id)?;
+    let kind = row.speculator.as_deref()?;
+    Some((format!("{kind}:{}:{}", row.id, row.quant), row.id.clone()))
+}
+
+/// `basert serve <model> --speculate auto`, the model already a path: the
+/// drafter the catalog pairs with that model (auto_drafter_row) is pulled when
+/// it is not installed — the road `--speculate dflash:<id>` takes — and the
+/// args go on as they came. `auto` stays superfluid's to settle: it takes that
+/// installed drafter first (it reads the same catalog, the cache's
+/// `.catalog-cache.json`, even under the `--offline` every start hands it) and
+/// keeps its fallbacks, so a copy it cannot use (stale, of another shape, or
+/// refused by the engine) gives way to the bundle's own head, then to plain
+/// decoding. Naming the file here (`dflash:<path>`) would make it an explicit
+/// choice, which superfluid refuses at startup instead. Nothing is pulled for
+/// another strategy or none, several models or a `--model-dir` (superfluid's
+/// one `--speculate` is not one model's there), a model with nothing paired,
+/// or under the user's own `--offline`; a drafter that could not be fetched is
+/// said and never stops the start.
+fn prepare_speculate_auto(rest: Vec<String>) -> Vec<String> {
+    if !speculate_auto_asked(&rest) {
+        return rest;
+    }
+    let Ok(reg) = MergedRegistry::load() else {
+        return rest;
+    };
+    prepare_speculate_auto_with(rest, &reg, |token| resolve_hub_model(token, None, None))
+}
+
+/// prepare_speculate_auto over a given registry, `fetch` resolving (pulling)
+/// a drafter's `<id>:<variant>` to its installed path.
+fn prepare_speculate_auto_with(
+    rest: Vec<String>,
+    reg: &MergedRegistry,
+    fetch: impl FnOnce(&str) -> Result<PathBuf>,
+) -> Vec<String> {
+    if !speculate_auto_asked(&rest) || rest.iter().any(|a| a == "--offline") {
+        return rest;
+    }
+    let Ok(crate::serve::Parsed::Serve(o)) = crate::serve::parse(&rest) else {
+        return rest;
+    };
+    let [model] = o.models.as_slice() else {
+        return rest;
+    };
+    if o.model_dir.is_some() {
+        return rest;
+    }
+    let Some((directive, drafter)) = speculate_auto_directive(reg, Path::new(model)) else {
+        return rest;
+    };
+    let Some((_, token)) = speculate_drafter_id(&directive) else {
+        return rest;
+    };
+    match fetch(token) {
+        Ok(path) => eprintln!(
+            "basert serve: --speculate auto: {drafter} is installed ({}); superfluid's auto drafts \
+             with it first, the model's own head and plain decoding behind it",
+            path.display()
+        ),
+        Err(e) => eprintln!(
+            "basert serve: --speculate auto: {drafter} could not be fetched ({e:#}); \
+             superfluid's auto settles among what is installed"
+        ),
+    }
+    rest
 }
 
 /// `<strategy>:<hub id>` for the strategies that take a drafter artifact —
@@ -826,7 +963,7 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
         let (variant_flag, rest) = extract_variant_flag(rest)?;
         let rest = resolve_model_args(&rest, variant_flag.as_deref())?;
         if cmd == "serve" {
-            return crate::serve::run(&rest);
+            return crate::serve::run(&prepare_speculate_auto(rest));
         }
         (vec![format!("basert-{cmd}"), format!("baseRT_{cmd}")], rest)
     };
@@ -4576,6 +4713,234 @@ mod tests {
         assert_eq!(
             serve_ready(&r, id, headless.clone(), None).unwrap(),
             headless
+        );
+    }
+
+    #[test]
+    fn speculate_auto_is_found_in_both_forms() {
+        let asked =
+            |v: &[&str]| speculate_auto_asked(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(asked(&["m.base", "--speculate", "auto"]));
+        assert!(asked(&["--speculate=auto", "m.base"]));
+        assert!(!asked(&["m.base", "--speculate", "mtp-head"]));
+        assert!(!asked(&["m.base", "--speculate=dflash:org/d"]));
+        assert!(!asked(&["m.base", "--speculate"]));
+        assert!(!asked(&["m.base", "--max-context", "auto"]));
+    }
+
+    /// `--speculate auto` becomes the drafter the catalog marks for the
+    /// model (`speculator_auto`), whether the model is the catalog's install
+    /// or a file of the catalog's name served by path; a Gemma 4 bundle with
+    /// its own head, a target with nothing marked and a conversion of the
+    /// user's own keep superfluid's choice.
+    #[test]
+    fn auto_takes_the_drafter_the_catalog_marks_for_the_model() {
+        use base_format::{SpeculatorBundle, FORMAT_VERSION, MAGIC};
+        use std::io::Write;
+        let metal = base_hub::registry::CatalogRegistry::client_backend() == "metal";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let reg = MergedRegistry::new(
+            root.clone(),
+            base_hub::registry::CatalogRegistry::bundled().unwrap(),
+        );
+        // A header-only bundle, with Google's Gemma 4 head or none.
+        let bundle = |path: &Path, gemma_head: bool| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut h =
+                crate::embed::fixtures::header("qwen35", serde_json::json!({"hidden_size": 8}));
+            if gemma_head {
+                h.speculator = Some(SpeculatorBundle {
+                    arch: "gemma4-mtp".into(),
+                    config: [("kind".to_string(), serde_json::json!("gemma4-mtp"))]
+                        .into_iter()
+                        .collect(),
+                    tensors: vec![],
+                });
+            }
+            let json = h.to_canonical_json().unwrap();
+            let mut f = std::fs::File::create(path).unwrap();
+            f.write_all(&MAGIC).unwrap();
+            f.write_all(&FORMAT_VERSION.to_le_bytes()).unwrap();
+            f.write_all(&(json.len() as u64).to_le_bytes()).unwrap();
+            f.write_all(&json).unwrap();
+        };
+        let directive = |path: &Path| speculate_auto_directive(&reg, path).map(|(d, _)| d);
+        let want = |drafter: &str| metal.then(|| format!("dflash:{drafter}:default-q4"));
+
+        // Served by path, outside the cache: matched by the catalog's file name.
+        let by_path = |name: &str, gemma_head: bool| {
+            let path = tmp.path().join("models").join(name);
+            bundle(&path, gemma_head);
+            path
+        };
+        assert_eq!(
+            directive(&by_path("Qwen3.8-27B-Q4.base", false)),
+            want("basecompute/Qwen3.8-27B-DFlash2")
+        );
+        assert_eq!(
+            directive(&by_path("Qwen3.6-35B-A3B-Q8.base", false)),
+            want("basecompute/Qwen3.6-35B-A3B-DFlash2")
+        );
+        assert_eq!(
+            directive(&by_path("Qwen3.6-27B-Q4.base", false)),
+            None,
+            "nothing marked for this target"
+        );
+        assert_eq!(
+            directive(&by_path("gemma-4-26B-A4B-it-Q4.base", true)),
+            None,
+            "Gemma 4 keeps its own head"
+        );
+        assert_eq!(directive(&by_path("my-own.base", false)), None);
+        assert_eq!(
+            directive(&by_path("Qwen3.8-27B-DFlash2-Q4.base", false)),
+            None,
+            "a drafter's file names no target"
+        );
+
+        // Installed by a pull: the sidecar names the catalog id.
+        let installed = |id: &str, variant: &str, source_kind: &str| {
+            let vdir = cache::variant_dir(&root, id, variant).unwrap();
+            let path = cache::base_artifact_path(&vdir);
+            bundle(&path, false);
+            cache::write_sidecar(
+                &vdir,
+                &HubSidecar {
+                    id: id.into(),
+                    source_kind: source_kind.into(),
+                    hf_repo: id.into(),
+                    source_repo: None,
+                    revision: "main".into(),
+                    variant: variant.into(),
+                    profile: None,
+                    pulled_at: "0".into(),
+                    base_sha256: None,
+                    file: None,
+                },
+            )
+            .unwrap();
+            path
+        };
+        assert_eq!(
+            directive(&installed(
+                "basecompute/Qwen3.8-27B",
+                "default-q8",
+                "catalog"
+            )),
+            want("basecompute/Qwen3.8-27B-DFlash2")
+        );
+        assert_eq!(
+            directive(&installed(
+                "basecompute/Qwen3.8-27B",
+                "default-f16",
+                "huggingface"
+            )),
+            None,
+            "a conversion of the user's own"
+        );
+
+        // The directive is one `--speculate dflash:<id>` resolves.
+        if let Some(d) = want("basecompute/Qwen3.8-27B-DFlash2") {
+            assert_eq!(
+                speculate_drafter_id(&d),
+                Some(("dflash", "basecompute/Qwen3.8-27B-DFlash2:default-q4"))
+            );
+        }
+
+        // Under `auto` such a target is not pulled again for an MTP head it
+        // will not use (a pull here would reach for the network and fail).
+        if metal {
+            let id = "basecompute/Qwen3.8-27B";
+            let headless = installed(id, "default-q4", "catalog");
+            assert!(stale_head_variant(&reg, id, &headless).is_some());
+            assert_eq!(
+                serve_ready(&reg, id, headless.clone(), Some("auto")).unwrap(),
+                headless
+            );
+        }
+    }
+
+    /// `--speculate auto` reaches superfluid as `auto` when the launcher has
+    /// prepared the drafter the catalog marks for the model: superfluid's
+    /// `auto` takes that drafter first and keeps its fallbacks, so a copy it
+    /// cannot use (here a cached file of another shape) gives way to the
+    /// model's head, where `dflash:<path>` would fail the start. The marked
+    /// drafter is fetched once; nothing is fetched for several models, a
+    /// `--model-dir`, the user's `--offline` or a strategy named by hand, and a
+    /// failed fetch leaves the args as they came too.
+    #[test]
+    fn auto_prepares_the_marked_drafter_and_stays_auto() {
+        use base_format::{FORMAT_VERSION, MAGIC};
+        use std::io::Write;
+        let metal = base_hub::registry::CatalogRegistry::client_backend() == "metal";
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = MergedRegistry::new(
+            tmp.path().join("cache"),
+            base_hub::registry::CatalogRegistry::bundled().unwrap(),
+        );
+        let bundle = |path: &Path, arch: &str, hidden: u64| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let h =
+                crate::embed::fixtures::header(arch, serde_json::json!({"hidden_size": hidden}));
+            let json = h.to_canonical_json().unwrap();
+            let mut f = std::fs::File::create(path).unwrap();
+            f.write_all(&MAGIC).unwrap();
+            f.write_all(&FORMAT_VERSION.to_le_bytes()).unwrap();
+            f.write_all(&(json.len() as u64).to_le_bytes()).unwrap();
+            f.write_all(&json).unwrap();
+        };
+        // The target, served by path under the catalog's file name.
+        let model = tmp.path().join("models").join("Qwen3.8-27B-Q4.base");
+        bundle(&model, "qwen35", 5120);
+        let model = model.to_string_lossy().into_owned();
+        // A cached drafter superfluid cannot use: another architecture and width.
+        let stale = tmp
+            .path()
+            .join("cache/basecompute/Qwen3.8-27B-DFlash2/default-q4/model.base");
+        bundle(&stale, "llama", 8);
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let run = |rest: Vec<String>, ok: bool| {
+            let fetched = std::cell::RefCell::new(Vec::<String>::new());
+            let out = prepare_speculate_auto_with(rest.clone(), &reg, |token| {
+                fetched.borrow_mut().push(token.to_string());
+                if ok {
+                    Ok(stale.clone())
+                } else {
+                    Err(anyhow::anyhow!("the Hub is unreachable"))
+                }
+            });
+            assert_eq!(out, rest, "the args reach superfluid as they came");
+            fetched.into_inner()
+        };
+        let marked: Vec<String> = if metal {
+            vec!["basecompute/Qwen3.8-27B-DFlash2:default-q4".into()]
+        } else {
+            vec![]
+        };
+        assert_eq!(run(args(&[&model, "--speculate", "auto"]), true), marked);
+        assert_eq!(run(args(&["--speculate=auto", &model]), true), marked);
+        assert_eq!(run(args(&[&model, "--speculate", "auto"]), false), marked);
+        let none = Vec::<String>::new();
+        assert_eq!(
+            run(args(&[&model, "--speculate", "auto", "--offline"]), true),
+            none
+        );
+        assert_eq!(run(args(&[&model, "--speculate", "mtp-head"]), true), none);
+        assert_eq!(
+            run(
+                args(&[&model, "--model", &model, "--speculate", "auto"]),
+                true
+            ),
+            none
+        );
+        let dir = tmp.path().join("models").to_string_lossy().into_owned();
+        assert_eq!(
+            run(
+                args(&[&model, "--model-dir", &dir, "--speculate", "auto"]),
+                true
+            ),
+            none
         );
     }
 }
