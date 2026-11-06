@@ -165,6 +165,7 @@ pub fn entry_from_header(
         }),
         speculator_for: None,
         speculator_rank: None,
+        speculator_auto: None,
     })
 }
 

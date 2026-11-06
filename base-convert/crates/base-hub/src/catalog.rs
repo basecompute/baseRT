@@ -109,6 +109,15 @@ pub struct CatalogEntry {
     /// order (dspark, dflash, eagle3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speculator_rank: Option<u32>,
+    /// Sidecar rows only: `basert serve --speculate auto` serves the target
+    /// (`speculator_for`) with this drafter, ahead of a head the target's
+    /// own bundle carries, and pulls it when it is not installed. Set where
+    /// the drafter was measured faster than that head (Qwen3.8-27B and
+    /// Qwen3.6-35B-A3B with their DFlash2 drafters, Metal). Absent: `auto`
+    /// is left to superfluid, which takes an in-bundle head first, then an
+    /// installed drafter by rank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculator_auto: Option<bool>,
 }
 
 fn default_file() -> String {

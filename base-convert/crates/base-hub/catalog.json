@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-11-05",
+  "updated": "2026-11-06",
   "models": [
     {
       "id": "basecompute/Llama-3.1-8B-Instruct",
@@ -1867,7 +1867,7 @@
       "sha256": "44989d3f2129ec5fcd60cb3068b9126247de7577fc6fb7ac216184dbc2c149c3",
       "speculator": "dflash",
       "speculator_for": "basecompute/Qwen3.6-35B-A3B",
-      "speculator_rank": 1
+      "speculator_rank": 2
     },
     {
       "id": "basecompute/Qwen3.6-35B-A3B-DFlash",
@@ -1881,7 +1881,7 @@
       "sha256": "56a5bc65f7019d08f231de8f51efb091c066fc9490c026d9188109c51921a485",
       "speculator": "dflash",
       "speculator_for": "basecompute/Qwen3.6-35B-A3B",
-      "speculator_rank": 1
+      "speculator_rank": 2
     },
     {
       "id": "basecompute/Qwen3.6-35B-A3B-DFlash2",
@@ -1895,7 +1895,8 @@
       "speculator": "dflash",
       "source_repo": "incoai/Qwen3.6-35B-A3B-DFlash2",
       "speculator_for": "basecompute/Qwen3.6-35B-A3B",
-      "speculator_rank": 1
+      "speculator_rank": 1,
+      "speculator_auto": true
     },
     {
       "id": "basecompute/Qwen3.6-35B-A3B-DFlash2",
@@ -1909,7 +1910,8 @@
       "speculator": "dflash",
       "source_repo": "incoai/Qwen3.6-35B-A3B-DFlash2",
       "speculator_for": "basecompute/Qwen3.6-35B-A3B",
-      "speculator_rank": 1
+      "speculator_rank": 1,
+      "speculator_auto": true
     },
     {
       "id": "basecompute/Qwen3.8-27B-DFlash2",
@@ -1923,7 +1925,8 @@
       "speculator": "dflash",
       "source_repo": "z-lab/Qwen3.8-27B-DFlash2",
       "speculator_for": "basecompute/Qwen3.8-27B",
-      "speculator_rank": 1
+      "speculator_rank": 1,
+      "speculator_auto": true
     },
     {
       "id": "basecompute/Qwen3.8-27B-DFlash2",
@@ -1937,7 +1940,8 @@
       "speculator": "dflash",
       "source_repo": "z-lab/Qwen3.8-27B-DFlash2",
       "speculator_for": "basecompute/Qwen3.8-27B",
-      "speculator_rank": 1
+      "speculator_rank": 1,
+      "speculator_auto": true
     },
     {
       "id": "basecompute/Qwen3.8-27B-DSpark",

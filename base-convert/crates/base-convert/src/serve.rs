@@ -71,6 +71,12 @@ Options:
                         throughput).
   --prefill-budget N    Max prompt tokens ingested per engine tick (64-4096). Lower
                         it to trade first-token latency for smoother concurrent decode.
+  --speculate auto      Speculative decoding with what suits the model: the drafter
+                        the catalog pairs with it, pulled on first use (Qwen3.8-27B
+                        and Qwen3.6-35B-A3B: their DFlash2 drafters), else the head
+                        the model's own bundle carries (Gemma 4: Google's MTP head).
+                        A strategy can be named instead: mtp-head, prompt-lookup,
+                        dflash:<path or hub id>, off (superfluid's flag).
   --basert-lib <dir>    The directory holding libbaseRT to serve with (default: beside
                         basert, or ../lib, or $BASERT_LIB)
   --print-command       Print the superfluid command line this start would run, and exit
@@ -417,6 +423,14 @@ pub fn superfluid_args(o: &Options, sessions: &Path) -> Vec<String> {
 /// A word on the command line that is a model, not a flag's value: a `.base`
 /// path, or a hub id (`org/name`, with a variant after `:` or not).
 fn looks_like_model(word: &str) -> bool {
+    // A drafter named after its strategy (`dflash:<path or id>`) is
+    // `--speculate`'s value, whatever it ends with.
+    if word
+        .split_once(':')
+        .is_some_and(|(kind, _)| matches!(kind, "dflash" | "dspark" | "eagle3" | "draft-model"))
+    {
+        return false;
+    }
     word.ends_with(".base")
         || (!word.starts_with(['/', '.', '~']) && word.matches('/').count() == 1)
 }
@@ -624,7 +638,7 @@ pub(crate) fn embedded_head_notice(
 }
 
 /// The `kind` of the head a bundle's header carries, if any.
-fn embedded_head_kind(path: &Path) -> Option<String> {
+pub(crate) fn embedded_head_kind(path: &Path) -> Option<String> {
     let h = base_format::BaseReader::read_header(path).ok()?;
     h.speculator?
         .config
@@ -1065,6 +1079,25 @@ mod tests {
         assert!(
             !looks_like_model("/tmp/log") && !looks_like_model("auto") && !looks_like_model("512")
         );
+        // A drafter after `--speculate` is that flag's value, by path or id.
+        let o = serve(&[
+            "m.base",
+            "--speculate",
+            "dflash:/models/d/model.base",
+            "--spec-draft-tokens",
+            "7",
+        ]);
+        assert_eq!(o.models, ["m.base"]);
+        assert_eq!(
+            o.passthrough,
+            [
+                "--speculate",
+                "dflash:/models/d/model.base",
+                "--spec-draft-tokens",
+                "7"
+            ]
+        );
+        assert!(!looks_like_model("dspark:org/drafter") && !looks_like_model("eagle3:x.base"));
         // Handed over last, after the flags every start sets; the user's
         // engine directory is superfluid's flag, said once.
         let o = serve(&["m.base", "--basert-lib", "/engine", "--speculate", "auto"]);
