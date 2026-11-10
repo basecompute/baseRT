@@ -637,6 +637,8 @@ extern "C" {
     pub fn baseRT_set_max_batch_size(n: c_int);
     pub fn baseRT_set_prefix_cache(enable: c_int);
     pub fn baseRT_set_prefill_chunk(n: c_int);
+    pub fn baseRT_set_neural_engine(enable: c_int);
+    pub fn baseRT_prepare_neural_engine(model_path: *const c_char, max_context: c_int) -> c_int;
     pub fn baseRT_set_kv_bits(bits: c_int);
     pub fn baseRT_set_verbose(on: c_int);
 
