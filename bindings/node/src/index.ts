@@ -410,6 +410,7 @@ interface BaseRTLib {
   baseRT_set_max_batch_size: (n: number) => void;
   baseRT_set_prefill_chunk: (n: number) => void;
   baseRT_set_paged_weights: (mode: number) => void;
+  baseRT_set_neural_engine: (enable: number) => void;
   baseRT_set_baked_decode: (enable: number) => void;
   baseRT_set_gpu_wait_timeout_ms: (ms: number) => void;
   baseRT_encode: (
@@ -559,6 +560,7 @@ function lib(): BaseRTLib {
     baseRT_set_max_batch_size: k.func("void baseRT_set_max_batch_size(int)"),
     baseRT_set_prefill_chunk: k.func("void baseRT_set_prefill_chunk(int)"),
     baseRT_set_paged_weights: k.func("void baseRT_set_paged_weights(int)"),
+    baseRT_set_neural_engine: k.func("void baseRT_set_neural_engine(int)"),
     baseRT_set_baked_decode: k.func("void baseRT_set_baked_decode(int)"),
     baseRT_set_gpu_wait_timeout_ms: k.func("void baseRT_set_gpu_wait_timeout_ms(double)"),
     baseRT_encode: k.func(
@@ -698,6 +700,10 @@ export const Engine = {
   /** Paged-weights load policy: 0=auto, 1=force, 2=no-retry (issue #113). */
   setPagedWeights(mode: number): void {
     lib().baseRT_set_paged_weights(mode);
+  },
+  /** The prefill's Neural Engine split: true=on (default), false=GPU alone. */
+  setNeuralEngine(enable: boolean): void {
+    lib().baseRT_set_neural_engine(enable ? 1 : 0);
   },
   /** Toggle the baked-decode fast path: true=on (default), false=force live. */
   setBakedDecode(enable: boolean): void {

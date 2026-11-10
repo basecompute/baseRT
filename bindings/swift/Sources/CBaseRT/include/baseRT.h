@@ -64,7 +64,7 @@ extern "C" {
 
 #define BASERT_VERSION_MAJOR 0
 #define BASERT_VERSION_MINOR 4
-#define BASERT_VERSION_PATCH 6
+#define BASERT_VERSION_PATCH 7
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
@@ -252,6 +252,32 @@ void baseRT_set_prefill_chunk(int n);
 ///   mode = 2 → disable the retry (fail hard on OOM, pre-#113 behavior)
 /// Process-wide; read at load. Set before baseRT_load_model.
 void baseRT_set_paged_weights(int mode);
+
+/// The prefill's Neural Engine split (Apple silicon, Metal backend).
+///   enable = 1 → on (default): a prefill chunk's dense FFN / projections are
+///     split between the GPU and the Neural Engine where that is faster for
+///     the chip and the model
+///   enable = 0 → off: the GPU runs every prefill alone (bit-for-bit the
+///     GPU path; the split's int8 part differs from it by ~2.5% RMS)
+/// Process-wide; read at load. Set before baseRT_load_model.
+void baseRT_set_neural_engine(int enable);
+
+/// Compiles ahead the Neural Engine programs the prefill's split would serve
+/// `model_path` with on this Mac, from the bundle's header alone (no weights
+/// are read), so that the model's first load does not compile them. A load
+/// whose programs are not compiled yet compiles them in the background (tens
+/// of seconds) while the GPU runs the prefill alone, and the split takes
+/// over from the next prefill chunk once they are ready. The ANE service
+/// keeps compilations per calling executable (by its code-signing
+/// identifier) until macOS updates or clears its caches: call this from the
+/// executable that will load the model. `max_context`: the context the model
+/// will be served at, as passed to baseRT_load_model (0: the context a load
+/// given 0 picks), which can size the prefill chunk the programs are built
+/// for. Returns the programs compiled (0:
+/// compiled already), -1 when the split takes nothing of this model on this
+/// machine (another backend or chip, a format it does not split) and -2
+/// when a compile failed; baseRT_get_error() says why.
+int baseRT_prepare_neural_engine(const char *model_path, int max_context);
 
 /// Toggle the baked-decode fast path (DispatchTable replay).
 ///   enable = 1 → on (default): replay the baked table when eligible

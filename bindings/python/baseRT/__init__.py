@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
-__version__ = "0.4.6"
+__version__ = "0.4.7"
 
 # ---------------------------------------------------------------------------
 # Library loading
