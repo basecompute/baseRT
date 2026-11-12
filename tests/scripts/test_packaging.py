@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""Unit tests for packaging/stage-engine.sh, packaging/check_engine_links.py and
-the npm launcher and package build (packaging/npm/).
+"""Unit tests for packaging/stage-engine.sh, packaging/check_engine_links.py,
+the wheel platform tag and build (packaging/python/), the npm launcher and
+package build (packaging/npm/) and the Homebrew formula
+(packaging/update-formula.sh); in the open repo also for install.sh and the
+publish workflow's lists of what a release builds.
 
 The bundles here are synthetic: a library is a few bytes of text, and the
-Mach-O and ELF programs carry only the load commands the link check reads.
+Mach-O and ELF programs carry only the load commands, CPU and version markers
+the scripts read.
 """
 
 from __future__ import annotations
 
+import fnmatch
+import hashlib
+import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -18,31 +26,54 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 STAGE = ROOT / "packaging" / "stage-engine.sh"
 BASERT_JS = ROOT / "packaging" / "npm" / "basert.js"
+PLATFORM_TAG = ROOT / "packaging" / "python" / "platform_tag.py"
+BUILD_WHEEL = ROOT / "packaging" / "python" / "build-wheel.sh"
+FORMULA = ROOT / "packaging" / "update-formula.sh"
+# The open repo's own files: install.sh and the workflows are not in the
+# engine repository's copy of this tree.
+INSTALL_SH = ROOT / "install.sh"
+WORKFLOWS = ROOT / ".github" / "workflows"
+IN_ENGINE_REPO = (ROOT / "tools" / "sync_public.py").exists()
 sys.path.insert(0, str(ROOT / "packaging"))
 from check_engine_links import missing_links, missing_own_names  # noqa: E402
 
 
-def macho(deps: list[str], own_id: str | None = None) -> bytes:
-    """A 64-bit Mach-O with an LC_LOAD_DYLIB per dep (and LC_ID_DYLIB when given)."""
+AARCH64, X86_64, AMDGPU = 0xB7, 0x3E, 0xE0  # ELF e_machine
+# A ROCm kernel file for two GPUs: a clang offload bundle, not an ELF file.
+OFFLOAD_BUNDLE = b"__CLANG_OFFLOAD_BUNDLE__" + struct.pack("<Q", 0)
+FATBIN = struct.pack("<I", 0xBA55ED50) + b"cuda kernels"
+
+
+def glibc(minor: int) -> bytes:
+    """The symbol version string an ELF file needing glibc 2.<minor> carries."""
+    return f"GLIBC_2.{minor}".encode() + b"\0"
+
+
+def macho(deps: list[str], own_id: str | None = None, minos: tuple[int, int] | None = None) -> bytes:
+    """A 64-bit Mach-O with an LC_LOAD_DYLIB per dep (and LC_ID_DYLIB, LC_BUILD_VERSION when given)."""
+    body = b""
+    if minos:
+        body += struct.pack("<6I", 0x32, 24, 1, minos[0] << 16 | minos[1] << 8, 0, 0)
     cmds = [(0xD, own_id)] if own_id else []
     cmds += [(0xC, d) for d in deps]
-    body = b""
     for cmd, name in cmds:
         s = name.encode() + b"\0"
         size = (24 + len(s) + 7) // 8 * 8
         body += struct.pack("<6I", cmd, size, 24, 2, 0x10000, 0x10000) + s.ljust(size - 24, b"\0")
-    header = struct.pack("<I2i5I", 0xFEEDFACF, 0x0100000C, 0, 2, len(cmds), len(body), 0, 0)
+    header = struct.pack("<I2i5I", 0xFEEDFACF, 0x0100000C, 0, 2, len(cmds) + bool(minos), len(body), 0, 0)
     return header + body
 
 
-def elf(needed: list[str], soname: str | None = None) -> bytes:
-    """A 64-bit little-endian ELF with one PT_LOAD and a PT_DYNAMIC naming `needed` (and DT_SONAME when given)."""
+def elf(needed: list[str], soname: str | None = None, machine: int = AARCH64, tail: bytes = b"") -> bytes:
+    """A 64-bit little-endian ELF for `machine` with one PT_LOAD and a PT_DYNAMIC
+    naming `needed` (and DT_SONAME when given), followed by `tail`."""
     strtab, offsets = b"\0", []
     for n in needed + ([soname] if soname else []):
         offsets.append(len(strtab))
@@ -55,10 +86,10 @@ def elf(needed: list[str], soname: str | None = None) -> bytes:
     dyn += struct.pack("<qQ", 5, str_off) + struct.pack("<qQ", 0, 0)  # DT_STRTAB, DT_NULL
     size = dyn_off + len(dyn)
     ident = b"\x7fELF" + bytes([2, 1, 1]) + b"\0" * 9
-    ehdr = ident + struct.pack("<HHIQQQIHHHHHH", 3, 0xB7, 1, 0, 64, 0, 0, 64, 56, 2, 64, 0, 0)
+    ehdr = ident + struct.pack("<HHIQQQIHHHHHH", 3, machine, 1, 0, 64, 0, 0, 64, 56, 2, 64, 0, 0)
     load = struct.pack("<IIQQQQQQ", 1, 5, 0, 0, 0, size, size, 0x1000)
     dynamic = struct.pack("<IIQQQQQQ", 2, 6, dyn_off, dyn_off, dyn_off, len(dyn), len(dyn), 8)
-    return (ehdr + load + dynamic + strtab).ljust(dyn_off, b"\0") + dyn
+    return (ehdr + load + dynamic + strtab).ljust(dyn_off, b"\0") + dyn + tail
 
 
 def bundle(path: Path, files: dict[str, bytes], links: dict[str, str]) -> None:
@@ -74,6 +105,54 @@ def bundle(path: Path, files: dict[str, bytes], links: dict[str, str]) -> None:
             info.type = tarfile.SYMTYPE
             info.linkname = target
             tar.addfile(info)
+
+
+# What each release bundle is called and which wheel its engine makes.
+BUNDLES = {
+    "basert-engine-macos-arm64": "macosx_15_0_arm64",
+    "basert-engine-linux-arm64-cuda": "manylinux_2_38_aarch64",
+    "basert-engine-linux-x64-rocm": "manylinux_2_43_x86_64",
+}
+
+
+def release(folder: Path, v: str, rocm: bool = True) -> None:
+    """Write a release's engine bundles (and their .sha256 files) to `folder`,
+    shaped like the real ones: the versioned library chain, the launcher, a
+    tool, the kernel file, the headers, LICENSE and NOTICE."""
+    folder.mkdir(parents=True, exist_ok=True)
+    common = {"LICENSE": b"engine licence", "NOTICE": b"engine notice", "include/baseRT/baseRT.h": b"/* api */"}
+    mac = {
+        f"libbaseRT.{v}.dylib": macho([], own_id="@rpath/libbaseRT.0.dylib", minos=(15, 0)),
+        "basert": macho([], minos=(14, 0)),
+        "basert-chat": macho(["@rpath/libbaseRT.0.dylib", "/usr/lib/libc++.1.dylib"], minos=(15, 0)),
+        "baseRT.metallib": b"MTLB",
+    }
+    so = {"libbaseRT.so.0": f"libbaseRT.so.{v}", "libbaseRT.so": "libbaseRT.so.0"}
+    cuda = {
+        f"libbaseRT.so.{v}": elf(["libcublas.so.13", "libcuda.so.1"], soname="libbaseRT.so.0", tail=glibc(38)),
+        "basert": elf(["libc.so.6"], tail=glibc(34)),
+        "basert-chat": elf(["libbaseRT.so.0", "libc.so.6"], tail=glibc(38)),
+        "baseRT_cuda_kernels.fatbin": FATBIN,
+    }
+    hip = ["libamdhip64.so.7", "libhipblas.so.3", "libhipblaslt.so.1"]
+    rocm_files = {
+        f"libbaseRT.so.{v}": elf(hip, soname="libbaseRT.so.0", machine=X86_64, tail=glibc(43)),
+        "basert": elf(["libc.so.6"], machine=X86_64, tail=glibc(39)),
+        "basert-chat": elf(["libbaseRT.so.0", "libc.so.6"], machine=X86_64, tail=glibc(43)),
+        "baseRT_rocm_kernels.hsaco": OFFLOAD_BUNDLE,
+    }
+    contents = {
+        "basert-engine-macos-arm64": ({**mac, **common}, {"libbaseRT.0.dylib": f"libbaseRT.{v}.dylib", "libbaseRT.dylib": "libbaseRT.0.dylib"}),
+        "basert-engine-linux-arm64-cuda": ({**cuda, **common}, so),
+        "basert-engine-linux-x64-rocm": ({**rocm_files, **common}, so),
+    }
+    for name, (files, links) in contents.items():
+        if name.endswith("rocm") and not rocm:
+            continue
+        tarball = folder / f"{name}-{v}.tar.gz"
+        bundle(tarball, files, links)
+        sha = hashlib.sha256(tarball.read_bytes()).hexdigest()
+        (folder / f"{tarball.name}.sha256").write_text(f"{sha}  {tarball.name}\n")
 
 
 class StageEngineTests(unittest.TestCase):
@@ -237,13 +316,18 @@ class EngineLinkTests(unittest.TestCase):
 class NpmLauncherTests(unittest.TestCase):
     """packaging/npm/basert.js, run by node over a node_modules laid out as npm would."""
 
-    ENGINES = {"darwin-arm64": "basert-darwin-arm64", "linux-arm64": "basert-linux-arm64-cuda"}
+    ENGINES = {
+        "darwin-arm64": "basert-darwin-arm64",
+        "linux-arm64": "basert-linux-arm64-cuda",
+        "linux-x64": "basert-linux-x64-rocm",
+    }
 
     def setUp(self) -> None:
         node = shutil.which("node")
-        engine = self.ENGINES.get(f"{sys.platform}-{os.uname().machine.replace('aarch64', 'arm64')}")
+        machine = {"aarch64": "arm64", "x86_64": "x64"}.get(os.uname().machine, os.uname().machine)
+        engine = self.ENGINES.get(f"{sys.platform}-{machine}")
         if not node or not engine:
-            self.skipTest("needs node on macOS/arm64 or Linux/arm64")
+            self.skipTest("needs node on macOS/arm64, Linux/arm64 or Linux/x64")
         self.node = node
         self.tmp = Path(tempfile.mkdtemp())
         self.modules = self.tmp / "node_modules" / "@basecompute"
@@ -348,17 +432,7 @@ class NpmBuildTests(unittest.TestCase):
         )
         os.chmod(self.bin / "npx", 0o755)
         self.bundles = self.tmp / "bundles"
-        self.bundles.mkdir()
-        bundle(
-            self.bundles / f"basert-engine-macos-arm64-{v}.tar.gz",
-            {f"libbaseRT.{v}.dylib": macho([], own_id="@rpath/libbaseRT.0.dylib"), "basert": macho([]), "LICENSE": b"engine"},
-            {"libbaseRT.0.dylib": f"libbaseRT.{v}.dylib", "libbaseRT.dylib": "libbaseRT.0.dylib"},
-        )
-        bundle(
-            self.bundles / f"basert-engine-linux-arm64-cuda-{v}.tar.gz",
-            {f"libbaseRT.so.{v}": elf([], soname="libbaseRT.so.0"), "basert": elf([]), "LICENSE": b"engine"},
-            {"libbaseRT.so.0": f"libbaseRT.so.{v}", "libbaseRT.so": "libbaseRT.so.0"},
-        )
+        release(self.bundles, v)
 
     def build(self, *args: str) -> tuple[subprocess.CompletedProcess, Path]:
         out = self.tmp / "out"
@@ -374,17 +448,27 @@ class NpmBuildTests(unittest.TestCase):
         )
         return run, out
 
+    def manifest(self, tgz: Path) -> dict:
+        with tarfile.open(tgz) as tar:
+            return json.load(tar.extractfile("package/package.json"))
+
     def test_the_bindings_compile_on_a_machine_they_do_not_install_on(self) -> None:
         run, out = self.build("--engines", "basert-darwin-arm64")
         self.assertEqual(run.returncode, 0, run.stderr)
         v = self.VERSION
         self.assertEqual(
             sorted(p.name for p in out.iterdir()),
-            [f"basecompute-basert-{v}.tgz", f"basecompute-basert-darwin-arm64-{v}.tgz", f"basecompute-basert-linux-arm64-cuda-{v}.tgz"],
+            [
+                f"basecompute-basert-{v}.tgz",
+                f"basecompute-basert-darwin-arm64-{v}.tgz",
+                f"basecompute-basert-linux-arm64-cuda-{v}.tgz",
+                f"basecompute-basert-linux-x64-rocm-{v}.tgz",
+            ],
         )
-        with tarfile.open(out / f"basecompute-basert-{v}.tgz") as tar:
-            main = json.load(tar.extractfile("package/package.json"))
-        self.assertEqual((main["os"], main["cpu"]), (["darwin", "linux"], ["arm64"]))
+        main = self.manifest(out / f"basecompute-basert-{v}.tgz")
+        # Every platform this release has an engine for: one left out of
+        # --engines is still there through install.sh or Homebrew.
+        self.assertEqual((main["os"], main["cpu"]), (["darwin", "linux"], ["arm64", "x64"]))
         # Only the engine package this release publishes.
         self.assertEqual(main["optionalDependencies"], {"@basecompute/basert-darwin-arm64": v})
         # The engine names npm as what updates it, for `basert self update`.
@@ -394,6 +478,450 @@ class NpmBuildTests(unittest.TestCase):
         # The bindings' own folder is left as it was.
         source = json.loads((self.root / "bindings" / "node" / "package.json").read_text())
         self.assertEqual(source["os"], self.FOREIGN["os"])
+
+    def test_the_rocm_engine_is_an_x64_linux_package(self) -> None:
+        run, out = self.build()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        v = self.VERSION
+        tgz = out / f"basecompute-basert-linux-x64-rocm-{v}.tgz"
+        rocm = self.manifest(tgz)
+        self.assertEqual(
+            (rocm["name"], rocm["os"], rocm["cpu"], rocm["libc"]),
+            ("@basecompute/basert-linux-x64-rocm", ["linux"], ["x64"], ["glibc"]),
+        )
+        with tarfile.open(tgz) as tar:
+            engine = {m.name.split("/", 2)[2] for m in tar.getmembers() if m.name.startswith("package/engine/")}
+        self.assertTrue({"baseRT_rocm_kernels.hsaco", "libbaseRT.so", "libbaseRT.so.0", "basert"} <= engine, engine)
+        main = self.manifest(out / f"basecompute-basert-{v}.tgz")
+        self.assertEqual(main["cpu"], ["arm64", "x64"])
+        self.assertEqual(
+            main["optionalDependencies"],
+            {f"@basecompute/{name}": v for name in ("basert-darwin-arm64", "basert-linux-arm64-cuda", "basert-linux-x64-rocm")},
+        )
+
+    def test_a_release_without_the_rocm_bundle_has_no_x64_package(self) -> None:
+        # release.yml ships a release without it when its AMD runner is off.
+        (self.bundles / f"basert-engine-linux-x64-rocm-{self.VERSION}.tar.gz").unlink()
+        run, out = self.build()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        v = self.VERSION
+        self.assertIn("basert-linux-x64-rocm is not built", run.stdout)
+        self.assertEqual(
+            sorted(p.name for p in out.iterdir()),
+            [f"basecompute-basert-{v}.tgz", f"basecompute-basert-darwin-arm64-{v}.tgz", f"basecompute-basert-linux-arm64-cuda-{v}.tgz"],
+        )
+        main = self.manifest(out / f"basecompute-basert-{v}.tgz")
+        self.assertEqual((main["os"], main["cpu"]), (["darwin", "linux"], ["arm64"]))
+        self.assertNotIn("@basecompute/basert-linux-x64-rocm", main["optionalDependencies"])
+
+    def test_the_cuda_bundle_is_never_optional(self) -> None:
+        (self.bundles / f"basert-engine-linux-arm64-cuda-{self.VERSION}.tar.gz").unlink()
+        run, _ = self.build()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("missing", run.stderr)
+
+    def test_naming_the_rocm_package_needs_its_bundle(self) -> None:
+        (self.bundles / f"basert-engine-linux-x64-rocm-{self.VERSION}.tar.gz").unlink()
+        run, _ = self.build("--engines", "basert-darwin-arm64,basert-linux-x64-rocm")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn(f"basert-engine-linux-x64-rocm-{self.VERSION}.tar.gz", run.stderr)
+
+
+
+class PlatformTagTests(unittest.TestCase):
+    """packaging/python/platform_tag.py: the wheel tag a staged engine folder gets."""
+
+    def tag(self, files: dict[str, bytes]) -> subprocess.CompletedProcess:
+        engine = Path(tempfile.mkdtemp())
+        for name, data in files.items():
+            (engine / name).write_bytes(data)
+        return subprocess.run([sys.executable, str(PLATFORM_TAG), str(engine)], capture_output=True, text=True)
+
+    def test_the_cuda_engine_is_aarch64(self) -> None:
+        run = self.tag({
+            "libbaseRT.so": elf(["libcublas.so.13"], soname="libbaseRT.so.0", tail=glibc(38)),
+            "basert": elf([], tail=glibc(34)),
+            "baseRT_cuda_kernels.fatbin": FATBIN,
+        })
+        self.assertEqual((run.returncode, run.stdout), (0, "manylinux_2_38_aarch64\n"), run.stderr)
+
+    def test_the_rocm_engine_is_x86_64(self) -> None:
+        # Until 0.5.0 every ELF engine was tagged aarch64, so this one made a
+        # second aarch64 wheel, and publish.yml's Linux test installed both.
+        run = self.tag({
+            "libbaseRT.so": elf(["libamdhip64.so.7"], soname="libbaseRT.so.0", machine=X86_64, tail=glibc(43)),
+            "basert": elf([], machine=X86_64, tail=glibc(39)),
+            "baseRT_rocm_kernels.hsaco": OFFLOAD_BUNDLE,
+        })
+        self.assertEqual((run.returncode, run.stdout), (0, "manylinux_2_43_x86_64\n"), run.stderr)
+
+    def test_a_gpu_code_object_says_nothing_about_the_cpu(self) -> None:
+        # A kernel file built for one GPU is an AMDGPU ELF code object.
+        run = self.tag({
+            "libbaseRT.so": elf([], machine=X86_64, tail=glibc(43)),
+            "baseRT_rocm_kernels.hsaco": elf([], machine=AMDGPU),
+        })
+        self.assertEqual((run.returncode, run.stdout), (0, "manylinux_2_43_x86_64\n"), run.stderr)
+
+    def test_binaries_for_two_cpus_are_refused(self) -> None:
+        run = self.tag({"libbaseRT.so": elf([], tail=glibc(38)), "basert": elf([], machine=X86_64, tail=glibc(39))})
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("more than one CPU (libbaseRT.so for aarch64, basert for x86_64)", run.stderr)
+
+    def test_an_elf_file_for_another_cpu_is_refused(self) -> None:
+        run = self.tag({"libbaseRT.so": elf([], machine=0x28, tail=glibc(38))})  # 32-bit Arm
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("machine 0x28", run.stderr)
+
+    def test_the_macos_engine_takes_the_highest_minimum_os(self) -> None:
+        run = self.tag({"libbaseRT.dylib": macho([], minos=(15, 0)), "basert": macho([], minos=(14, 0))})
+        self.assertEqual((run.returncode, run.stdout), (0, "macosx_15_0_arm64\n"), run.stderr)
+
+
+class FormulaTests(unittest.TestCase):
+    """packaging/update-formula.sh, from a release's .sha256 files."""
+
+    V = "1.2.3"
+
+    def formula(self, rocm: bool) -> tuple[subprocess.CompletedProcess, str]:
+        tmp = Path(tempfile.mkdtemp())
+        release(tmp / "bundles", self.V, rocm=rocm)
+        for tarball in (tmp / "bundles").glob("*.tar.gz"):
+            tarball.unlink()  # the formula needs only the checksums
+        run = subprocess.run(["sh", str(FORMULA), self.V, str(tmp / "bundles"), str(tmp / "out")], capture_output=True, text=True)
+        rb = tmp / "out" / "basert.rb"
+        return run, rb.read_text() if rb.exists() else ""
+
+    @staticmethod
+    def block(rb: str, opening: str) -> str:
+        """The lines of a top-level `opening do` block of the class."""
+        start = rb.index(f"\n  {opening} do\n")
+        return rb[start : rb.index("\n  end\n", start)]
+
+    def url(self, bundle_name: str) -> str:
+        return f'url "https://github.com/basecompute/baseRT/releases/download/v{self.V}/{bundle_name}-{self.V}.tar.gz"'
+
+    def test_linux_on_intel_gets_the_rocm_bundle(self) -> None:
+        run, rb = self.formula(rocm=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        linux = self.block(rb, "on_linux")
+        self.assertIn(f"    if Hardware::CPU.intel?\n      {self.url('basert-engine-linux-x64-rocm')}\n", linux)
+        self.assertIn(f"    if Hardware::CPU.arm?\n      {self.url('basert-engine-linux-arm64-cuda')}\n", linux)
+        self.assertNotIn("depends_on arch:", linux)
+        # macOS stays Apple Silicon only.
+        self.assertIn("depends_on arch: :arm64", self.block(rb, "on_macos"))
+        self.assertNotIn("\n  depends_on arch:", rb)
+        self.assertIn("AMD Strix", re.search(r'^  desc "(.*)"$', rb, re.M).group(1))
+        for gfx in ("gfx1151", "gfx1150"):
+            self.assertIn(f"sudo apt install amdrocm-blas10.0-{gfx}", rb)
+        self.assertIn("CUDA 13", rb)
+
+    def test_without_the_rocm_bundle_it_stays_arm64_only(self) -> None:
+        run, rb = self.formula(rocm=False)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("depends_on arch: :arm64", self.block(rb, "on_linux"))
+        self.assertIn("depends_on arch: :arm64", self.block(rb, "on_macos"))
+        self.assertNotIn("Hardware::CPU.intel?", rb)
+        self.assertNotIn("rocm", rb.lower())
+        self.assertNotIn("AMD", rb)
+
+    def test_each_checksum_is_the_one_its_sha256_file_names(self) -> None:
+        run, rb = self.formula(rocm=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        urls = re.findall(r'url "[^"]*/([^/"]+)"\n\s+sha256 "([0-9a-f]{64})"', rb)
+        tmp_shas = {}
+        tmp = Path(tempfile.mkdtemp())
+        release(tmp, self.V)
+        for f in tmp.glob("*.sha256"):
+            sha, name = f.read_text().split()
+            tmp_shas[name] = sha
+        self.assertEqual(len(urls), 3)
+        self.assertEqual(dict(urls), tmp_shas)
+
+    def test_a_bad_rocm_checksum_is_refused(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        release(tmp, self.V)
+        (tmp / f"basert-engine-linux-x64-rocm-{self.V}.tar.gz.sha256").write_text("not-a-checksum  x\n")
+        run = subprocess.run(["sh", str(FORMULA), self.V, str(tmp), str(tmp / "out")], capture_output=True, text=True)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("bad checksum", run.stderr)
+
+
+@unittest.skipIf(IN_ENGINE_REPO, "wheels are built from the public tree (packaging/public-tree.sh)")
+class WheelBuildTests(unittest.TestCase):
+    """packaging/python/build-wheel.sh over a whole release: one wheel per
+    bundle, each tagged for the platform its engine runs on. Needs `build` and
+    `wheel` (ci.yml and publish.yml install them) and the network: the build
+    fetches its setuptools."""
+
+    def setUp(self) -> None:
+        missing = [m for m in ("build", "wheel") if importlib.util.find_spec(m) is None]
+        if missing:
+            self.skipTest(f"needs {' and '.join(missing)} (pip install build wheel)")
+        self.tmp = Path(tempfile.mkdtemp())
+        init = (ROOT / "bindings" / "python" / "baseRT" / "__init__.py").read_text()
+        self.v = re.search(r'^__version__ = "(.*)"$', init, re.M).group(1)
+
+    def test_each_bundle_makes_the_wheel_for_its_platform(self) -> None:
+        release(self.tmp / "bundles", self.v)
+        out = self.tmp / "wheels"
+        # build-wheel.sh runs python3: this one, which has build and wheel.
+        env = dict(os.environ, PATH=f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}")
+        for name in BUNDLES:
+            run = subprocess.run(
+                ["sh", str(BUILD_WHEEL), str(self.tmp / "bundles" / f"{name}-{self.v}.tar.gz"), str(out)],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(
+            sorted(p.name for p in out.iterdir()),
+            sorted(f"basert-{self.v}-py3-none-{tag}.whl" for tag in BUNDLES.values()),
+        )
+        with zipfile.ZipFile(out / f"basert-{self.v}-py3-none-manylinux_2_43_x86_64.whl") as whl:
+            engine = {n.split("/", 2)[2] for n in whl.namelist() if n.startswith("baseRT/_engine/")}
+        self.assertTrue({"baseRT_rocm_kernels.hsaco", "libbaseRT.so", "libbaseRT.so.0", "basert", "installed-by"} <= engine, engine)
+
+
+@unittest.skipUnless(INSTALL_SH.is_file(), "install.sh is in the open repo only")
+class InstallScriptTests(unittest.TestCase):
+    """install.sh, run with stand-ins for uname and curl and a folder standing
+    in for / (BASERT_INSTALL_TEST_ROOT) where the AMD GPU and ROCm checks look."""
+
+    V = "1.2.3"
+    UNAME = '#!/bin/sh\ncase "$1" in -s) echo "$STUB_OS" ;; -m) echo "$STUB_ARCH" ;; *) exit 1 ;; esac\n'
+    # The release API answers from a file; a download copies the asset.
+    CURL = """#!/bin/sh
+out="" url=""
+while [ $# -gt 0 ]; do
+  case "$1" in -o) out=$2; shift 2 ;; -*) shift ;; *) url=$1; shift ;; esac
+done
+echo "$url" >> "$STUB_LOG"
+case "$url" in
+  https://api.github.com/*) cat "$STUB_RELEASE" ;;
+  *) cp "$STUB_ASSETS/${url##*/}" "$out" ;;
+esac
+"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "root"
+        self.root.mkdir()
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        for name, text in (("uname", self.UNAME), ("curl", self.CURL)):
+            (self.bin / name).write_text(text)
+            os.chmod(self.bin / name, 0o755)
+        # Bundles whose programs are scripts, so the installer can run them
+        # here: `self install` and `superfluid` are refused, as by a launcher
+        # older than 0.4.3, and the bundle is unpacked as it is.
+        self.assets = self.tmp / "assets"
+        self.assets.mkdir()
+        refuse = b"#!/bin/sh\nexit 1\n"
+        urls = []
+        for name in BUNDLES:
+            tarball = self.assets / f"{name}-{self.V}.tar.gz"
+            bundle(tarball, {"basert": refuse, "basert-chat": refuse, f"lib-{name}": b"engine", "LICENSE": b"licence"}, {})
+            for f in (tarball.name, f"{tarball.name}.sha256"):
+                urls.append(f"https://github.com/basecompute/baseRT/releases/download/v{self.V}/{f}")
+        self.api = self.tmp / "release.json"
+        self.api.write_text(json.dumps({"tag_name": f"v{self.V}", "assets": [{"browser_download_url": u} for u in urls]}))
+        self.log = self.tmp / "curl.log"
+        self.log.write_text("")
+        self.dest = self.tmp / "basert"
+
+    def amd(self, *gfx_target_versions: int, kfd: bool = True) -> None:
+        """An amdgpu driver's view: /dev/kfd and one topology node per version (0 = a CPU)."""
+        if kfd:
+            (self.root / "dev").mkdir(exist_ok=True)
+            (self.root / "dev" / "kfd").write_text("")
+        for i, v in enumerate(gfx_target_versions):
+            node = self.root / "sys/class/kfd/kfd/topology/nodes" / str(i)
+            node.mkdir(parents=True)
+            (node / "properties").write_text(f"cpu_cores_count 0\ngfx_target_version {v}\nvendor_id 4098\n")
+
+    def rocm(self, gfx: str) -> None:
+        """What `apt install amdrocm-blas10.0-<gfx>` puts in /opt/rocm/core-10.0."""
+        lib = self.root / "opt/rocm/core-10.0/lib"
+        (lib / "rocblas/library" / gfx).mkdir(parents=True)
+        (lib / "libamdhip64.so.7.15.26333-0000000").write_text("hip")
+        os.symlink("libamdhip64.so.7.15.26333-0000000", lib / "libamdhip64.so.7")
+
+    def install(self, os_name: str = "Linux", arch: str = "x86_64") -> subprocess.CompletedProcess:
+        env = {
+            "PATH": f"{self.bin}{os.pathsep}/usr/bin{os.pathsep}/bin",
+            "HOME": str(self.tmp / "home"),
+            "BASERT_INSTALL_DIR": str(self.dest),
+            "BASERT_NO_MODIFY_PATH": "1",
+            "BASERT_INSTALL_TEST_ROOT": str(self.root),
+            "STUB_OS": os_name,
+            "STUB_ARCH": arch,
+            "STUB_RELEASE": str(self.api),
+            "STUB_ASSETS": str(self.assets),
+            "STUB_LOG": str(self.log),
+        }
+        return subprocess.run(["sh", str(INSTALL_SH)], capture_output=True, text=True, env=env)
+
+    def downloaded(self) -> list[str]:
+        return [u.rsplit("/", 1)[-1] for u in self.log.read_text().split() if not u.startswith("https://api.")]
+
+    def test_strix_halo_with_rocm_gets_the_rocm_bundle(self) -> None:
+        self.amd(0, 110501)
+        self.rocm("gfx1151")
+        run = self.install()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("Linux/x86_64 → basert-engine-linux-x64-rocm", run.stdout)
+        self.assertEqual(self.downloaded(), [f"basert-engine-linux-x64-rocm-{self.V}.tar.gz"])
+        self.assertTrue((self.dest / "lib-basert-engine-linux-x64-rocm").is_file())
+        self.assertNotIn("apt install", run.stdout + run.stderr)
+
+    def test_strix_point_without_rocm_is_told_its_apt_line(self) -> None:
+        self.amd(0, 110500)
+        run = self.install()
+        # Installed anyway: the CLI works, and the engine once ROCm is there.
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue((self.dest / "lib-basert-engine-linux-x64-rocm").is_file())
+        self.assertIn("sudo apt install amdrocm-blas10.0-gfx1150", run.stderr)
+        self.assertIn("sudo apt install amdrocm-blas10.0-gfx1150", run.stdout)  # again at the end
+
+    def test_blas_kernels_for_another_chip_are_not_enough(self) -> None:
+        self.amd(0, 110500)
+        self.rocm("gfx1151")
+        run = self.install()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("sudo apt install amdrocm-blas10.0-gfx1150", run.stderr)
+
+    def test_a_machine_without_an_amd_gpu_is_refused(self) -> None:
+        for kfd, nodes in ((False, (0, 110501)), (True, (0,))):
+            with self.subTest(kfd=kfd, nodes=nodes):
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+                self.amd(*nodes, kfd=kfd)
+                run = self.install()
+                self.assertEqual(run.returncode, 1)
+                self.assertIn("needs an AMD Strix Halo (gfx1151) or Strix Point (gfx1150) GPU", run.stderr)
+                self.assertEqual(self.downloaded(), [])
+
+    def test_another_amd_gpu_is_named_and_refused(self) -> None:
+        for nodes, name in (((0, 110000), "gfx1100"), ((90010,), "gfx90a")):
+            with self.subTest(name=name):
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+                self.amd(*nodes)
+                run = self.install()
+                self.assertEqual(run.returncode, 1)
+                self.assertIn(f"Strix Point (gfx1150) GPUs, not {name}.", run.stderr)
+
+    def test_a_strix_gpu_beside_another_is_used(self) -> None:
+        self.amd(0, 110000, 110501)
+        self.rocm("gfx1151")
+        run = self.install()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("→ basert-engine-linux-x64-rocm", run.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "root opens any file")
+    def test_a_kfd_this_user_cannot_open_is_pointed_out(self) -> None:
+        self.amd(0, 110501)
+        self.rocm("gfx1151")
+        os.chmod(self.root / "dev" / "kfd", 0)
+        run = self.install()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("render", run.stderr)
+
+    def test_the_other_platforms_are_unchanged(self) -> None:
+        run = self.install("Darwin", "arm64")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.downloaded(), [f"basert-engine-macos-arm64-{self.V}.tar.gz"])
+        for os_name, arch in (("Darwin", "x86_64"), ("Linux", "riscv64")):
+            with self.subTest(platform=f"{os_name}/{arch}"):
+                run = self.install(os_name, arch)
+                self.assertEqual(run.returncode, 1)
+                self.assertIn(
+                    f"unsupported platform: {os_name}/{arch}. BaseRT ships macOS/arm64 (Metal), "
+                    "Linux/arm64 (NVIDIA CUDA) and Linux/x86_64 (AMD ROCm).",
+                    run.stderr,
+                )
+
+    def test_it_parses_and_passes_shellcheck(self) -> None:
+        for sh in ("sh", "dash", "bash"):
+            if shutil.which(sh):
+                run = subprocess.run([sh, "-n", str(INSTALL_SH)], capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, f"{sh}: {run.stderr}")
+        if not shutil.which("shellcheck"):
+            self.skipTest("shellcheck is not installed")
+        run = subprocess.run(["shellcheck", str(INSTALL_SH)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stdout)
+
+
+@unittest.skipUnless((WORKFLOWS / "publish.yml").is_file() and not IN_ENGINE_REPO, "the open repo's workflows")
+class WorkflowTests(unittest.TestCase):
+    """What .github/workflows/publish.yml expects a release to build, against
+    what the packaging scripts build; and where the lab's runners may be used."""
+
+    V = "1.2.3"
+    # Self-hosted runners: the GB10 and the Strix Halo.
+    LAB_LABELS = ("gb10", "rocm-gfx1151")
+    # Events a pull request from a fork can start a workflow with.
+    PR_EVENTS = {"pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment",
+                 "issue_comment", "workflow_run", "merge_group"}
+
+    def setUp(self) -> None:
+        self.publish = (WORKFLOWS / "publish.yml").read_text()
+
+    @staticmethod
+    def triggers(workflow: str) -> set[str]:
+        block = re.search(r"^on:\n((?:[ \t]+.*\n|\n)*)", workflow, re.M)
+        if block is None:
+            inline = re.search(r"^on:\s*(.+)$", workflow, re.M)
+            return set(re.findall(r"[\w-]+", inline.group(1))) if inline else set()
+        return set(re.findall(r"^  (\w+):", block.group(1), re.M))
+
+    def test_lab_runners_never_run_pull_requests(self) -> None:
+        # A fork's pull request runs the workflow as the fork wrote it, so
+        # only a workflow pull requests cannot start may name these runners.
+        for path in sorted(WORKFLOWS.glob("*.y*ml")):
+            text = path.read_text()
+            labels = [label for label in self.LAB_LABELS if re.search(rf"\b{re.escape(label)}\b", text)]
+            if labels:
+                with self.subTest(workflow=path.name):
+                    self.assertEqual(self.triggers(text) & self.PR_EVENTS, set(), f"{path.name} names {labels}")
+        self.assertEqual(self.triggers(self.publish), {"release", "workflow_dispatch"})
+        self.assertIn("pull_request", self.triggers((WORKFLOWS / "ci.yml").read_text()))
+
+    def test_publish_names_every_engine_package_the_build_makes(self) -> None:
+        mjs = (ROOT / "packaging" / "npm" / "build-packages.mjs").read_text()
+        built = set(re.findall(r"name: `\$\{SCOPE\}/(basert-[\w-]+)`", mjs))
+        listed = set()
+        for value in re.findall(r'^\s*engines="([^"]*)"$', self.publish, re.M):
+            listed |= set(value.replace("$engines", "").split())
+        self.assertEqual(listed, built)
+        self.assertEqual(built, {"basert-darwin-arm64", "basert-linux-arm64-cuda", "basert-linux-x64-rocm"})
+
+    def test_each_wheel_pattern_matches_exactly_one_wheel(self) -> None:
+        wheels = [f"basert-{self.V}-py3-none-{tag}.whl" for tag in BUNDLES.values()]
+        # The plan's list of the wheels PyPI must have.
+        patterns = []
+        for value in re.findall(r'^\s*wheels="([^"]*)"$', self.publish, re.M):
+            patterns += value.replace("$wheels", "").replace("$V", self.V).split()
+        # The wheels each test job installs.
+        patterns += re.findall(r"pip install --quiet out/wheels/(\S+\.whl)", self.publish)
+        self.assertEqual(len(patterns), 6, patterns)
+        for pattern in patterns:
+            with self.subTest(pattern=pattern):
+                self.assertEqual(len(fnmatch.filter(wheels, pattern)), 1, fnmatch.filter(wheels, pattern))
+
+    def test_each_npm_install_takes_one_engine_and_the_main_package(self) -> None:
+        tarballs = [f"basecompute-basert-{name}-{self.V}.tgz" for name in ("darwin-arm64", "linux-arm64-cuda", "linux-x64-rocm")]
+        tarballs.append(f"basecompute-basert-{self.V}.tgz")
+        installs = re.findall(r"npm install --no-audit --no-fund (.+)$", self.publish, re.M)
+        self.assertEqual(len(installs), 3, installs)
+        engines = set()
+        for line in installs:
+            with self.subTest(install=line):
+                matched = [fnmatch.filter(tarballs, arg.rsplit("/", 1)[-1]) for arg in line.split()]
+                self.assertEqual([len(m) for m in matched], [1, 1])
+                self.assertEqual(matched[1], [f"basecompute-basert-{self.V}.tgz"])
+                engines.add(matched[0][0])
+        self.assertEqual(len(engines), 3)
 
 
 if __name__ == "__main__":

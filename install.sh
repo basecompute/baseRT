@@ -4,8 +4,9 @@
 #   curl -LsSf https://basecompute.co/install.sh | sh
 #
 # Downloads the latest prebuilt engine bundle for this platform — macOS/arm64
-# (Metal) or Linux/arm64 (CUDA) — the engine library + the basert CLI and
-# runtime tools, installs it to ~/.basert, then adds it to your PATH. Each
+# (Metal), Linux/arm64 (NVIDIA CUDA) or Linux/x86_64 (AMD ROCm, for Strix Halo
+# and Strix Point) — the engine library + the basert CLI and runtime tools,
+# installs it to ~/.basert, then adds it to your PATH. Each
 # release goes to ~/.basert/versions/<v>/ (from 0.4.3 on), and ~/.basert holds
 # links to the one in use, so `basert self update` updates it later and
 # `basert self use <v>` goes back. Re-running installs the target release the
@@ -21,6 +22,9 @@
 #   BASERT_VERSION       release tag, e.g. v0.5.0   (default: latest)
 #   BASERT_FORCE         set to 1 to reinstall even if already up to date
 #   BASERT_NO_MODIFY_PATH  set to 1 to skip editing shell profiles
+#
+# For the installer's tests only: BASERT_INSTALL_TEST_ROOT, a folder that
+# stands in for / where the AMD GPU and ROCm checks look.
 set -eu
 
 REPO="basecompute/baseRT"
@@ -37,9 +41,37 @@ need tar
 need uname
 
 # --- platform detection + asset selection ------------------------------------
-# BaseRT ships two prebuilt engine bundles: macOS/arm64 (Metal) and Linux/arm64
-# (CUDA). Pick the one matching this host; the installed CLI is built for that
-# backend and `basert pull` resolves the matching catalog variant.
+# BaseRT ships three prebuilt engine bundles: macOS/arm64 (Metal), Linux/arm64
+# (NVIDIA CUDA) and Linux/x86_64 (AMD ROCm). Pick the one matching this host;
+# the installed CLI is built for that backend and `basert pull` resolves the
+# matching catalog variant.
+#
+# The Linux/x86_64 engine runs on the integrated GPU of AMD Strix Halo
+# (gfx1151) and Strix Point (gfx1150), through the ROCm 10 runtime that AMD's
+# apt repository installs in /opt/rocm/core-10.0. This installer checks for it
+# and says what to install; it does not run apt itself.
+sysroot="${BASERT_INSTALL_TEST_ROOT:-}"
+ROCM_LIB="/opt/rocm/core-10.0/lib"
+rocm_missing=""
+
+# The AMD GPU's LLVM target (gfx1151, ...), from the amdgpu driver's topology;
+# nothing without one. A supported chip wins over any other AMD GPU present.
+amd_gpu() {
+  [ -e "$sysroot/dev/kfd" ] || return 0
+  other=""
+  for props in "$sysroot"/sys/class/kfd/kfd/topology/nodes/*/properties; do
+    [ -f "$props" ] || continue
+    v="$(sed -n 's/^gfx_target_version \([0-9][0-9]*\)$/\1/p' "$props")"
+    case "$v" in
+      "" | 0) ;; # a CPU node
+      110501) echo gfx1151; return 0 ;;
+      110500) echo gfx1150; return 0 ;;
+      *) [ -n "$other" ] || other="$(printf 'gfx%d%x%x' $((v / 10000)) $((v / 100 % 100)) $((v % 100)))" ;;
+    esac
+  done
+  printf '%s' "$other"
+}
+
 os="$(uname -s)"
 arch="$(uname -m)"
 case "$os $arch" in
@@ -52,8 +84,30 @@ case "$os $arch" in
     else
       err "BaseRT on Linux/arm64 needs an NVIDIA CUDA GPU (none detected)."
     fi ;;
+  "Linux x86_64")
+    # The x86_64 bundle is ROCm-only, built for these two chips.
+    gpu="$(amd_gpu)"
+    case "$gpu" in
+      gfx1151 | gfx1150) ;;
+      "") err "BaseRT on Linux/x86_64 needs an AMD Strix Halo (gfx1151) or Strix Point (gfx1150) GPU with the amdgpu driver (none detected)." ;;
+      *) err "BaseRT on Linux/x86_64 runs on AMD Strix Halo (gfx1151) and Strix Point (gfx1150) GPUs, not $gpu." ;;
+    esac
+    if [ ! -r "$sysroot/dev/kfd" ] || [ ! -w "$sysroot/dev/kfd" ]; then
+      warn "you cannot open /dev/kfd, so the engine cannot use the GPU: add yourself to the render"
+      warn "group (sudo usermod -aG render \"\$USER\") and log in again."
+    fi
+    # One package brings the runtime and the BLAS kernels for this chip.
+    hip=""
+    for f in "$sysroot$ROCM_LIB"/libamdhip64.so*; do [ -e "$f" ] && hip="$f"; done
+    if [ -z "$hip" ] || [ ! -d "$sysroot$ROCM_LIB/rocblas/library/$gpu" ]; then
+      rocm_missing="sudo apt install amdrocm-blas10.0-$gpu"
+      warn "the engine needs the ROCm 10 runtime and the $gpu BLAS kernels in /opt/rocm/core-10.0, which"
+      warn "are not there. Install them from AMD's ROCm 10 apt repository (stable.repo.amd.com/rocm/core):"
+      warn "  $rocm_missing"
+    fi
+    ASSET_PREFIX="basert-engine-linux-x64-rocm" ;;
   *)
-    err "unsupported platform: $os/$arch. BaseRT ships macOS/arm64 (Metal) and Linux/arm64 (CUDA)." ;;
+    err "unsupported platform: $os/$arch. BaseRT ships macOS/arm64 (Metal), Linux/arm64 (NVIDIA CUDA) and Linux/x86_64 (AMD ROCm)." ;;
 esac
 say "platform $os/$arch → $ASSET_PREFIX"
 
@@ -78,7 +132,7 @@ if [ "${BASERT_FORCE:-0}" != "1" ] && [ -x "$INSTALL_DIR/basert" ] \
   exit 0
 fi
 
-# Find the browser_download_url for the macOS arm64 tarball.
+# Find the browser_download_url for this platform's tarball.
 url="$(printf '%s' "$json" \
   | grep -o '"browser_download_url"[^,]*' \
   | grep -o 'https://[^"]*'"$ASSET_PREFIX"'[^"]*\.tar\.gz' \
@@ -164,6 +218,7 @@ if [ -x "$INSTALL_DIR/basert" ] && "$INSTALL_DIR/basert" superfluid --help >/dev
 fi
 
 # --- PATH wiring -------------------------------------------------------------
+# shellcheck disable=SC2016 # $PATH is written to the profile unexpanded
 add_path_line='export PATH="'"$INSTALL_DIR"':$PATH"'
 already_on_path=0
 case ":$PATH:" in *":$INSTALL_DIR:"*) already_on_path=1 ;; esac
@@ -183,6 +238,11 @@ say "done."
 if [ "$already_on_path" -eq 0 ]; then
   echo
   echo "  Restart your shell, or run:  export PATH=\"$INSTALL_DIR:\$PATH\""
+fi
+if [ -n "$rocm_missing" ]; then
+  echo
+  echo "  First install the ROCm 10 runtime the engine needs (from AMD's apt repository):"
+  echo "    $rocm_missing"
 fi
 echo
 echo "  Try it:"

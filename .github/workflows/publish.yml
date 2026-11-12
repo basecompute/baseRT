@@ -7,11 +7,14 @@ name: Publish packages
 # the engine. The scripts are in packaging/.
 #
 # It runs when a release is published (the engine's release pipeline creates
-# it as a draft at the commit that holds the release's source, attaches both
+# it as a draft at the commit that holds the release's source, attaches the
 # engine bundles, then publishes it) and by hand for a tag. Every run builds
 # every package and installs each on macOS and, on the GB10 the CUDA engine
-# needs, on Linux arm64. A run uploads only when all of these hold, and is
-# otherwise a dry run:
+# needs, on Linux arm64. The Linux x86-64 (AMD ROCm) bundle is optional: the
+# release pipeline leaves it out when its AMD runner is off. When the release
+# carries it, its packages are built, installed on a Strix Halo and uploaded
+# with the rest; when not, there are none, and nothing waits for that machine.
+# A run uploads only when all of these hold, and is otherwise a dry run:
 #   - the repository variable PUBLISH_ENABLED is "true" and dry_run is not ticked;
 #   - the release is published: not a draft, not a pre-release;
 #   - this run's commit is the one the tag names, so the packages hold that
@@ -23,8 +26,8 @@ name: Publish packages
 # v* tags; PyPI trusted publisher for basert (this repository, publish.yml,
 # environment pypi); secrets NPM_TOKEN (npm), CARGO_REGISTRY_TOKEN (crates)
 # and HOMEBREW_TAP_TOKEN (homebrew: Contents and Pull requests write on the
-# tap); the self-hosted GB10 runner made available to this repository; then
-# PUBLISH_ENABLED.
+# tap); the self-hosted GB10 and Strix Halo (rocm-gfx1151) runners made
+# available to this repository; then PUBLISH_ENABLED.
 #
 # Actions are pinned to commits and tools to exact versions: the upload jobs
 # hold publishing rights.
@@ -66,6 +69,8 @@ jobs:
     outputs:
       version: ${{ steps.plan.outputs.version }}
       upload: ${{ steps.plan.outputs.upload }}
+      rocm: ${{ steps.plan.outputs.rocm }}
+      engines: ${{ steps.registries.outputs.engines }}
       pypi: ${{ steps.registries.outputs.pypi }}
       npm: ${{ steps.registries.outputs.npm }}
       crates: ${{ steps.registries.outputs.crates }}
@@ -122,6 +127,21 @@ jobs:
           # A missing release stops the run here, with gh's message.
           state=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease \
             --jq 'if .isDraft then "a draft" elif .isPrerelease then "a pre-release" else "published" end')
+          # The ROCm bundle is optional (see the top of this file); everything
+          # below that builds, tests or uploads a ROCm package follows this.
+          rocm_bundle="basert-engine-linux-x64-rocm-$V.tar.gz"
+          assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          rocm=false
+          for asset in $assets; do
+            if [ "$asset" = "$rocm_bundle" ]; then rocm=true; fi
+          done
+          if [ "$rocm" = true ]; then
+            echo "rocm=true" >> "$GITHUB_OUTPUT"
+            echo "$TAG carries $rocm_bundle: the Linux x86-64 (ROCm) packages are part of this run."
+          else
+            echo "rocm=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG has no $rocm_bundle: no Linux x86-64 (ROCm) packages this run."
+          fi
           # The commit the tag names: the peeled line for an annotated tag, else the tag's own.
           tagged=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY" "refs/tags/$TAG" "refs/tags/$TAG^{}" \
             | sort -k2 | tail -n 1 | cut -f1)
@@ -144,6 +164,7 @@ jobs:
         env:
           V: ${{ steps.plan.outputs.version }}
           UPLOAD: ${{ steps.plan.outputs.upload }}
+          ROCM: ${{ steps.plan.outputs.rocm }}
         run: |
           set -euo pipefail
           set -f # the file name patterns below are matched, not expanded
@@ -166,6 +187,11 @@ jobs:
           # The platform tags come from the build, so they're matched.
           wheels="basert-$V-py3-none-macosx_*_arm64.whl basert-$V-py3-none-manylinux_*_aarch64.whl"
           engines="basert-darwin-arm64 basert-linux-arm64-cuda"
+          if [ "$ROCM" = true ]; then
+            wheels="$wheels basert-$V-py3-none-manylinux_*_x86_64.whl"
+            engines="$engines basert-linux-x64-rocm"
+          fi
+          echo "engines=$engines" >> "$GITHUB_OUTPUT" # the npm job publishes these
           pypi_has() {
             files=$(curl -sf -A "$agent" "https://pypi.org/pypi/basert/$V/json" | jq -r '.urls[].filename') || return 1
             for want in $wheels; do
@@ -207,6 +233,10 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
+      # Before the script tests: they build wheels too.
+      - name: Wheel tooling
+        run: python3 -m pip install --quiet build==1.6.1 wheel==0.48.0 twine==7.0.0
+
       - name: Test the packaging scripts
         run: python3 tests/scripts/test_packaging.py
 
@@ -223,7 +253,6 @@ jobs:
 
       - name: PyPI wheels
         run: |
-          python3 -m pip install --quiet build==1.6.1 wheel==0.48.0 twine==7.0.0
           for b in bundles/*.tar.gz; do packaging/python/build-wheel.sh "$b" out/wheels; done
           python3 -m twine check --strict out/wheels/*.whl
 
@@ -342,7 +371,7 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           python3 -m venv venv
-          venv/bin/pip install --quiet out/wheels/*manylinux*.whl
+          venv/bin/pip install --quiet out/wheels/*manylinux*_aarch64.whl
           venv/bin/basert --version
           venv/bin/basert chat --help | head -n 3   # the launcher finds basert-chat
           venv/bin/basert serve --help | head -n 3
@@ -385,6 +414,78 @@ jobs:
             ./consumer
           done
 
+  # The same checks again for the Linux x86-64 engine, on a Strix Halo
+  # (gfx1151) with the ROCm 10 runtime it needs: no GitHub-hosted runner has
+  # an AMD GPU. Only for a release that carries the ROCm bundle. The runner is
+  # self-hosted like the GB10 (this happens under RUNNER_TEMP), and is offline
+  # while the machine is booked for other work, so a run may wait for it. Its
+  # label must stay out of workflows that pull requests run:
+  # tests/scripts/test_packaging.py checks that.
+  test-rocm:
+    name: Test on Linux x86-64 (ROCm)
+    needs: [plan, build]
+    if: needs.plan.outputs.rocm == 'true'
+    runs-on: [self-hosted, Linux, X64, rocm-gfx1151]
+    env:
+      # `serve --help` must not install superfluid on the shared machine.
+      BASERT_SUPERFLUID_AUTO_INSTALL: "0"
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packages
+          path: ${{ runner.temp }}/out
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: pip install basert
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 -m venv venv
+          venv/bin/pip install --quiet out/wheels/*manylinux*_x86_64.whl
+          venv/bin/basert --version
+          venv/bin/basert chat --help | head -n 3   # the launcher finds basert-chat
+          venv/bin/basert serve --help | head -n 3
+          # The wheel's own engine, not one installed elsewhere on the machine.
+          venv/bin/python -c "import baseRT; p = baseRT._find_library(); assert '/_engine/' in p, p; print(p)"
+          venv/bin/python -c "import ctypes, baseRT; f = baseRT._get_lib().baseRT_version_string; f.restype = ctypes.c_char_p; print('engine', f().decode())"
+
+      - name: npm install @basecompute/basert
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir npm-test && cd npm-test && npm init -y > /dev/null
+          npm install --no-audit --no-fund ../out/npm/basecompute-basert-linux-x64-rocm-*.tgz ../out/npm/basecompute-basert-[0-9]*.tgz
+          npx basert --version
+          npx basert serve --help | head -n 3
+          # Only the engine's own refusal of a missing model proves it loaded.
+          # A library or symbol koffi cannot load, or anything else failing,
+          # throws some other error; a model that loads is wrong too.
+          node -e '
+            const { BaseRTModel } = require("@basecompute/basert");
+            const expected = "Failed to load model: Failed to open model: /nonexistent.base";
+            try { new BaseRTModel("/nonexistent.base"); } catch (e) {
+              if (!e.message.startsWith(expected)) throw e;
+              console.log("engine loaded:", e.message);
+              process.exit(0);
+            }
+            throw new Error("a model that does not exist loaded");'
+
+      # As on the GB10: the SONAME resolves in the package, and loading the
+      # engine pulls in the HIP runtime and hipBLAS(Lt) from ROCm 10.
+      - name: Link a program against the installed engines
+        working-directory: ${{ runner.temp }}
+        run: |
+          printf '#include <stdio.h>\nconst char *baseRT_version_string(void);\nint main(void) { return puts(baseRT_version_string()) < 0; }\n' > consumer.c
+          for engine in "$(venv/bin/python -c 'import baseRT, os; print(os.path.dirname(baseRT._find_library()))')" \
+                        "$PWD/npm-test/node_modules/@basecompute/basert-linux-x64-rocm/engine"; do
+            cc consumer.c -o consumer -L"$engine" -lbaseRT -Wl,-rpath,"$engine"
+            ldd ./consumer | grep -q "libbaseRT.so.0 => $engine/libbaseRT.so.0"
+            ./consumer
+          done
+
   crates-check:
     name: Verify crates
     needs: plan
@@ -407,10 +508,15 @@ jobs:
 
   # --- uploads: only when the plan says so -----------------------------------
 
+  # test-rocm is skipped for a release without the ROCm bundle, and a skipped
+  # need would skip this job too, so the test results are checked here.
   pypi:
     name: Publish to PyPI
-    needs: [plan, test-macos, test-linux]
-    if: needs.plan.outputs.upload == 'true' && needs.plan.outputs.pypi == 'true'
+    needs: [plan, test-macos, test-linux, test-rocm]
+    if: >-
+      ${{ !cancelled() && needs.plan.outputs.upload == 'true' && needs.plan.outputs.pypi == 'true'
+      && needs.test-macos.result == 'success' && needs.test-linux.result == 'success'
+      && (needs.test-rocm.result == 'success' || (needs.plan.outputs.rocm == 'false' && needs.test-rocm.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     environment:
       name: pypi
@@ -429,10 +535,15 @@ jobs:
           # upload would stop at the first wheel already there. Step over it.
           skip-existing: true
 
+  # test-rocm is skipped for a release without the ROCm bundle, and a skipped
+  # need would skip this job too, so the test results are checked here.
   npm:
     name: Publish to npm
-    needs: [plan, test-macos, test-linux]
-    if: needs.plan.outputs.upload == 'true' && needs.plan.outputs.npm == 'true'
+    needs: [plan, test-macos, test-linux, test-rocm]
+    if: >-
+      ${{ !cancelled() && needs.plan.outputs.upload == 'true' && needs.plan.outputs.npm == 'true'
+      && needs.test-macos.result == 'success' && needs.test-linux.result == 'success'
+      && (needs.test-rocm.result == 'success' || (needs.plan.outputs.rocm == 'false' && needs.test-rocm.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     environment:
       name: npm
@@ -452,11 +563,13 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           V: ${{ needs.plan.outputs.version }}
+          ENGINES: ${{ needs.plan.outputs.engines }}
         run: |
           set -euo pipefail
           # Engine packages first, so the main package's optional dependencies
           # already exist when it appears. Skip any a previous run published.
-          for pkg in basert-darwin-arm64 basert-linux-arm64-cuda basert; do
+          # shellcheck disable=SC2086 # ENGINES is a word list
+          for pkg in $ENGINES basert; do
             if npm view "@basecompute/$pkg@$V" version > /dev/null 2>&1; then
               echo "@basecompute/$pkg@$V is on npm already"
             else
@@ -464,10 +577,16 @@ jobs:
             fi
           done
 
+  # test-rocm is skipped for a release without the ROCm bundle, and a skipped
+  # need would skip this job too, so the test results are checked here.
   crates:
     name: Publish to crates.io
-    needs: [plan, crates-check, test-macos, test-linux]
-    if: needs.plan.outputs.upload == 'true' && needs.plan.outputs.crates == 'true'
+    needs: [plan, crates-check, test-macos, test-linux, test-rocm]
+    if: >-
+      ${{ !cancelled() && needs.plan.outputs.upload == 'true' && needs.plan.outputs.crates == 'true'
+      && needs.test-macos.result == 'success' && needs.test-linux.result == 'success'
+      && (needs.test-rocm.result == 'success' || (needs.plan.outputs.rocm == 'false' && needs.test-rocm.result == 'skipped'))
+      && needs.crates-check.result == 'success' }}
     runs-on: ubuntu-24.04-arm
     environment:
       name: crates

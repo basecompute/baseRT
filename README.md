@@ -2,24 +2,24 @@
 
 # BaseRT
 
-**Fastest LLM inference on Apple Silicon — now on NVIDIA GB10 (DGX Spark), too.**
+**Fastest LLM inference on Apple Silicon — now on NVIDIA GB10 (DGX Spark) and AMD Strix Halo / Strix Point, too.**
 
 Pull a model from HuggingFace, chat with it, or serve an OpenAI-compatible API — all from one CLI.
 
 [![Docs](https://img.shields.io/badge/docs-docs.basecompute.co-5b8fa8)](https://docs.basecompute.co)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Apple%20Silicon%20%C2%B7%20NVIDIA%20GB10-black)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-Apple%20Silicon%20%C2%B7%20NVIDIA%20GB10%20%C2%B7%20AMD%20Strix-black)](#requirements)
 [![Bindings](https://img.shields.io/badge/bindings-Python%20%C2%B7%20Node%20%C2%B7%20Rust%20%C2%B7%20Swift-444)](docs/bindings/index.md)
 
 </div>
 
 ---
 
-BaseRT runs large language models locally on Apple Silicon (Metal) and NVIDIA
-GB10 / DGX Spark (CUDA), accelerated by hand-written GPU kernels. This repository
-is the open ecosystem around the engine: the `basert` CLI (model hub +
-converter), the `.base` model format, the public C API, and language bindings for
-Python, Node, Rust, and Swift.
+BaseRT runs large language models locally on Apple Silicon (Metal), NVIDIA
+GB10 / DGX Spark (CUDA) and AMD Strix Halo / Strix Point (ROCm), accelerated by
+hand-written GPU kernels. This repository is the open ecosystem around the
+engine: the `basert` CLI (model hub + converter), the `.base` model format, the
+public C API, and language bindings for Python, Node, Rust, and Swift.
 
 - **One CLI for everything** — `basert pull`, `chat`, `serve`, `convert`.
 - **OpenAI-compatible server** — chat, completions, embeddings, transcription,
@@ -38,6 +38,10 @@ One of:
 
 - Apple Silicon (M1 or later), macOS 14+.
 - NVIDIA GB10 (DGX Spark), Linux / arm64 with a CUDA driver.
+- AMD Strix Halo (Ryzen AI Max, gfx1151) or Strix Point (Ryzen AI 300,
+  gfx1150), Linux / x86-64 on Ubuntu 26.04 or newer, with the ROCm 10 runtime
+  from AMD's apt repository: `sudo apt install amdrocm-blas10.0-gfx1151` (or
+  `amdrocm-blas10.0-gfx1150`).
 
 ## Quickstart
 
