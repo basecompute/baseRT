@@ -89,7 +89,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      # The tests build wheels (build, wheel) and lint install.sh (shellcheck).
+      - run: |
+          python3 -m pip install --quiet build==1.6.1 wheel==0.48.0
+          command -v shellcheck || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
       # publish.yml runs these scripts only after a release; their engine
-      # staging, link check and npm launcher are tested here on synthetic
-      # bundles.
+      # staging, link check, wheel tags, npm and Homebrew packages, and
+      # install.sh's platform checks are tested here on synthetic bundles.
       - run: python3 tests/scripts/test_packaging.py

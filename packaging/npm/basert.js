@@ -14,13 +14,14 @@ const path = require("path");
 const ENGINE_PACKAGES = {
   "darwin-arm64": "@basecompute/basert-darwin-arm64",
   "linux-arm64": "@basecompute/basert-linux-arm64-cuda",
+  "linux-x64": "@basecompute/basert-linux-x64-rocm",
 };
 
 const platform = `${process.platform}-${process.arch}`;
 const pkg = ENGINE_PACKAGES[platform];
 if (!pkg) {
   console.error(
-    `basert: no prebuilt engine for ${platform}. BaseRT ships macOS/arm64 (Apple Silicon) and Linux/arm64 (NVIDIA CUDA).`
+    `basert: no prebuilt engine for ${platform}. BaseRT ships macOS/arm64 (Apple Silicon), Linux/arm64 (NVIDIA CUDA) and Linux/x64 (AMD ROCm).`
   );
   process.exit(1);
 }

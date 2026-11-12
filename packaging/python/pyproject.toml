@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "basert"
 dynamic = ["version"]
-description = "Fast local LLM inference on Apple Silicon and NVIDIA GB10: the basert CLI, engine, and Python bindings"
+description = "Fast local LLM inference on Apple Silicon, NVIDIA GB10 and AMD Strix: the basert CLI, engine, and Python bindings"
 readme = "README.md"
 # The bindings and CLI launcher are Apache-2.0; the bundled engine binaries in
 # baseRT/_engine/ are under the BaseRT Engine license (_engine/LICENSE).
@@ -21,7 +21,7 @@ license = "Apache-2.0 AND LicenseRef-BaseRT-Engine"
 license-files = ["LICENSE", "NOTICE", "baseRT/_engine/LICENSE", "baseRT/_engine/NOTICE"]
 requires-python = ">=3.9"
 authors = [{ name = "BaseCompute" }]
-keywords = ["llm", "inference", "apple-silicon", "metal", "cuda", "openai"]
+keywords = ["llm", "inference", "apple-silicon", "metal", "cuda", "rocm", "amd", "openai"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: GPU",

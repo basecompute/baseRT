@@ -3,23 +3,28 @@
 //
 //   node packaging/npm/build-packages.mjs <bundles-dir> <out-dir> [--engines <names>]
 //
-// <bundles-dir> holds both release engine bundles for the version in
-// bindings/node/package.json. Writes three tarballs to <out-dir>, ready for
-// `npm publish <tarball>`:
+// <bundles-dir> holds the release's engine bundles for the version in
+// bindings/node/package.json. Writes a tarball per engine and the main one to
+// <out-dir>, ready for `npm publish <tarball>`:
 //
 //   basecompute-basert-darwin-arm64-<v>.tgz      engine for Apple Silicon
 //   basecompute-basert-linux-arm64-cuda-<v>.tgz  engine for Linux/arm64 CUDA
+//   basecompute-basert-linux-x64-rocm-<v>.tgz    engine for Linux/x86-64 ROCm
 //   basecompute-basert-<v>.tgz                   bindings + `basert` command
 //
 // The engine is split out so each machine downloads only its own (esbuild and
-// biome ship the same way): the main package lists both engine packages as
-// optionalDependencies, and npm skips the one whose os/cpu don't match.
+// biome ship the same way): the main package lists the engine packages as
+// optionalDependencies, and npm skips those whose os/cpu don't match.
+//
+// The macOS and CUDA bundles are in every release. The ROCm one is optional:
+// the engine's release pipeline ships a release without it when its AMD
+// runner is off, and then there is no ROCm package to build or depend on.
 //
 // --engines names the engine packages this release publishes, comma-separated
-// (default: all, `basert-darwin-arm64,basert-linux-arm64-cuda`). Every engine
-// tarball is still built, for testing, but the main package depends only on
-// the named ones: one that never reaches the registry must not be among its
-// optionalDependencies. publish.yml publishes all of them.
+// (default: every one built). Every engine tarball is still built, for
+// testing, but the main package depends only on the named ones: one that
+// never reaches the registry must not be among its optionalDependencies.
+// publish.yml publishes all of them.
 //
 // bindings/node is compiled in a staging copy and its package.json rewritten
 // there, so the published package gets its own name and metadata while the
@@ -70,21 +75,38 @@ const PLATFORMS = [
     cpu: ["arm64"],
     libc: ["glibc"],
   },
+  {
+    bundle: "basert-engine-linux-x64-rocm",
+    name: `${SCOPE}/basert-linux-x64-rocm`,
+    description: "BaseRT engine for Linux/x86-64 with AMD ROCm (Strix Halo / Strix Point)",
+    os: ["linux"],
+    cpu: ["x64"],
+    libc: ["glibc"],
+    optional: true, // not in a release built without its AMD runner
+  },
 ];
 
-const published = PLATFORMS.filter((p) => !engines || engines.includes(p.name.split("/")[1]));
 for (const name of engines || []) {
   if (!PLATFORMS.some((p) => p.name === `${SCOPE}/${name}`)) {
     console.error(`--engines: no engine package ${name}`);
     process.exit(2);
   }
 }
+const named = (p) => !engines || engines.includes(p.name.split("/")[1]);
 
 const run = (cmd, args, cwd) => execFileSync(cmd, args, { cwd, stdio: ["ignore", "pipe", "inherit"] }).toString();
 const writeJson = (file, obj) => fs.writeFileSync(file, JSON.stringify(obj, null, 2) + "\n");
 
 const source = JSON.parse(fs.readFileSync(path.join(root, "bindings/node/package.json"), "utf8"));
 const version = source.version;
+const bundleFile = (p) => path.join(bundlesDir, `${p.bundle}-${version}.tar.gz`);
+// An optional bundle the release lacks is left out, unless --engines names it.
+const built = PLATFORMS.filter((p) => {
+  if (fs.existsSync(bundleFile(p)) || !p.optional || (engines && named(p))) return true;
+  console.log(`no ${path.basename(bundleFile(p))} in this release: ${p.name} is not built`);
+  return false;
+});
+const published = built.filter(named);
 const stage = fs.mkdtempSync(path.join(os.tmpdir(), "basert-npm-"));
 fs.mkdirSync(outDir, { recursive: true });
 
@@ -95,8 +117,8 @@ function pack(dir) {
 
 try {
   // --- engine packages -------------------------------------------------------
-  for (const p of PLATFORMS) {
-    const bundle = path.join(bundlesDir, `${p.bundle}-${version}.tar.gz`);
+  for (const p of built) {
+    const bundle = bundleFile(p);
     if (!fs.existsSync(bundle)) {
       throw new Error(`missing ${bundle} (bindings/node is at ${version}; has release v${version} been published?)`);
     }
@@ -160,17 +182,19 @@ try {
   writeJson(path.join(main, "package.json"), {
     name: `${SCOPE}/basert`,
     version,
-    description: "Fast local LLM inference on Apple Silicon and NVIDIA GB10: the basert CLI and Node.js bindings",
+    description: "Fast local LLM inference on Apple Silicon, NVIDIA GB10 and AMD Strix: the basert CLI and Node.js bindings",
     license: "Apache-2.0",
     repository: { ...REPOSITORY, directory: "bindings/node" },
     homepage: HOMEPAGE,
-    keywords: ["llm", "inference", "apple-silicon", "metal", "cuda", "openai"],
+    keywords: ["llm", "inference", "apple-silicon", "metal", "cuda", "rocm", "amd", "openai"],
     main: source.main,
     types: source.types,
     bin: { basert: "bin/basert.js" },
     engines: source.engines,
-    os: ["darwin", "linux"],
-    cpu: ["arm64"],
+    // Where this release has an engine. One left out of --engines still
+    // reaches users through install.sh or Homebrew, and the bindings find it.
+    os: [...new Set(built.flatMap((p) => p.os))],
+    cpu: [...new Set(built.flatMap((p) => p.cpu))],
     dependencies: source.dependencies,
     optionalDependencies: Object.fromEntries(published.map((p) => [p.name, version])),
     files: ["dist/**/*.js", "dist/**/*.d.ts", "bin/", "NOTICE"],

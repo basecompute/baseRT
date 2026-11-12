@@ -47,6 +47,7 @@ function libNames(): string[] {
 const ENGINE_PACKAGES: Record<string, string> = {
   "darwin-arm64": "@basecompute/basert-darwin-arm64",
   "linux-arm64": "@basecompute/basert-linux-arm64-cuda",
+  "linux-x64": "@basecompute/basert-linux-x64-rocm",
 };
 
 function enginePackageDir(): string | undefined {

@@ -11,7 +11,8 @@
 #
 # Keeping the release layout matters: the `basert` launcher finds the
 # `basert-*` runtime tools next to itself, and those find their kernel files
-# (baseRT*.metallib / baseRT_cuda_kernels.fatbin) the same way.
+# (baseRT*.metallib / baseRT_cuda_kernels.fatbin / baseRT_rocm_kernels.hsaco)
+# the same way.
 set -eu
 
 [ $# -eq 2 ] || [ $# -eq 3 ] || { echo "usage: $0 <bundle.tar.gz> <dest-dir> ['<manager>: <command>']" >&2; exit 2; }
