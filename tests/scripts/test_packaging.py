@@ -746,7 +746,7 @@ esac
         (lib / "libamdhip64.so.7.15.26333-0000000").write_text("hip")
         os.symlink("libamdhip64.so.7.15.26333-0000000", lib / "libamdhip64.so.7")
 
-    def install(self, os_name: str = "Linux", arch: str = "x86_64") -> subprocess.CompletedProcess:
+    def install(self, os_name: str = "Linux", arch: str = "x86_64", **extra: str) -> subprocess.CompletedProcess:
         env = {
             "PATH": f"{self.bin}{os.pathsep}/usr/bin{os.pathsep}/bin",
             "HOME": str(self.tmp / "home"),
@@ -758,6 +758,7 @@ esac
             "STUB_RELEASE": str(self.api),
             "STUB_ASSETS": str(self.assets),
             "STUB_LOG": str(self.log),
+            **extra,
         }
         return subprocess.run(["sh", str(INSTALL_SH)], capture_output=True, text=True, env=env)
 
@@ -811,12 +812,46 @@ esac
                 self.assertEqual(run.returncode, 1)
                 self.assertIn(f"Strix Point (gfx1150) GPUs, not {name}.", run.stderr)
 
-    def test_a_strix_gpu_beside_another_is_used(self) -> None:
+    def test_a_strix_gpu_behind_another_is_named_with_its_device_number(self) -> None:
+        # The engine opens HIP device 0: a Strix GPU that is device 1 needs
+        # HIP_VISIBLE_DEVICES, and the installer says so (and installs anyway).
         self.amd(0, 110000, 110501)
         self.rocm("gfx1151")
         run = self.install()
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("→ basert-engine-linux-x64-rocm", run.stdout)
+        self.assertIn("HIP device 0, which is gfx1100 here; the gfx1151 is HIP device 1", run.stderr)
+        self.assertIn("export HIP_VISIBLE_DEVICES=1", run.stdout)  # again at the end
+
+    def test_device_0_decides(self) -> None:
+        self.amd(0, 110501, 110000)
+        self.rocm("gfx1151")
+        run = self.install()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertNotIn("HIP_VISIBLE_DEVICES", run.stdout + run.stderr)
+
+    def test_the_visibility_variables_choose_device_0(self) -> None:
+        self.amd(0, 110000, 110501)
+        self.rocm("gfx1151")
+        for env in ({"HIP_VISIBLE_DEVICES": "1"}, {"ROCR_VISIBLE_DEVICES": "1"}, {"CUDA_VISIBLE_DEVICES": "1,0"}):
+            with self.subTest(env=env):
+                run = self.install(**env)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertNotIn("HIP device", run.stderr)
+        run = self.install(HIP_VISIBLE_DEVICES="0")  # only the gfx1100 is left
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("Strix Point (gfx1150) GPUs, not gfx1100.", run.stderr)
+        run = self.install(HIP_VISIBLE_DEVICES="GPU-0123456789abcdef")  # a UUID: not read, node order stands
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("the gfx1151 is HIP device 1", run.stderr)
+
+    def test_topology_nodes_are_read_in_number_order(self) -> None:
+        # Node 10 sorts before node 2 as text; HIP numbers the GPUs by node number.
+        self.amd(0, 0, 110501, 0, 0, 0, 0, 0, 0, 0, 110000)
+        self.rocm("gfx1151")
+        run = self.install()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertNotIn("HIP device", run.stderr)
 
     @unittest.skipIf(os.geteuid() == 0, "root opens any file")
     def test_a_kfd_this_user_cannot_open_is_pointed_out(self) -> None:

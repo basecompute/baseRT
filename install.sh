@@ -54,22 +54,49 @@ sysroot="${BASERT_INSTALL_TEST_ROOT:-}"
 ROCM_LIB="/opt/rocm/core-10.0/lib"
 rocm_missing=""
 
-# The AMD GPU's LLVM target (gfx1151, ...), from the amdgpu driver's topology;
-# nothing without one. A supported chip wins over any other AMD GPU present.
-amd_gpu() {
+device_hint=""
+
+# The AMD GPUs' LLVM targets (gfx1151, ...), one per line, from the amdgpu
+# driver's topology in node-number order: the order HIP numbers them in.
+# Nothing without the driver.
+kfd_gpus() {
   [ -e "$sysroot/dev/kfd" ] || return 0
-  other=""
-  for props in "$sysroot"/sys/class/kfd/kfd/topology/nodes/*/properties; do
-    [ -f "$props" ] || continue
-    v="$(sed -n 's/^gfx_target_version \([0-9][0-9]*\)$/\1/p' "$props")"
+  nodes="$sysroot/sys/class/kfd/kfd/topology/nodes"
+  for dir in "$nodes"/*; do
+    [ -f "$dir/properties" ] && printf '%s\n' "${dir##*/}"
+  done | sort -n | while read -r node; do
+    v="$(sed -n 's/^gfx_target_version \([0-9][0-9]*\)$/\1/p' "$nodes/$node/properties")"
     case "$v" in
       "" | 0) ;; # a CPU node
-      110501) echo gfx1151; return 0 ;;
-      110500) echo gfx1150; return 0 ;;
-      *) [ -n "$other" ] || other="$(printf 'gfx%d%x%x' $((v / 10000)) $((v / 100 % 100)) $((v % 100)))" ;;
+      *) printf 'gfx%d%x%x\n' $((v / 10000)) $((v / 100 % 100)) $((v % 100)) ;;
     esac
   done
-  printf '%s' "$other"
+}
+
+# The lines of stdin that a ROCR_/HIP_VISIBLE_DEVICES list ($1) leaves, in its
+# order, as the ROCm runtime reads it: indices into the lines, a repeat
+# dropped, an index past the end ending the list. Unset or empty, or a list
+# that names devices by UUID, leaves the lines as they are.
+visible() {
+  lines="$(cat)"
+  list="$(printf '%s' "$1" | tr -d ' ')"
+  case "$list" in
+    "" | *[!0-9,]*) [ -z "$lines" ] || printf '%s\n' "$lines"; return 0 ;;
+  esac
+  count="$(printf '%s\n' "$lines" | grep -c . || true)"
+  kept=","
+  for i in $(printf '%s' "$list" | tr ',' ' '); do
+    [ "$i" -lt "$count" ] || break
+    case "$kept" in *",$i,"*) continue ;; esac
+    kept="$kept$i,"
+    printf '%s\n' "$lines" | sed -n "$((i + 1))p"
+  done
+}
+
+# The AMD GPUs as HIP numbers them, device 0 first: ROCR_VISIBLE_DEVICES
+# narrows the driver's list, then HIP_VISIBLE_DEVICES (or CUDA_VISIBLE_DEVICES).
+amd_gpus() {
+  kfd_gpus | visible "${ROCR_VISIBLE_DEVICES:-}" | visible "${HIP_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}"
 }
 
 os="$(uname -s)"
@@ -85,13 +112,26 @@ case "$os $arch" in
       err "BaseRT on Linux/arm64 needs an NVIDIA CUDA GPU (none detected)."
     fi ;;
   "Linux x86_64")
-    # The x86_64 bundle is ROCm-only, built for these two chips.
-    gpu="$(amd_gpu)"
-    case "$gpu" in
-      gfx1151 | gfx1150) ;;
-      "") err "BaseRT on Linux/x86_64 needs an AMD Strix Halo (gfx1151) or Strix Point (gfx1150) GPU with the amdgpu driver (none detected)." ;;
-      *) err "BaseRT on Linux/x86_64 runs on AMD Strix Halo (gfx1151) and Strix Point (gfx1150) GPUs, not $gpu." ;;
-    esac
+    # The x86_64 bundle is ROCm-only, built for these two chips. The engine
+    # runs on HIP device 0, so that is the GPU that decides; a Strix GPU behind
+    # another one is installed for, with how to make it device 0.
+    gpus="$(amd_gpus)"
+    first="$(printf '%s\n' "$gpus" | sed -n '1p')"
+    gpu="" device=0
+    for g in $gpus; do
+      case "$g" in gfx1151 | gfx1150) gpu="$g"; break ;; esac
+      device=$((device + 1))
+    done
+    if [ -z "$gpu" ]; then
+      [ -n "$first" ] || err "BaseRT on Linux/x86_64 needs an AMD Strix Halo (gfx1151) or Strix Point (gfx1150) GPU with the amdgpu driver (none detected)."
+      err "BaseRT on Linux/x86_64 runs on AMD Strix Halo (gfx1151) and Strix Point (gfx1150) GPUs, not $first."
+    fi
+    if [ "$device" -ne 0 ]; then
+      device_hint="export HIP_VISIBLE_DEVICES=$device"
+      warn "the engine runs on HIP device 0, which is $first here; the $gpu is HIP device $device."
+      warn "make it device 0 wherever you run basert:  $device_hint"
+      warn "(where HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set already, list the $gpu first there)"
+    fi
     if [ ! -r "$sysroot/dev/kfd" ] || [ ! -w "$sysroot/dev/kfd" ]; then
       warn "you cannot open /dev/kfd, so the engine cannot use the GPU: add yourself to the render"
       warn "group (sudo usermod -aG render \"\$USER\") and log in again."
@@ -243,6 +283,11 @@ if [ -n "$rocm_missing" ]; then
   echo
   echo "  First install the ROCm 10 runtime the engine needs (from AMD's apt repository):"
   echo "    $rocm_missing"
+fi
+if [ -n "$device_hint" ]; then
+  echo
+  echo "  The engine runs on HIP device 0, which is not your $gpu; make the $gpu device 0:"
+  echo "    $device_hint"
 fi
 echo
 echo "  Try it:"
