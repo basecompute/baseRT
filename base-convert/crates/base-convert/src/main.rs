@@ -8333,3 +8333,50 @@ mod tied_head_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod row_group_tests {
+    use super::{pack_for_target_rows, TargetScheme};
+    use base_format::TensorDtype;
+
+    // The runtime's base_qN kernels read K / gs scales per row, so a group may
+    // never run across a row end. gemma-4-26B-A4B-it's catalog Q8 was packed
+    // before this choice existed: ffn_down_exps (K = 704) and mlp.down_proj
+    // (K = 2112) at gs 128, with every row decoding against the wrong scales.
+    fn pack(k: usize, rows: usize, target: TargetScheme) -> (base_quant::Packed, TensorDtype) {
+        let w: Vec<f32> = (0..rows * k)
+            .map(|i| ((i % 97) as f32 - 48.0) / 64.0)
+            .collect();
+        pack_for_target_rows(&w, target, Some(k), "layers.0.test.weight").unwrap()
+    }
+
+    #[test]
+    fn q8_rows_that_split_gs128_pack_at_a_dividing_group() {
+        for (k, gs) in [(704, 64), (2112, 64), (2816, 128), (1856, 64), (1888, 32)] {
+            let (p, dt) = pack(k, 3, TargetScheme::BaseQ8);
+            assert_eq!(dt, TensorDtype::BaseQ8, "K = {k}");
+            assert_eq!(p.group_size as usize, gs, "K = {k}");
+            // One f16 scale and one f16 bias per group, groups per row = K / gs.
+            assert_eq!(p.scales.len(), 3 * (k / gs) * 2, "K = {k}");
+            assert_eq!(p.biases.len(), 3 * (k / gs) * 2, "K = {k}");
+        }
+    }
+
+    #[test]
+    fn rows_no_group_divides_stay_unquantized() {
+        // gemma-4's vision ffn.down: 4304 = 16 x 269, below the smallest group.
+        let (p, dt) = pack(4304, 2, TargetScheme::BaseQ8);
+        assert_eq!(dt, TensorDtype::Bf16);
+        assert_eq!(p.group_size, 0);
+        assert!(p.scales.is_empty() && p.biases.is_empty());
+        assert_eq!(p.packed_weights.len(), 2 * 4304 * 2);
+    }
+
+    #[test]
+    fn q4_keeps_its_default_group_where_it_divides() {
+        let (p, dt) = pack(704, 2, TargetScheme::BaseQ4);
+        assert_eq!((dt, p.group_size), (TensorDtype::BaseQ4, 64));
+        let (p, _) = pack(1888, 2, TargetScheme::BaseQ4);
+        assert_eq!(p.group_size, 32);
+    }
+}
