@@ -57,7 +57,7 @@ Add the dependency from crates.io (install the engine first, e.g.
 
 ```toml
 [dependencies]
-baseRT = "0.4"
+baseRT = "0.5"
 ```
 
 or from a checkout:

@@ -625,9 +625,17 @@ pub fn bundle_dir() -> Result<PathBuf> {
 /// The engine bundle name's platform for this machine:
 /// `basert-engine-<platform>-<v>.tar.gz`.
 pub fn platform() -> Result<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
+    platform_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// One engine per OS and CPU: Metal on Apple silicon, CUDA on Linux arm64
+/// (GB10), ROCm on Linux x86-64 (AMD Strix Halo and Strix Point; one bundle
+/// carries both chips' kernels).
+fn platform_for(os: &str, arch: &str) -> Result<&'static str> {
+    match (os, arch) {
         ("macos", "aarch64") => Ok("macos-arm64"),
         ("linux", "aarch64") => Ok("linux-arm64-cuda"),
+        ("linux", "x86_64") => Ok("linux-x64-rocm"),
         (os, arch) => bail!("no basert release is published for {os}/{arch}"),
     }
 }
@@ -2305,6 +2313,48 @@ mod tests {
         );
         pre["prerelease"] = json!(true);
         assert!(releases_in(&json!([pre]), "macos-arm64").is_empty());
+    }
+
+    #[test]
+    fn each_os_and_cpu_takes_its_own_engine_bundle() {
+        assert_eq!(platform_for("macos", "aarch64").unwrap(), "macos-arm64");
+        assert_eq!(
+            platform_for("linux", "aarch64").unwrap(),
+            "linux-arm64-cuda"
+        );
+        assert_eq!(platform_for("linux", "x86_64").unwrap(), "linux-x64-rocm");
+        let err = platform_for("macos", "x86_64").unwrap_err().to_string();
+        assert!(
+            err.contains("no basert release is published for macos/x86_64"),
+            "{err}"
+        );
+        assert!(platform_for("windows", "x86_64").is_err());
+
+        // A release with all three bundles: Linux x86-64 takes the ROCm one.
+        let listing = json!([listed(
+            "v0.5.0",
+            "2026-12-10T00:00:00Z",
+            &[
+                "basert-engine-abi-1.txt",
+                "basert-engine-macos-arm64-0.5.0.tar.gz",
+                "basert-engine-macos-arm64-0.5.0.tar.gz.sha256",
+                "basert-engine-linux-arm64-cuda-0.5.0.tar.gz",
+                "basert-engine-linux-arm64-cuda-0.5.0.tar.gz.sha256",
+                "basert-engine-linux-x64-rocm-0.5.0.tar.gz",
+                "basert-engine-linux-x64-rocm-0.5.0.tar.gz.sha256",
+            ]
+        )]);
+        let found = releases_in(&listing, platform_for("linux", "x86_64").unwrap());
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].tarball,
+            "basert-engine-linux-x64-rocm-0.5.0.tar.gz"
+        );
+        assert_eq!(
+            found[0].checksum_url,
+            "https://x/v0.5.0/basert-engine-linux-x64-rocm-0.5.0.tar.gz.sha256"
+        );
+        assert_eq!(found[0].abi, Some(1));
     }
 
     #[test]

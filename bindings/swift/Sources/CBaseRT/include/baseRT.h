@@ -63,8 +63,8 @@ extern "C" {
 // === Versioning ===
 
 #define BASERT_VERSION_MAJOR 0
-#define BASERT_VERSION_MINOR 4
-#define BASERT_VERSION_PATCH 7
+#define BASERT_VERSION_MINOR 5
+#define BASERT_VERSION_PATCH 0
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
