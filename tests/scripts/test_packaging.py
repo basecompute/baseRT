@@ -791,6 +791,58 @@ esac
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("sudo apt install amdrocm-blas10.0-gfx1150", run.stderr)
 
+    def os_release(self, os_id: str, version: str) -> None:
+        (self.root / "etc").mkdir(exist_ok=True)
+        (self.root / "etc/os-release").write_text(f'NAME="Some Linux"\nID={os_id}\nVERSION_ID="{version}"\n')
+
+    def test_without_amds_repository_its_setup_comes_first(self) -> None:
+        for version, dist in (("24.04", "ubuntu2404"), ("26.04", "ubuntu2604")):
+            with self.subTest(version=version):
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+                self.amd(0, 110501)
+                self.os_release("ubuntu", version)
+                run = self.install(BASERT_FORCE="1")
+                self.assertEqual(run.returncode, 0, run.stderr)
+                steps = [
+                    "sudo curl -fsSL https://stable.repo.amd.com/rocm/gpg/packages.gpg -o /etc/apt/keyrings/amdrocm.asc",
+                    f"echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.asc] https://stable.repo.amd.com/rocm/core/packages/{dist} stable main' | sudo tee /etc/apt/sources.list.d/amdrocm.list",
+                    "sudo apt update",
+                    "sudo apt install amdrocm-blas10.0-gfx1151",
+                ]
+                for out in (run.stderr, run.stdout):  # warned, and again at the end
+                    lines = [line.rsplit("basert\x1b[0m", 1)[-1].strip() for line in out.splitlines()]
+                    at = [lines.index(s) if s in lines else -1 for s in steps]
+                    self.assertEqual(at, list(range(at[0], at[0] + 4)), out)  # whole lines, in order
+
+    def test_with_amds_repository_only_the_apt_line(self) -> None:
+        self.amd(0, 110500)
+        self.os_release("ubuntu", "24.04")
+        sources = self.root / "etc/apt/sources.list.d"
+        sources.mkdir(parents=True)
+        (sources / "amdrocm.sources").write_text(
+            "Types: deb\nURIs: https://stable.repo.amd.com/rocm/core/packages/ubuntu2404\nSuites: stable\nComponents: main\n"
+        )
+        run = self.install()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("sudo apt install amdrocm-blas10.0-gfx1150", run.stdout)
+        self.assertNotIn("keyrings", run.stdout + run.stderr)
+        self.assertNotIn("apt update", run.stdout + run.stderr)
+
+    def test_another_release_is_told_which_ones_amd_serves(self) -> None:
+        for release in (("ubuntu", "25.10"), ("debian", "13"), None):
+            with self.subTest(release=release):
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+                self.amd(0, 110501)
+                if release:
+                    self.os_release(*release)
+                run = self.install(BASERT_FORCE="1")
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertIn("which serves Ubuntu 24.04 and 26.04", run.stdout)
+                self.assertIn("sudo apt install amdrocm-blas10.0-gfx1151", run.stdout)
+                self.assertNotIn("keyrings", run.stdout + run.stderr)
+
     def test_a_machine_without_an_amd_gpu_is_refused(self) -> None:
         for kfd, nodes in ((False, (0, 110501)), (True, (0,))):
             with self.subTest(kfd=kfd, nodes=nodes):

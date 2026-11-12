@@ -52,7 +52,32 @@ need uname
 # and says what to install; it does not run apt itself.
 sysroot="${BASERT_INSTALL_TEST_ROOT:-}"
 ROCM_LIB="/opt/rocm/core-10.0/lib"
+AMD_REPO="https://stable.repo.amd.com/rocm"
 rocm_missing=""
+
+# A field of /etc/os-release ($1), unquoted.
+os_release() { sed -n "s/^$1=//p" "$sysroot/etc/os-release" 2>/dev/null | tr -d "\"'"; }
+
+# The commands that install ROCm 10 for a chip ($1), one per line: AMD's apt
+# repository first when apt does not have it yet. AMD serves it for Ubuntu
+# 24.04 and 26.04.
+rocm_steps() {
+  if ! grep -rqs "stable.repo.amd.com/rocm/core" "$sysroot/etc/apt/sources.list" "$sysroot/etc/apt/sources.list.d"; then
+    case "$(os_release ID) $(os_release VERSION_ID)" in
+      "ubuntu 24.04") dist=ubuntu2404 ;;
+      "ubuntu 26.04") dist=ubuntu2604 ;;
+      *) dist="" ;;
+    esac
+    if [ -n "$dist" ]; then
+      echo "sudo curl -fsSL $AMD_REPO/gpg/packages.gpg -o /etc/apt/keyrings/amdrocm.asc"
+      echo "echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.asc] $AMD_REPO/core/packages/$dist stable main' | sudo tee /etc/apt/sources.list.d/amdrocm.list"
+      echo "sudo apt update"
+    else
+      echo "# from AMD's ROCm 10 repository, $AMD_REPO/core/packages, which serves Ubuntu 24.04 and 26.04:"
+    fi
+  fi
+  echo "sudo apt install amdrocm-blas10.0-$1"
+}
 
 device_hint=""
 
@@ -220,10 +245,10 @@ case "$os $arch" in
     hip=""
     for f in "$sysroot$ROCM_LIB"/libamdhip64.so*; do [ -e "$f" ] && hip="$f"; done
     if [ -z "$hip" ] || [ ! -d "$sysroot$ROCM_LIB/rocblas/library/$gpu" ]; then
-      rocm_missing="sudo apt install amdrocm-blas10.0-$gpu"
+      rocm_missing="$(rocm_steps "$gpu")"
       warn "the engine needs the ROCm 10 runtime and the $gpu BLAS kernels in /opt/rocm/core-10.0, which"
-      warn "are not there. Install them from AMD's ROCm 10 apt repository (stable.repo.amd.com/rocm/core):"
-      warn "  $rocm_missing"
+      warn "are not there. Install them from AMD's ROCm 10 apt repository:"
+      printf '%s\n' "$rocm_missing" | while IFS= read -r line; do warn "  $line"; done
     fi
     ASSET_PREFIX="basert-engine-linux-x64-rocm" ;;
   *)
@@ -362,7 +387,7 @@ fi
 if [ -n "$rocm_missing" ]; then
   echo
   echo "  First install the ROCm 10 runtime the engine needs (from AMD's apt repository):"
-  echo "    $rocm_missing"
+  printf '%s\n' "$rocm_missing" | sed 's/^/    /'
 fi
 if [ -n "$device_hint" ]; then
   echo

@@ -40,12 +40,25 @@ One of:
 - NVIDIA GB10 (DGX Spark), Linux / arm64 with a CUDA driver.
 - AMD Strix Halo (Ryzen AI Max, gfx1151) or Strix Point (Ryzen AI 300,
   gfx1150), Linux / x86-64 on Ubuntu 24.04 or newer, with the ROCm 10 runtime
-  from AMD's apt repository: `sudo apt install amdrocm-blas10.0-gfx1151` (or
-  `amdrocm-blas10.0-gfx1150`). The kernel must be one AMD supports for
+  from AMD's apt repository (below). The kernel must be one AMD supports for
   RDNA3.5: on Ubuntu 24.04 the HWE kernel `6.17.0-19.19~24.04.2` or later or
   the OEM kernel `6.14.0-1018` or later, Ubuntu 26.04's own kernel, and
   elsewhere Linux 6.18.4 or later
   ([AMD's list](https://rocm.docs.amd.com/en/latest/reference/system-optimization/rdna3-5.html)).
+
+On AMD, add AMD's ROCm 10 repository, then install the runtime with the BLAS
+kernels for your chip: `amdrocm-blas10.0-gfx1151` on Strix Halo,
+`amdrocm-blas10.0-gfx1150` on Strix Point. AMD serves the repository for
+Ubuntu 24.04 (`ubuntu2404`, as below) and 26.04 (`ubuntu2604`). The installer
+checks for all of this and prints the commands for your machine.
+
+```sh
+sudo curl -fsSL https://stable.repo.amd.com/rocm/gpg/packages.gpg -o /etc/apt/keyrings/amdrocm.asc
+echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.asc] https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main' | sudo tee /etc/apt/sources.list.d/amdrocm.list
+sudo apt update
+sudo apt install amdrocm-blas10.0-gfx1151
+sudo usermod -aG render "$USER"   # access to the GPU; log in again afterwards
+```
 
 ## Quickstart
 
