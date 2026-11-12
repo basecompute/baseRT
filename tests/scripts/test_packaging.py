@@ -111,7 +111,7 @@ def bundle(path: Path, files: dict[str, bytes], links: dict[str, str]) -> None:
 BUNDLES = {
     "basert-engine-macos-arm64": "macosx_15_0_arm64",
     "basert-engine-linux-arm64-cuda": "manylinux_2_38_aarch64",
-    "basert-engine-linux-x64-rocm": "manylinux_2_43_x86_64",
+    "basert-engine-linux-x64-rocm": "manylinux_2_39_x86_64",
 }
 
 
@@ -136,9 +136,9 @@ def release(folder: Path, v: str, rocm: bool = True) -> None:
     }
     hip = ["libamdhip64.so.7", "libhipblas.so.3", "libhipblaslt.so.1"]
     rocm_files = {
-        f"libbaseRT.so.{v}": elf(hip, soname="libbaseRT.so.0", machine=X86_64, tail=glibc(43)),
+        f"libbaseRT.so.{v}": elf(hip, soname="libbaseRT.so.0", machine=X86_64, tail=glibc(38)),
         "basert": elf(["libc.so.6"], machine=X86_64, tail=glibc(39)),
-        "basert-chat": elf(["libbaseRT.so.0", "libc.so.6"], machine=X86_64, tail=glibc(43)),
+        "basert-chat": elf(["libbaseRT.so.0", "libc.so.6"], machine=X86_64, tail=glibc(38)),
         "baseRT_rocm_kernels.hsaco": OFFLOAD_BUNDLE,
     }
     contents = {
@@ -549,19 +549,19 @@ class PlatformTagTests(unittest.TestCase):
         # Until 0.5.0 every ELF engine was tagged aarch64, so this one made a
         # second aarch64 wheel, and publish.yml's Linux test installed both.
         run = self.tag({
-            "libbaseRT.so": elf(["libamdhip64.so.7"], soname="libbaseRT.so.0", machine=X86_64, tail=glibc(43)),
+            "libbaseRT.so": elf(["libamdhip64.so.7"], soname="libbaseRT.so.0", machine=X86_64, tail=glibc(38)),
             "basert": elf([], machine=X86_64, tail=glibc(39)),
             "baseRT_rocm_kernels.hsaco": OFFLOAD_BUNDLE,
         })
-        self.assertEqual((run.returncode, run.stdout), (0, "manylinux_2_43_x86_64\n"), run.stderr)
+        self.assertEqual((run.returncode, run.stdout), (0, "manylinux_2_39_x86_64\n"), run.stderr)
 
     def test_a_gpu_code_object_says_nothing_about_the_cpu(self) -> None:
         # A kernel file built for one GPU is an AMDGPU ELF code object.
         run = self.tag({
-            "libbaseRT.so": elf([], machine=X86_64, tail=glibc(43)),
+            "libbaseRT.so": elf([], machine=X86_64, tail=glibc(39)),
             "baseRT_rocm_kernels.hsaco": elf([], machine=AMDGPU),
         })
-        self.assertEqual((run.returncode, run.stdout), (0, "manylinux_2_43_x86_64\n"), run.stderr)
+        self.assertEqual((run.returncode, run.stdout), (0, "manylinux_2_39_x86_64\n"), run.stderr)
 
     def test_binaries_for_two_cpus_are_refused(self) -> None:
         run = self.tag({"libbaseRT.so": elf([], tail=glibc(38)), "basert": elf([], machine=X86_64, tail=glibc(39))})
@@ -677,7 +677,7 @@ class WheelBuildTests(unittest.TestCase):
             sorted(p.name for p in out.iterdir()),
             sorted(f"basert-{self.v}-py3-none-{tag}.whl" for tag in BUNDLES.values()),
         )
-        with zipfile.ZipFile(out / f"basert-{self.v}-py3-none-manylinux_2_43_x86_64.whl") as whl:
+        with zipfile.ZipFile(out / f"basert-{self.v}-py3-none-manylinux_2_39_x86_64.whl") as whl:
             engine = {n.split("/", 2)[2] for n in whl.namelist() if n.startswith("baseRT/_engine/")}
         self.assertTrue({"baseRT_rocm_kernels.hsaco", "libbaseRT.so", "libbaseRT.so.0", "basert", "installed-by"} <= engine, engine)
 
