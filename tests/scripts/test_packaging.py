@@ -841,9 +841,60 @@ esac
         run = self.install(HIP_VISIBLE_DEVICES="0")  # only the gfx1100 is left
         self.assertEqual(run.returncode, 1)
         self.assertIn("Strix Point (gfx1150) GPUs, not gfx1100.", run.stderr)
-        run = self.install(HIP_VISIBLE_DEVICES="GPU-0123456789abcdef")  # a UUID: not read, node order stands
-        self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertIn("the gfx1151 is HIP device 1", run.stderr)
+
+    def fresh(self, *nodes: int) -> None:
+        """A new machine: these AMD GPUs (after a CPU node), ROCm for the gfx1151, nothing installed yet."""
+        shutil.rmtree(self.root)
+        self.root.mkdir()
+        shutil.rmtree(self.dest, ignore_errors=True)
+        self.log.write_text("")
+        self.amd(0, *nodes)
+        self.rocm("gfx1151")
+
+    def test_a_uuid_selector_leaves_device_0_to_the_engine(self) -> None:
+        # ROCr and HIP match UUIDs differently and the installer does not
+        # reproduce either: it neither refuses nor offers a selector.
+        uuid = "GPU-1a2b3c4d5e6f7a8b"
+        for env in ({"ROCR_VISIBLE_DEVICES": uuid, "HIP_VISIBLE_DEVICES": "0"},
+                    {"ROCR_VISIBLE_DEVICES": uuid}, {"HIP_VISIBLE_DEVICES": uuid}):
+            with self.subTest(env=env):
+                self.fresh(110000, 110501)
+                run = self.install(**env)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertNotIn("HIP_VISIBLE_DEVICES=", run.stdout + run.stderr)
+                self.assertIn("by UUID", run.stderr)
+
+    def test_lists_that_leave_no_gpu_are_refused(self) -> None:
+        # ROCr: set but empty, or an index out of range from the first entry;
+        # HIP: an entry that is not a plain decimal ends the list.
+        for env in ({"ROCR_VISIBLE_DEVICES": ""}, {"ROCR_VISIBLE_DEVICES": "5"},
+                    {"HIP_VISIBLE_DEVICES": "-1"}, {"HIP_VISIBLE_DEVICES": "01"}):
+            with self.subTest(env=env):
+                self.fresh(110501)
+                run = self.install(**env)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertIn("leave no AMD GPU", run.stderr)
+                self.assertEqual(self.downloaded(), [])
+
+    def test_the_offered_selector_makes_the_strix_gpu_device_0(self) -> None:
+        # HIP_VISIBLE_DEVICES counts the GPUs ROCR_VISIBLE_DEVICES leaves, not
+        # the order an earlier HIP list made: run the installer again with the
+        # value it offered and the Strix GPU is device 0.
+        cases = (
+            ((110000, 110501), {}, "1"),
+            ((110501, 110000), {"HIP_VISIBLE_DEVICES": "1,0"}, "0"),
+            ((110501, 110000, 110500), {"ROCR_VISIBLE_DEVICES": "1,0,2", "HIP_VISIBLE_DEVICES": "0,1"}, "1"),
+        )
+        for nodes, env, want in cases:
+            with self.subTest(env=env):
+                self.fresh(*nodes)
+                run = self.install(**env)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                offered = re.findall(r"export HIP_VISIBLE_DEVICES=(\d+)", run.stdout)
+                self.assertEqual(offered, [want], run.stdout)
+                again = self.install(**{**env, "HIP_VISIBLE_DEVICES": want})
+                self.assertEqual(again.returncode, 0, again.stderr)
+                self.assertNotIn("HIP device", again.stderr)
 
     def test_topology_nodes_are_read_in_number_order(self) -> None:
         # Node 10 sorts before node 2 as text; HIP numbers the GPUs by node number.

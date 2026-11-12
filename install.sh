@@ -73,30 +73,89 @@ kfd_gpus() {
   done
 }
 
-# The lines of stdin that a ROCR_/HIP_VISIBLE_DEVICES list ($1) leaves, in its
-# order, as the ROCm runtime reads it: indices into the lines, a repeat
-# dropped, an index past the end ending the list. Unset or empty, or a list
-# that names devices by UUID, leaves the lines as they are.
-visible() {
-  lines="$(cat)"
-  list="$(printf '%s' "$1" | tr -d ' ')"
-  case "$list" in
-    "" | *[!0-9,]*) [ -z "$lines" ] || printf '%s\n' "$lines"; return 0 ;;
-  esac
-  count="$(printf '%s\n' "$lines" | grep -c . || true)"
-  kept=","
-  for i in $(printf '%s' "$list" | tr ',' ' '); do
-    [ "$i" -lt "$count" ] || break
-    case "$kept" in *",$i,"*) continue ;; esac
-    kept="$kept$i,"
-    printf '%s\n' "$lines" | sed -n "$((i + 1))p"
-  done
+# A comma list's entries ($1), one per line, as C reads them (ROCr's getline,
+# HIP's do { } while (pos < size)): no entry after a final comma.
+entries() {
+  printf '%s\n' "$1" | sed 's/,$//' | tr ',' '\n'
 }
 
-# The AMD GPUs as HIP numbers them, device 0 first: ROCR_VISIBLE_DEVICES
-# narrows the driver's list, then HIP_VISIBLE_DEVICES (or CUDA_VISIBLE_DEVICES).
-amd_gpus() {
-  kfd_gpus | visible "${ROCR_VISIBLE_DEVICES:-}" | visible "${HIP_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}"
+# C's strtol($1, &end, 0) when it reads all of $1: the value (hex after 0x,
+# octal after 0), or failure.
+strtol0() {
+  s=$1 sign=""
+  case "$s" in -*) sign=- s=${s#-} ;; +*) s=${s#+} ;; esac
+  case "$s" in
+    0[xX]*) body=${s#??} base=16; case "$body" in "" | *[!0-9a-fA-F]*) return 1 ;; esac ;;
+    0?*) body=${s#0} base=8; case "$body" in *[!0-7]*) return 1 ;; esac ;;
+    "" | *[!0-9]*) return 1 ;;
+    *) body=$s base=10 ;;
+  esac
+  # Past any GPU count, and safe from the shell's integer width.
+  if [ "${#body}" -gt 9 ]; then echo "${sign}999999999"; return 0; fi
+  case $base in 16) v=$((0x$body)) ;; 8) v=$((0$body)) ;; *) v=$((body)) ;; esac
+  echo "$sign$v"
+}
+
+# The GPUs (stdin, one per line) that ROCR_VISIBLE_DEVICES leaves, in its order,
+# as ROCr reads it (amd_filter_device.cpp): set but empty leaves none; entries
+# are trimmed and read up to the number of GPUs, each a strtol index, and one
+# that does not parse, is out of range or repeats ends the list. A single "?"
+# when it reaches an entry that names a GPU by UUID (or an empty one).
+rocr_visible() {
+  lines="$(cat)"
+  if [ "${ROCR_VISIBLE_DEVICES+set}" != set ]; then
+    [ -z "$lines" ] || printf '%s\n' "$lines"
+    return 0
+  fi
+  [ -n "$ROCR_VISIBLE_DEVICES" ] || return 0
+  count="$(printf '%s\n' "$lines" | grep -c . || true)"
+  entries "$ROCR_VISIBLE_DEVICES" | {
+    out="" seen="," n=0
+    while IFS= read -r entry; do
+      [ "$n" -lt "$count" ] || break
+      n=$((n + 1))
+      entry="$(printf '%s' "$entry" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      case "$entry" in "" | [Gg]*) echo "?"; exit 0 ;; esac
+      i="$(strtol0 "$entry")" || break
+      { [ "$i" -ge 0 ] && [ "$i" -lt "$count" ]; } || break
+      case "$seen" in *",$i,"*) break ;; esac
+      seen="$seen$i,"
+      out="$out$(printf '%s\n' "$lines" | sed -n "$((i + 1))p")
+"
+    done
+    printf '%s' "$out"
+  }
+}
+
+# The GPUs (stdin, as rocr_visible leaves them) that HIP's own list leaves, as
+# "index gpu" lines in HIP's order, where index is the number HIP_VISIBLE_DEVICES
+# names that GPU by. HIP reads HIP_VISIBLE_DEVICES, or CUDA_VISIBLE_DEVICES when
+# that is empty (rocdevice.cpp): only plain decimal entries count, a repeat is
+# skipped, and any other entry ends the list. A single "?" when the order is
+# unknown: ROCr's list was, or this one reaches an entry naming a GPU by UUID.
+hip_visible() {
+  lines="$(cat)"
+  if [ "$lines" = "?" ]; then echo "?"; return 0; fi
+  list="${HIP_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}"
+  if [ -z "$list" ]; then
+    [ -z "$lines" ] || printf '%s\n' "$lines" | awk '{ print NR - 1, $0 }'
+    return 0
+  fi
+  count="$(printf '%s\n' "$lines" | grep -c . || true)"
+  entries "$list" | {
+    out="" seen=","
+    while IFS= read -r entry; do
+      case "$entry" in *GPU-*) echo "?"; exit 0 ;; esac
+      case "$entry" in 0 | [1-9] | [1-9]*[0-9]) ;; *) break ;; esac
+      case "$entry" in *[!0-9]*) break ;; esac
+      { [ "${#entry}" -le 9 ] && [ "$entry" -lt "$count" ]; } || break
+      case "$seen" in *",$entry,"*) continue ;; esac
+      seen="$seen$entry,"
+      out="$out$entry $(printf '%s\n' "$lines" | sed -n "$((entry + 1))p")
+"
+    done
+    printf '%s' "$out"
+  }
 }
 
 os="$(uname -s)"
@@ -115,22 +174,43 @@ case "$os $arch" in
     # The x86_64 bundle is ROCm-only, built for these two chips. The engine
     # runs on HIP device 0, so that is the GPU that decides; a Strix GPU behind
     # another one is installed for, with how to make it device 0.
-    gpus="$(amd_gpus)"
-    first="$(printf '%s\n' "$gpus" | sed -n '1p')"
-    gpu="" device=0
-    for g in $gpus; do
-      case "$g" in gfx1151 | gfx1150) gpu="$g"; break ;; esac
-      device=$((device + 1))
-    done
-    if [ -z "$gpu" ]; then
-      [ -n "$first" ] || err "BaseRT on Linux/x86_64 needs an AMD Strix Halo (gfx1151) or Strix Point (gfx1150) GPU with the amdgpu driver (none detected)."
-      err "BaseRT on Linux/x86_64 runs on AMD Strix Halo (gfx1151) and Strix Point (gfx1150) GPUs, not $first."
-    fi
-    if [ "$device" -ne 0 ]; then
-      device_hint="export HIP_VISIBLE_DEVICES=$device"
-      warn "the engine runs on HIP device 0, which is $first here; the $gpu is HIP device $device."
-      warn "make it device 0 wherever you run basert:  $device_hint"
-      warn "(where HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set already, list the $gpu first there)"
+    raw="$(kfd_gpus)"
+    seen="$(printf '%s\n' "$raw" | rocr_visible | hip_visible)"
+    gpu="" device=0 selector=0 first=""
+    if [ "$seen" = "?" ]; then
+      # A UUID selector: neither runtime's UUID matching is reproduced here, so
+      # which GPU is device 0 is left to the engine's own check at start.
+      first="$(printf '%s\n' "$raw" | sed -n '1p')"
+      for g in $raw; do
+        case "$g" in gfx1151 | gfx1150) gpu="$g"; break ;; esac
+      done
+      if [ -z "$gpu" ]; then
+        [ -n "$first" ] || err "BaseRT on Linux/x86_64 needs an AMD Strix Halo (gfx1151) or Strix Point (gfx1150) GPU with the amdgpu driver (none detected)."
+        err "BaseRT on Linux/x86_64 runs on AMD Strix Halo (gfx1151) and Strix Point (gfx1150) GPUs, not $first."
+      fi
+      warn "ROCR_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES names a GPU by UUID, so which GPU is HIP device 0"
+      warn "is not checked here; the engine checks that it is a Strix GPU when it starts."
+    else
+      first="$(printf '%s\n' "$seen" | sed -n '1s/^[0-9]* //p')"
+      count="$(printf '%s\n' "$seen" | grep -c . || true)"
+      i=0
+      while [ "$i" -lt "$count" ]; do
+        line="$(printf '%s\n' "$seen" | sed -n "$((i + 1))p")"
+        case "${line#* }" in gfx1151 | gfx1150) gpu="${line#* }" device=$i selector="${line%% *}"; break ;; esac
+        i=$((i + 1))
+      done
+      if [ -z "$gpu" ]; then
+        [ -n "$raw" ] || err "BaseRT on Linux/x86_64 needs an AMD Strix Halo (gfx1151) or Strix Point (gfx1150) GPU with the amdgpu driver (none detected)."
+        [ -n "$first" ] || err "BaseRT on Linux/x86_64 needs an AMD Strix Halo (gfx1151) or Strix Point (gfx1150) GPU, and ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES leave no AMD GPU visible."
+        err "BaseRT on Linux/x86_64 runs on AMD Strix Halo (gfx1151) and Strix Point (gfx1150) GPUs, not $first."
+      fi
+      if [ "$device" -ne 0 ]; then
+        # HIP_VISIBLE_DEVICES counts the GPUs ROCR_VISIBLE_DEVICES leaves, not
+        # the order an earlier HIP list made: offer that number.
+        device_hint="export HIP_VISIBLE_DEVICES=$selector"
+        warn "the engine runs on HIP device 0, which is $first here; the $gpu is HIP device $device."
+        warn "make it device 0 wherever you run basert:  $device_hint"
+      fi
     fi
     if [ ! -r "$sysroot/dev/kfd" ] || [ ! -w "$sysroot/dev/kfd" ]; then
       warn "you cannot open /dev/kfd, so the engine cannot use the GPU: add yourself to the render"
