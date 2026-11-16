@@ -92,6 +92,52 @@ basert sign     <bundle> <secret-key>  # signs an unsigned .base in-place
 basert verify   <bundle> <public-key>  # exits non-zero on tampered file
 ```
 
+Probe tooling for HF checkpoints (per-tensor quant search; everything is
+mapped to the same canonical names `convert` uses — see `basert inventory`):
+
+```
+basert inventory  <hf-dir>                       # canonical tensors + AWQ fold groups (JSON)
+basert awq-search <hf-dir> --awq-profile <sidecar.json> --tensors <a,b;c> --cell 4:64
+basert overlay    <hf-dir> --spec <spec.json> -o <overlay.base> [--awq-profile <sidecar.json>]
+basert merge      <base.base> <overlay.base>... -o <out.base>
+basert fakequant  <hf-dir> --tensor <canonical> --dtype base_q4 --group-size 64 --out <w.f32>
+```
+
+* `overlay` quantizes ONLY the tensors named in the spec — byte-identical
+  to what `convert --profile` produces for them (same header, value hooks,
+  AWQ fold, dtype routing) — plus whatever the AWQ fold rescales (norm
+  gamma, fold consumers, carried f16). No other tensor's bytes are read,
+  so a probe costs well under a second. Spec schema:
+
+  ```json
+  {"tensors": {
+    "layers.3.mlp.down_proj.weight":   {"dtype": "base_q4", "group_size": 64, "scale_dtype": "bf16", "algo": "rtn"},
+    "layers.3.self_attn.q_proj.weight": {"dtype": "base_q4", "group_size": 64, "algo": "awq", "awq_alpha": 0.5},
+    "layers.5.mlp.down_proj.weight":   {"dtype": "base_q3", "group_size": 64, "algo": "gptq", "codes": "/path/codes.safetensors"},
+    "layers.9.input_norm.weight":      {"dtype": "f16"}
+  }}
+  ```
+
+  `dtype` as in profile rules; `group_size` defaults per dtype,
+  `scale_dtype` to `bf16`, `symmetric` to `false`, `algo` to `rtn`.
+  `algo: "awq"` needs `--awq-profile`. `algo: "gptq"` packs externally
+  searched codes verbatim: the safetensors file holds `<T>.codes` (U8,
+  `[N, K]`, values `0..2^bits-1`), `<T>.scales` and `<T>.biases` (F32,
+  `[N, K/group_size]`), laid out exactly like the RTN packer's output
+  (`base_quant::pack_codes`). The header records
+  `provenance.overlay = {spec, fold_modified}`; `quant_profile` is
+  `"overlay"`.
+* `merge` rewrites the base bundle with same-named tensors taken from the
+  overlays (later overlays win), entries and bytes copied verbatim
+  (checksums kept). Header, slots and the mmproj sub-bundle come from the
+  base; an overlay tensor the base lacks is an error. Records
+  `provenance.merge = {base, overlays, replaced}`; a signature on the base
+  is dropped (re-sign the result).
+* `fakequant` writes `unpack(pack(w))` of one canonical tensor as raw
+  little-endian f32 (row-major, no header) after the converter's value
+  hooks, and prints `{"shape": [N, K], "elements": n}` on stdout — the
+  reference for parity-testing an external quantizer replica.
+
 Run `basert --help` for the full flag matrix.
 
 ## Model signing workflow

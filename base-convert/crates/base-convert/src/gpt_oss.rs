@@ -113,6 +113,8 @@ fn entry(name: &str, dtype: TensorDtype, shape: Vec<u64>, len: u64, hot: bool) -
         flags: TensorFlags::empty(),
         checksum_xxh64: None,
         source_ggml_type: None,
+        algo: None,
+        awq_alpha: None,
     }
 }
 

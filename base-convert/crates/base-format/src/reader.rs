@@ -141,7 +141,27 @@ impl BaseReader {
 
     pub fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
         let entry = self.find_entry(name)?;
+        self.entry_bytes(entry)
+    }
 
+    /// `tensor_bytes` for a tensor listed under `header.mmproj.tensors`
+    /// (the multimodal sub-bundle shares the weights blob; its entries use
+    /// the same offset space).
+    pub fn mmproj_tensor_bytes(&self, name: &str) -> Result<&[u8]> {
+        let entry = self
+            .header
+            .mmproj
+            .iter()
+            .flat_map(|m| m.tensors.iter())
+            .find(|t| t.name == name)
+            .ok_or_else(|| Error::TensorNotFound {
+                name: name.to_string(),
+            })?;
+        self.entry_bytes(entry)
+    }
+
+    fn entry_bytes(&self, entry: &crate::header::TensorEntry) -> Result<&[u8]> {
+        let name = entry.name.as_str();
         let abs_start = self.blob_offset + entry.offset;
         let abs_end = abs_start + entry.length;
         let total = self.mmap.len() as u64;

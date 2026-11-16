@@ -71,12 +71,14 @@ Options:
                         throughput).
   --prefill-budget N    Max prompt tokens ingested per engine tick (64-4096). Lower
                         it to trade first-token latency for smoother concurrent decode.
-  --speculate auto      Speculative decoding with what suits the model: the drafter
-                        the catalog pairs with it, pulled on first use (Qwen3.8-27B
-                        and Qwen3.6-35B-A3B: their DFlash2 drafters), else the head
-                        the model's own bundle carries (Gemma 4: Google's MTP head).
-                        A strategy can be named instead: mtp-head, prompt-lookup,
-                        dflash:<path or hub id>, off (superfluid's flag).
+  --speculate auto      Speculative decoding with what suits the model (the default):
+                        the drafter the catalog pairs with it, pulled on first use
+                        (Qwen3.8-27B and Qwen3.6-35B-A3B: their DFlash2 drafters),
+                        else the head the model's own bundle carries (Gemma 4:
+                        Google's MTP head; a catalog file older than the catalog's
+                        head is pulled again), else none. --offline pulls nothing.
+  --speculate off       Decode without drafting. A strategy can be named instead:
+                        mtp-head, prompt-lookup, dflash:<path or hub id>.
   --basert-lib <dir>    The directory holding libbaseRT to serve with (default: beside
                         basert, or ../lib, or $BASERT_LIB)
   --print-command       Print the superfluid command line this start would run, and exit
@@ -418,6 +420,31 @@ pub fn superfluid_args(o: &Options, sessions: &Path) -> Vec<String> {
     a.extend(ALWAYS.map(String::from));
     a.extend(o.passthrough.iter().cloned());
     a
+}
+
+/// Whether a command line names a speculation strategy itself
+/// (`--speculate <value>` or `--speculate=<value>`, `off` included).
+pub(crate) fn speculation_named(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--speculate" || a.starts_with("--speculate="))
+}
+
+/// Speculative decoding is on by default: a `basert serve` start that names
+/// no strategy is the start with `--speculate auto` in front, taken before
+/// anything is resolved, so the default does all a hand-given `auto` does —
+/// the drafter the catalog pairs with the model is pulled when missing
+/// (prepare_speculate_auto), a catalog file older than its MTP head is pulled
+/// again (serve_ready), and superfluid gets `--speculate auto`. A named
+/// strategy, `off` included, is left alone, and so is a line that is not a
+/// start (help, version, a usage error).
+pub(crate) fn with_default_speculation(args: Vec<String>) -> Vec<String> {
+    if speculation_named(&args) || !matches!(parse(&args), Ok(Parsed::Serve(_))) {
+        return args;
+    }
+    ["--speculate".to_string(), "auto".to_string()]
+        .into_iter()
+        .chain(args)
+        .collect()
 }
 
 /// A word on the command line that is a model, not a flag's value: a `.base`
@@ -1031,6 +1058,93 @@ mod tests {
         assert!(
             !joined.contains("--max-context"),
             "auto sizing is superfluid's default: {joined}"
+        );
+    }
+
+    /// Speculative decoding is on by default: a start that names no strategy
+    /// is the start with `--speculate auto` in front, so superfluid gets it;
+    /// one that names any, `off` included and in either form or after `--`,
+    /// hands over its own alone. A line that is not a start is left alone.
+    #[test]
+    fn speculation_is_auto_unless_the_command_line_names_it() {
+        let speculate = |args: &[&str]| -> Vec<String> {
+            let o = match parse(&with_default_speculation(line(args))) {
+                Ok(Parsed::Serve(o)) => *o,
+                other => panic!("{args:?}: {other:?}"),
+            };
+            let a = superfluid_args(&o, Path::new("/s"));
+            a.iter()
+                .enumerate()
+                .filter(|(_, w)| w.starts_with("--speculate"))
+                .map(|(i, w)| match a.get(i + 1) {
+                    Some(v) if w.as_str() == "--speculate" => format!("{w} {v}"),
+                    _ => w.clone(),
+                })
+                .collect()
+        };
+        assert_eq!(speculate(&["m.base"]), ["--speculate auto"]);
+        assert_eq!(
+            speculate(&["m.base", "--model", "n.base", "--max-batch", "4"]),
+            ["--speculate auto"]
+        );
+        assert_eq!(speculate(&["--model-dir", "/m"]), ["--speculate auto"]);
+        assert_eq!(
+            speculate(&["m.base", "--speculate", "off"]),
+            ["--speculate off"]
+        );
+        assert_eq!(
+            speculate(&["m.base", "--speculate=off"]),
+            ["--speculate=off"]
+        );
+        assert_eq!(
+            speculate(&["m.base", "--speculate", "mtp-head"]),
+            ["--speculate mtp-head"]
+        );
+        assert_eq!(
+            speculate(&["m.base", "--speculate", "auto"]),
+            ["--speculate auto"]
+        );
+        assert_eq!(
+            speculate(&["m.base", "--", "--speculate", "off"]),
+            ["--speculate off"]
+        );
+        // The default sits where a named strategy would: after the flags
+        // every start sets, before the user's own.
+        let o = match parse(&with_default_speculation(line(&[
+            "m.base",
+            "--spec-draft-tokens",
+            "7",
+        ]))) {
+            Ok(Parsed::Serve(o)) => *o,
+            other => panic!("{other:?}"),
+        };
+        let joined = superfluid_args(&o, Path::new("/s")).join(" ");
+        assert!(
+            joined.ends_with("--no-http-qos-header --speculate auto --spec-draft-tokens 7"),
+            "{joined}"
+        );
+        // Not a start: help, version, no model, nothing at all.
+        for args in [
+            &["--help"][..],
+            &["m.base", "--version"],
+            &["--port", "9000"],
+            &[],
+        ] {
+            assert_eq!(with_default_speculation(line(args)), line(args), "{args:?}");
+        }
+        // The default reaches what a hand-given `auto` reaches: the model's
+        // own head asked for (serve_ready pulls a stale catalog file again).
+        assert_eq!(
+            crate::hub::mtp_speculation_asked(&with_default_speculation(line(&["m.base"]))),
+            Some("auto")
+        );
+        assert_eq!(
+            crate::hub::mtp_speculation_asked(&with_default_speculation(line(&[
+                "m.base",
+                "--speculate",
+                "off"
+            ]))),
+            None
         );
     }
 

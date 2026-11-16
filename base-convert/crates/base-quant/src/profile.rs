@@ -58,6 +58,38 @@ pub struct RuleEntry {
     /// None = false (asymmetric, MLX-affine default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symmetric: Option<bool>,
+    /// Weight-rounding algorithm for tensors this rule covers.
+    /// `rtn` (default) = plain round-to-nearest. `awq` = activation-
+    /// aware scaling folded into the weights before RTN; applies ONLY
+    /// when the converter also has an AWQ sidecar (`--awq-profile`)
+    /// with this tensor's absmax and the tensor sits in a foldable
+    /// group (see base-convert's fold plan); otherwise falls back to
+    /// RTN with a warning. Unknown values are rejected at load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algo: Option<String>,
+    /// Explicit AWQ alpha in `0..=1` for `algo: "awq"` rules. When set,
+    /// the converter applies `s = absmax^alpha / geomean(absmax^alpha)`
+    /// verbatim and skips the proxy search; all AWQ members of one fold
+    /// group must carry the same value. Absent = search. Rejected at
+    /// load when out of range or given without `algo: "awq"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awq_alpha: Option<f32>,
+}
+
+/// Rounding algorithm resolved from a rule's `algo` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantAlgo {
+    Rtn,
+    Awq,
+}
+
+impl QuantAlgo {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuantAlgo::Rtn => "rtn",
+            QuantAlgo::Awq => "awq",
+        }
+    }
 }
 
 /// Resolved per-tensor quant config — the spec defaults filled in.
@@ -67,6 +99,9 @@ pub struct ResolvedQuant {
     pub group_size: u32,
     pub scale_dtype: ScaleDtype,
     pub symmetric: bool,
+    pub algo: QuantAlgo,
+    /// Explicit AWQ alpha from the rule (None = search).
+    pub awq_alpha: Option<f32>,
 }
 
 impl QuantProfile {
@@ -103,6 +138,21 @@ impl QuantProfile {
             let closes = rule.pattern.matches('}').count();
             if opens != closes {
                 bail!("rule {i}: unbalanced {{}} in pattern {:?}", rule.pattern);
+            }
+            match rule.algo.as_deref() {
+                None | Some("rtn") | Some("awq") => {}
+                Some(other) => bail!(
+                    "rule {i}: unknown algo {other:?} (expected \"rtn\" or \"awq\"; \
+                     gptq is not implemented in the converter)"
+                ),
+            }
+            if let Some(a) = rule.awq_alpha {
+                if !(0.0..=1.0).contains(&a) || !a.is_finite() {
+                    bail!("rule {i}: awq_alpha {a} out of range (expected 0.0..=1.0)");
+                }
+                if rule.algo.as_deref() != Some("awq") {
+                    bail!("rule {i}: awq_alpha given but algo is not \"awq\"");
+                }
             }
             // e4m3 is q8-only per spec.
             if rule.scale_dtype == Some(ScaleDtype::E4m3) && rule.dtype != TensorDtype::BaseQ8 {
@@ -144,11 +194,17 @@ fn resolve_rule(rule: &RuleEntry) -> ResolvedQuant {
         .unwrap_or(1);
     let scale_dtype = rule.scale_dtype.unwrap_or(ScaleDtype::Bf16);
     let symmetric = rule.symmetric.unwrap_or(false);
+    let algo = match rule.algo.as_deref() {
+        Some("awq") => QuantAlgo::Awq,
+        _ => QuantAlgo::Rtn,
+    };
     ResolvedQuant {
         dtype: rule.dtype,
         group_size,
         scale_dtype,
         symmetric,
+        algo,
+        awq_alpha: rule.awq_alpha,
     }
 }
 
@@ -366,6 +422,8 @@ mod tests {
                     group_size: None,
                     scale_dtype: None,
                     symmetric: None,
+                    algo: None,
+                    awq_alpha: None,
                 },
                 RuleEntry {
                     pattern: "**.weight".into(),
@@ -373,6 +431,8 @@ mod tests {
                     group_size: None,
                     scale_dtype: None,
                     symmetric: None,
+                    algo: None,
+                    awq_alpha: None,
                 },
             ],
         };
@@ -390,6 +450,37 @@ mod tests {
     }
 
     #[test]
+    fn awq_alpha_validated() {
+        let mk = |algo: Option<&str>, alpha: Option<f32>| QuantProfile {
+            name: "t".into(),
+            arch: "*".into(),
+            calibration: None,
+            rules: vec![RuleEntry {
+                pattern: "**.weight".into(),
+                dtype: TensorDtype::BaseQ4,
+                group_size: None,
+                scale_dtype: None,
+                symmetric: None,
+                algo: algo.map(String::from),
+                awq_alpha: alpha,
+            }],
+        };
+        mk(Some("awq"), Some(0.35)).validate().unwrap();
+        assert_eq!(
+            mk(Some("awq"), Some(0.35))
+                .resolve("x.weight")
+                .unwrap()
+                .awq_alpha,
+            Some(0.35)
+        );
+        assert!(mk(Some("awq"), Some(1.5)).validate().is_err());
+        assert!(mk(Some("awq"), Some(-0.1)).validate().is_err());
+        assert!(mk(Some("rtn"), Some(0.3)).validate().is_err());
+        assert!(mk(None, Some(0.3)).validate().is_err());
+        assert!(mk(Some("gptq"), None).validate().is_err());
+    }
+
+    #[test]
     fn resolve_fills_canonical_defaults() {
         let profile = QuantProfile {
             name: "t".into(),
@@ -401,6 +492,8 @@ mod tests {
                 group_size: None,
                 scale_dtype: None,
                 symmetric: None,
+                algo: None,
+                awq_alpha: None,
             }],
         };
         let r = profile.resolve("x.weight").unwrap();

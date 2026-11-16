@@ -63,6 +63,8 @@ fn entry(name: &str) -> TensorEntry {
         flags: TensorFlags::empty(),
         checksum_xxh64: None,
         source_ggml_type: None,
+        algo: None,
+        awq_alpha: None,
     }
 }
 

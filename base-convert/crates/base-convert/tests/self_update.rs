@@ -269,6 +269,9 @@ impl Fixture {
             .env("BASERT_RELEASES", &listing)
             .env("BASERT_SUPERFLUID_RELEASES", &sf_listing)
             .env("BASERT_NO_UPDATE_CHECK", "1")
+            // `basert serve` speculates by default, which reads the catalog:
+            // the bundled one, not the Hub's.
+            .env("BASERT_CATALOG_OFFLINE", "1")
             .env_remove("BASERT_LIB")
             .env_remove("BASERT_SUPERFLUID_DIR")
             .env_remove("BASERT_SUPERFLUID_SOURCE")

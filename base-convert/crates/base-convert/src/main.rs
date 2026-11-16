@@ -6,6 +6,7 @@ mod embed;
 mod gpt_oss;
 mod hub;
 mod lora;
+mod overlay;
 mod selfupdate;
 mod serve;
 mod superfluid;
@@ -91,6 +92,23 @@ enum Cmd {
     /// Update basert itself, or switch between the versions installed here.
     #[command(name = "self")]
     SelfUpdate(selfupdate::SelfArgs),
+    /// Quantize exactly the tensors an overlay spec names (plus what an AWQ
+    /// fold modifies) into a small `.base` — the probe-server overlay.
+    Overlay(overlay::OverlayArgs),
+    /// Splice overlay bundles into a base bundle (tensors replaced verbatim).
+    Merge(overlay::MergeArgs),
+    /// Write the dequantized f32 image of one tensor at a quant dtype.
+    Fakequant(overlay::FakequantArgs),
+    /// Run the converter's AWQ alpha search for one or more fold groups of
+    /// an HF checkpoint and report the chosen alpha + objective curve
+    /// (probe/producer parity: autoquant prices AWQ cells at this alpha).
+    AwqSearch(AwqSearchArgs),
+    /// Print the inventory fingerprint of an HF checkpoint — the string an
+    /// AWQ sidecar's `source_fingerprint` must carry.
+    Fingerprint(FingerprintArgs),
+    /// Print the canonical tensor inventory and the AWQ fold groups the
+    /// converter would form for an HF checkpoint (JSON).
+    Inventory(InventoryArgs),
     /// Runtime commands — `serve`, `chat`, `complete`, `bench`, … — handled
     /// by the BaseRT runtime (dispatched in `hub::dispatch_external`).
     #[command(external_subcommand)]
@@ -159,6 +177,12 @@ struct ConvertArgs {
     #[arg(long)]
     awq_profile: Option<PathBuf>,
 
+    /// AWQ alpha search: score an evenly strided subset of N rows per
+    /// member instead of every row (0 = all rows). Same stride autoquant's
+    /// proxy search uses; the fold and the pack always touch every row.
+    #[arg(long, default_value_t = 0)]
+    awq_search_rows: usize,
+
     /// Override the spec-mandated "fp16/bf16/fp32 source only" check
     /// to allow `--profile` on already-quantized inputs (GGUF
     /// Q4_K_M / Q5_0 / Q8_0, MLX 4-bit/8-bit). Quant-from-quant
@@ -199,13 +223,13 @@ struct ConvertArgs {
     /// (the pre-2026-10-19 bundles). The 1/256 fold applies either way.
     #[arg(long, requires = "quantize_drafter")]
     keep_drafter_fc_f16: bool,
-    /// GGUF sources only: copy Q3_K / Q4_K / Q5_K / Q6_K / IQ4_XS and IQ2_XS /
-    /// IQ2_S / IQ3_XXS / IQ3_S super-blocks into the bundle VERBATIM instead
-    /// of dequantizing and re-packing them.
+    /// GGUF sources only: copy Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / IQ4_XS and
+    /// IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S super-blocks into the bundle VERBATIM
+    /// instead of dequantizing and re-packing them.
     ///
     /// This is lossless — the exact block bytes land in the `.base`
     /// weights blob, tagged with `layout = gguf_super`, `group_size =
-    /// 256` and the source `ggml_type` (11/12/13/14/23, 17/18/21/22) so the runtime can
+    /// 256` and the source `ggml_type` (10/11/12/13/14/23, 17/18/21/22) so the runtime can
     /// dispatch a native k-quant kernel. It is therefore NOT
     /// "quant-from-quant" and does not need `--allow-quant-from-quant`;
     /// the canonical-quant spec forbids dequant→requant precisely
@@ -367,6 +391,54 @@ struct KeygenArgs {
     /// Base name for the key files.
     #[arg(long, default_value = "baseRT-key")]
     name: String,
+}
+
+#[derive(Parser, Debug)]
+struct AwqSearchArgs {
+    /// FP HF checkpoint directory (the convert source).
+    input: PathBuf,
+    /// AWQ activation sidecar (what `convert --awq-profile` takes).
+    #[arg(long)]
+    awq_profile: PathBuf,
+    /// Canonical names of the AWQ members to search: `,` separates the
+    /// members of one fold group, `;` separates groups. Every member is
+    /// searched at `--cell`. Members of one group share one alpha.
+    #[arg(long)]
+    tensors: String,
+    /// Quant cell `bits:group_size` (e.g. `4:64`) for every listed tensor.
+    #[arg(long)]
+    cell: String,
+    /// Scale dtype of the cell.
+    #[arg(long, default_value = "bf16")]
+    scale_dtype: String,
+    /// Search the symmetric (no-bias) grid instead of affine.
+    #[arg(long)]
+    symmetric: bool,
+    /// Do not refuse a sidecar whose fingerprint mismatches the checkpoint.
+    #[arg(long)]
+    no_fingerprint_check: bool,
+    /// Score an evenly strided subset of N rows per member (0 = all rows);
+    /// pass the same value to `convert` for probe/producer parity.
+    #[arg(long, default_value_t = 0)]
+    awq_search_rows: usize,
+    /// Write the JSON report here instead of stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+struct FingerprintArgs {
+    /// HF checkpoint directory.
+    input: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+struct InventoryArgs {
+    /// HF checkpoint directory.
+    input: PathBuf,
+    /// Write the JSON here instead of stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -549,6 +621,12 @@ fn main() -> Result<()> {
         Cmd::CatalogManifest(a) => hub::cmd_catalog_manifest(a.bundle),
         Cmd::Superfluid(a) => superfluid::cmd(a),
         Cmd::SelfUpdate(a) => selfupdate::cmd(a),
+        Cmd::Overlay(a) => overlay::cmd_overlay(a),
+        Cmd::Merge(a) => overlay::cmd_merge(a),
+        Cmd::Fakequant(a) => overlay::cmd_fakequant(a),
+        Cmd::AwqSearch(a) => cmd_awq_search(a),
+        Cmd::Fingerprint(a) => cmd_fingerprint(a),
+        Cmd::Inventory(a) => cmd_inventory(a),
         Cmd::External(argv) => hub::dispatch_external(argv),
     }
 }
@@ -772,20 +850,24 @@ fn convert_gguf(
     let has_kquant = gguf.tensors.iter().any(kquant_passes_through);
     if kquant_passthrough && !has_kquant {
         eprintln!(
-            "  warning: --kquant-passthrough set but no Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ2_XS/\
-             IQ2_S/IQ3_XXS/IQ3_S tensors outside the MoE expert stacks in this GGUF; every \
-             tensor takes the normal convert path"
+            "  warning: --kquant-passthrough set but no Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS/\
+             IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S tensors outside the MoE expert stacks (nor Q4_K / \
+             Q5_K / IQ4_XS expert stacks) in this GGUF; every tensor takes the normal convert path"
         );
     }
     let kquant_experts = gguf
         .tensors
         .iter()
-        .filter(|t| is_passthrough_kquant(t.ggml_type) && is_gguf_expert_stack(&t.name))
+        .filter(|t| {
+            is_passthrough_kquant(t.ggml_type)
+                && is_gguf_expert_stack(&t.name)
+                && !expert_stack_kquant(t.ggml_type)
+        })
         .count();
     if kquant_passthrough && kquant_experts > 0 {
         eprintln!(
             "  kquant:  {} MoE expert tensors take the normal convert path \
-             (the expert GEMM has no k-quant kernels)",
+             (the expert GEMM has k-quant kernels for Q4_K, Q5_K and IQ4_XS only)",
             kquant_experts
         );
     }
@@ -793,8 +875,8 @@ fn convert_gguf(
         if let Some(t) = unconvertible_expert_stack(&gguf.tensors) {
             bail!(
                 "MoE expert tensor `{}` is {}: --kquant-passthrough leaves expert stacks \
-                 to the normal convert path (the expert GEMM has no k-quant kernels), \
-                 and that path cannot dequantize {}",
+                 outside Q4_K / Q5_K / IQ4_XS to the normal convert path (the expert GEMM has \
+                 no kernel for the other k-quant types), and that path cannot dequantize {}",
                 t.name,
                 ggml_type_name(t.ggml_type),
                 ggml_type_name(t.ggml_type)
@@ -813,8 +895,8 @@ fn convert_gguf(
     // Tensors headed for k-quant PASSTHROUGH are exempt: they are never
     // dequantized, so there is no compounded error to acknowledge. The
     // guard still fires for anything else quantized in the same file
-    // (a stray Q4_0 / Q8_0 tensor, or a k-quant MoE expert stack, does get
-    // dequant→requant).
+    // (a stray Q4_0 / Q8_0 tensor, or a MoE expert stack in a k-quant type
+    // the expert GEMM has no kernel for, does get dequant→requant).
     if ctx.profile.is_some() && !ctx.allow_quant_from_quant {
         for tensor in gguf.tensors.iter() {
             if kquant_passthrough && kquant_passes_through(tensor) {
@@ -1118,6 +1200,8 @@ fn convert_gguf(
                 flags,
                 checksum_xxh64: None,
                 source_ggml_type: None,
+                algo: None,
+                awq_alpha: None,
             };
             let data: Vec<u8> = f32s.iter().flat_map(|f| f.to_le_bytes()).collect();
             entry.length = data.len() as u64;
@@ -1156,6 +1240,8 @@ fn convert_gguf(
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
                 source_ggml_type: None,
+                algo: None,
+                awq_alpha: None,
             };
             (entry, bytes)
         } else if is_embedding {
@@ -1221,6 +1307,8 @@ fn convert_gguf(
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
                 source_ggml_type: None,
+                algo: None,
+                awq_alpha: None,
             };
             entry.length = data.len() as u64;
             (entry, data)
@@ -1283,6 +1371,8 @@ fn convert_gguf(
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
                 source_ggml_type: None,
+                algo: None,
+                awq_alpha: None,
             };
             let _ = entry.length; // length will be overwritten by writer
             entry.length = data.len() as u64;
@@ -1456,6 +1546,8 @@ fn convert_gguf(
                     flags: TensorFlags::empty(),
                     checksum_xxh64: None,
                     source_ggml_type: None,
+                    algo: None,
+                    awq_alpha: None,
                 };
                 (entry, bytes)
             } else {
@@ -1492,6 +1584,8 @@ fn convert_gguf(
                     flags: TensorFlags::empty(),
                     checksum_xxh64: None,
                     source_ggml_type: None,
+                    algo: None,
+                    awq_alpha: None,
                 };
                 entry.length = data.len() as u64;
                 (entry, data)
@@ -1627,7 +1721,8 @@ fn is_passthrough_kquant(t: base_readers::gguf::GgmlType) -> bool {
     use base_readers::gguf::GgmlType;
     matches!(
         t,
-        GgmlType::Q3K
+        GgmlType::Q2K
+            | GgmlType::Q3K
             | GgmlType::Q4K
             | GgmlType::Q5K
             | GgmlType::Q6K
@@ -1644,9 +1739,21 @@ fn is_gguf_expert_stack(name: &str) -> bool {
     name.contains("_exps")
 }
 
+/// The GGUF super-block types the engine's MoE expert class dispatches
+/// (its `dt_is_moe_kquant`: the expert GEMV `moe_expert_gemm_<type>` and the
+/// bucketed expert GEMM `moe_simd_gemm_<type>` exist for Q4_K, Q5_K and
+/// IQ4_XS, Metal). An expert stack passes through, or packs from autoquant's
+/// blocks (`overlay::emit_kquant_blocks`), only in these; the other types
+/// have dense kernels only. Keep in step with the engine's list.
+pub(crate) fn expert_stack_kquant(t: base_readers::gguf::GgmlType) -> bool {
+    use base_readers::gguf::GgmlType;
+    matches!(t, GgmlType::Q4K | GgmlType::Q5K | GgmlType::Iq4Xs)
+}
+
 /// The first expert stack in a type `--kquant-passthrough` copies but
-/// `dequant_to_f32` cannot read (the grid i-quants). Expert stacks never pass
-/// through, so such a tensor has no way into the bundle.
+/// `dequant_to_f32` cannot read (the grid i-quants). Expert stacks pass
+/// through only as Q4_K / Q5_K / IQ4_XS, so such a tensor has no way into
+/// the bundle.
 fn unconvertible_expert_stack(
     tensors: &[base_readers::gguf::TensorInfo],
 ) -> Option<&base_readers::gguf::TensorInfo> {
@@ -1660,12 +1767,14 @@ fn unconvertible_expert_stack(
     })
 }
 
-/// Whether `--kquant-passthrough` copies this tensor verbatim. Expert
-/// stacks never do: the MoE expert GEMM has no kernel for any GGUF
-/// super-block dtype, so a copied stack would convert and then abort at
-/// the first expert dispatch. They take the normal convert path instead.
+/// Whether `--kquant-passthrough` copies this tensor verbatim. An expert
+/// stack does only in the types the MoE expert GEMM dispatches
+/// (`expert_stack_kquant`: Q4_K, Q5_K, IQ4_XS); in any other super-block type a
+/// copied stack would convert and then abort at the first expert dispatch,
+/// so those take the normal convert path instead.
 fn kquant_passes_through(t: &base_readers::gguf::TensorInfo) -> bool {
-    is_passthrough_kquant(t.ggml_type) && !is_gguf_expert_stack(&t.name)
+    is_passthrough_kquant(t.ggml_type)
+        && (!is_gguf_expert_stack(&t.name) || expert_stack_kquant(t.ggml_type))
 }
 
 /// The declared `.base` shape of a GGUF tensor: its `ne` reversed. GGUF
@@ -1688,15 +1797,17 @@ fn base_shape(info: &base_readers::gguf::TensorInfo) -> Vec<u64> {
 /// that ignores `source_ggml_type` still sizes the tensor correctly,
 /// while the runtime's `BaseWeightStore::get_dtype` short-circuits on
 /// `source_ggml_type` and dispatches the native GGUF kernel.
-fn kquant_passthrough_entry(
-    info: &base_readers::gguf::TensorInfo,
-    bytes: &[u8],
-    canonical: String,
-) -> (base_format::TensorEntry, Vec<u8>) {
-    use base_format::{ComputeRegion, Layout, TensorDtype, TensorFlags};
+/// The bundle dtype a passed-through GGUF super-block type is filed under
+/// (the base_qN that sizes it from below) and the ggml code the entry
+/// records. None for a type `--kquant-passthrough` does not copy.
+fn kquant_passthrough_dtype(
+    ty: base_readers::gguf::GgmlType,
+) -> Option<(base_format::TensorDtype, u32)> {
+    use base_format::TensorDtype;
     use base_readers::gguf::GgmlType;
-
-    let (dtype, ggml_code) = match info.ggml_type {
+    Some(match ty {
+        // 2.625 bits per element: base_q2 sizes it from below.
+        GgmlType::Q2K => (TensorDtype::BaseQ2, 10u32),
         // 3.4375 bits per element: base_q3 sizes it from below.
         GgmlType::Q3K => (TensorDtype::BaseQ3, 11u32),
         GgmlType::Q4K => (TensorDtype::BaseQ4, 12u32),
@@ -1710,9 +1821,20 @@ fn kquant_passthrough_entry(
         GgmlType::Iq2S => (TensorDtype::BaseQ2, 22u32),
         GgmlType::Iq3Xxs => (TensorDtype::BaseQ3, 18u32),
         GgmlType::Iq3S => (TensorDtype::BaseQ3, 21u32),
-        // Unreachable: the caller gates on the same types.
-        other => unreachable!("kquant passthrough called with {other:?}"),
-    };
+        _ => return None,
+    })
+}
+
+fn kquant_passthrough_entry(
+    info: &base_readers::gguf::TensorInfo,
+    bytes: &[u8],
+    canonical: String,
+) -> (base_format::TensorEntry, Vec<u8>) {
+    use base_format::{ComputeRegion, Layout, TensorFlags};
+
+    // Unreachable: the callers gate on `is_passthrough_kquant`.
+    let (dtype, ggml_code) = kquant_passthrough_dtype(info.ggml_type)
+        .unwrap_or_else(|| unreachable!("kquant passthrough called with {:?}", info.ggml_type));
     // Same role-based routing the re-quantizing path uses: the
     // embed/lm_head pair stays hot in the GPU region, bulk layer weights
     // go warm to the accelerator region.
@@ -1746,6 +1868,8 @@ fn kquant_passthrough_entry(
         flags: TensorFlags::empty(),
         checksum_xxh64: None,
         source_ggml_type: Some(ggml_code),
+        algo: None,
+        awq_alpha: None,
     };
     (entry, data)
 }
@@ -1884,6 +2008,15 @@ fn convert_hf(input: &std::path::Path, output: &std::path::Path, ctx: &QuantCont
     // primary eos first; append any extra ids from generation_config.json.
     let mut config = config;
     apply_generation_config(input, &mut config);
+
+    if let Some(awq) = ctx.awq_profile.as_ref() {
+        if !ctx.awq_skip_fingerprint {
+            let fp = hf_inventory_fingerprint(&hf);
+            awq.check_fingerprint(&fp)
+                .context("AWQ sidecar does not belong to this checkpoint")?;
+        }
+    }
+
     let provider = HfTensorProvider { hf: &hf };
     let mmproj_cfg = mmproj_config_from_hf(&hf);
     let config_for_permute = config.clone();
@@ -2259,6 +2392,8 @@ fn convert_whisper(
                     flags: TensorFlags::empty(),
                     checksum_xxh64: None,
                     source_ggml_type: None,
+                    algo: None,
+                    awq_alpha: None,
                 };
                 (entry, data)
             } else {
@@ -2289,6 +2424,8 @@ fn convert_whisper(
                     flags: TensorFlags::empty(),
                     checksum_xxh64: None,
                     source_ggml_type: None,
+                    algo: None,
+                    awq_alpha: None,
                 };
                 (entry, bytes)
             };
@@ -2983,6 +3120,28 @@ trait TensorProvider {
     fn packed_nvfp4(&self, _name: &str) -> Result<Option<base_quant::Packed>> {
         Ok(None)
     }
+    /// The tensor's own f16/bf16 bytes when the source holds it plainly
+    /// (no dequant, stacking or other rewrite): the AWQ alpha search
+    /// reads rows straight off the shard's mmap instead of an f32 copy
+    /// of the matrix. None → callers fall back to `to_f32`.
+    fn raw_rows(&self, _name: &str) -> Option<base_awq::MemberData<'_>> {
+        None
+    }
+}
+
+/// `raw_rows` for a plain (non-MLX-packed) safetensors tensor.
+fn hf_raw_rows<'a>(
+    hf: &'a base_readers::hf::HfDir,
+    name: &str,
+) -> Option<base_awq::MemberData<'a>> {
+    use base_readers::safetensors::StDtype;
+    let info = hf.tensor_info(name)?;
+    let bytes = hf.tensor_bytes(name)?;
+    match info.dtype {
+        StDtype::Bf16 => Some(base_awq::MemberData::Bf16(bytes)),
+        StDtype::F16 => Some(base_awq::MemberData::F16(bytes)),
+        _ => None,
+    }
 }
 
 struct HfTensorProvider<'a> {
@@ -3096,6 +3255,9 @@ impl<'a> TensorProvider for HfTensorProvider<'a> {
             scale_dtype: Some(base_format::ScaleDtype::E4m3),
         }))
     }
+    fn raw_rows(&self, name: &str) -> Option<base_awq::MemberData<'_>> {
+        hf_raw_rows(self.hf, name)
+    }
 }
 
 struct MlxTensorProvider<'a> {
@@ -3141,6 +3303,12 @@ impl<'a> TensorProvider for MlxTensorProvider<'a> {
     }
     fn source_is_quantized(&self, name: &str) -> bool {
         self.mlx.unpacked_shape(name).is_some()
+    }
+    fn raw_rows(&self, name: &str) -> Option<base_awq::MemberData<'_>> {
+        if self.mlx.unpacked_shape(name).is_some() {
+            return None; // MLX-packed: only the dequant path knows its layout
+        }
+        hf_raw_rows(&self.mlx.hf, name)
     }
 }
 
@@ -3241,6 +3409,12 @@ impl TensorProvider for StackingProvider<'_> {
                 Ok(out)
             }
             None => self.inner.to_f32(name),
+        }
+    }
+    fn raw_rows(&self, name: &str) -> Option<base_awq::MemberData<'_>> {
+        match self.stacks.get(name) {
+            Some(_) => None, // a stacked virtual tensor has no single byte range
+            None => self.inner.raw_rows(name),
         }
     }
     fn packed_base_q4(&self, name: &str, group_size: u32) -> Result<Option<base_quant::Packed>> {
@@ -3448,6 +3622,27 @@ impl TensorProvider for SplittingProvider<'_> {
                 Ok(data[start..end].to_vec())
             }
             None => self.inner.to_f32(name),
+        }
+    }
+    fn raw_rows(&self, name: &str) -> Option<base_awq::MemberData<'_>> {
+        use base_awq::MemberData;
+        match self.splits.get(name) {
+            Some(spec) => {
+                // a row slice of the fused source is a contiguous byte range
+                let full = self.inner.source_shape(&spec.src).ok()?;
+                if full.len() != 2 {
+                    return None;
+                }
+                let in_dim = full[1] as usize;
+                let start = spec.row_off as usize * in_dim;
+                let end = (spec.row_off + spec.row_cnt) as usize * in_dim;
+                Some(match self.inner.raw_rows(&spec.src)? {
+                    MemberData::F32(w) => MemberData::F32(&w[start..end]),
+                    MemberData::F16(b) => MemberData::F16(&b[2 * start..2 * end]),
+                    MemberData::Bf16(b) => MemberData::Bf16(&b[2 * start..2 * end]),
+                })
+            }
+            None => self.inner.raw_rows(name),
         }
     }
     fn packed_base_q4(&self, name: &str, group_size: u32) -> Result<Option<base_quant::Packed>> {
@@ -3779,6 +3974,13 @@ impl TensorProvider for FcSplitProvider<'_> {
             None => self.inner.source_is_quantized(name),
         }
     }
+    fn raw_rows(&self, name: &str) -> Option<base_awq::MemberData<'_>> {
+        // k_b/v_b are per-head re-cuts of kv_b_proj, not a byte range of it.
+        if self.splits.contains_key(name) {
+            return None;
+        }
+        self.inner.raw_rows(name)
+    }
 }
 
 /// Tensors the runtime reads at f16 rather than through a quant GEMM
@@ -4060,6 +4262,12 @@ fn convert_generic(
             eprintln!("  mtp:     --speculator-lm-head: no lm_head source found, head keeps the shared one");
         }
     }
+    if ctx.overlay.is_some() {
+        // An overlay holds main-list tensors only: no mmproj tower, no
+        // speculator sub-bundle (both come from the base bundle at merge).
+        mmproj_mapped.clear();
+        speculator_mapped.clear();
+    }
     eprintln!(
         "  mapped:  {} tensors kept, {} mmproj, {} speculator, {} dropped",
         mapped.len(),
@@ -4233,6 +4441,34 @@ fn convert_generic(
         }
     }
 
+    // AWQ fold plan (empty without --awq-profile). Must be built before
+    // any tensor is packed: a group's scale is shared by all its members
+    // and its inverse lands on a different tensor (norm / up_proj).
+    if ctx.awq_profile.is_some() && mirror {
+        bail!("--awq-profile is not supported with a source-quantized (mirror) input: transplanted tensors cannot be re-scaled");
+    }
+    let fold = build_awq_fold_plan(ctx, &mapped, provider, &config, canonical_arch)?;
+    // The fold plan is the only place AWQ is applied now (no per-tensor
+    // rotation in the packer): count the folded groups so the post-convert
+    // "AWQ matched zero tensors" diagnostic reflects what actually happened.
+    ctx.awq_applied
+        .fetch_add(fold.alpha.len(), std::sync::atomic::Ordering::Relaxed);
+    // `basert overlay`: the tensors this conversion emits — the spec's plus
+    // what the fold modified (carried through the catch-all so the bundle
+    // stays exact); everything else is skipped before its bytes are read.
+    let overlay_keep = match &ctx.overlay {
+        Some(plan) => Some(overlay::overlay_keep_set(plan, &mapped, &fold)?),
+        None => None,
+    };
+    if let Some((keep, fold_modified)) = &overlay_keep {
+        eprintln!(
+            "  overlay: {} tensors ({} from the spec, {} carried for the fold)",
+            keep.len(),
+            keep.len() - fold_modified.len(),
+            fold_modified.len()
+        );
+    }
+
     // 64 MiB header reserve in direct-write mode: ~2k tensor entries at
     // ~400 B JSON each is well under 8 MiB even for GLM 5.2's 79-layer MoE;
     // the padding cost is invisible against a 400+ GB bundle.
@@ -4320,6 +4556,17 @@ fn convert_generic(
         // and `fc.*` taps, which the head has none of).
         let mtp_sidecar_head =
             base_arch::dflash::is_mtp_sidecar_arch(canonical_arch) && canonical == "output.weight";
+        if let Some((keep, _)) = &overlay_keep {
+            if !keep.contains(canonical) {
+                pb.inc(1);
+                continue; // never reads the bytes
+            }
+        }
+        // --quantize-drafter: the drafter's transformer layers follow
+        // --target; everything else in the sidecar (fc taps, norms, heads,
+        // d2t) stays f16.
+        // DFlash 2's conv `base_kernel` ([2, K, D]) is read as raw halves,
+        // not a projection — it stays f16 (its kernel_projection quantizes).
         let drafter_f16 = is_drafter_arch
             && !(ctx.quantize_drafter && mtp_sidecar_head)
             && drafter_tensor_stays_f16(ctx.quantize_drafter, ctx.keep_drafter_fc_f16, canonical);
@@ -4356,6 +4603,52 @@ fn convert_generic(
         }
         let shape = shape;
         let ndims = shape.len();
+
+        // Overlay gptq / k-quant / dense-values entry: producer codes packed
+        // verbatim, GGUF super-blocks or given halves copied verbatim; the
+        // f32 path below (and its dtype policy) is not consulted.
+        if let Some(e) = ctx
+            .overlay
+            .as_ref()
+            .and_then(|p| p.entry(canonical))
+            .filter(|e| e.is_prepacked())
+        {
+            let (entry, data) =
+                ctx.overlay
+                    .as_ref()
+                    .unwrap()
+                    .prepacked_payload(e, canonical, shape.clone())?;
+            let (tag, transform) = if e.kquant.is_some() {
+                ("kquant  ", "kquant_blocks")
+            } else if e.values.is_some() {
+                ("values  ", "values")
+            } else {
+                ("gptq    ", "gptq_codes")
+            };
+            eprintln!(
+                "  {tag}  {canonical}  {:?} gs={}{}",
+                entry.dtype,
+                entry
+                    .group_size
+                    .map(|g| g.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                entry
+                    .source_ggml_type
+                    .map(|c| format!(" ggml_type={c}"))
+                    .unwrap_or_default()
+            );
+            writer.add_tensor(TensorPayload { entry, data });
+            prov_tensors.insert(
+                canonical.clone(),
+                base_format::TensorProvenance {
+                    src: vec![src_name.clone()],
+                    transform: Some(transform.to_string()),
+                    ..Default::default()
+                },
+            );
+            pb.inc(1);
+            continue;
+        }
 
         let is_ssm_a = canonical == "ssm.a_log"
             || canonical.ends_with(".ssm.a_log")
@@ -4447,6 +4740,10 @@ fn convert_generic(
                 .with_context(|| format!("reading {src_name}"))?
         };
 
+        // Transforms main's provenance record cannot re-derive from the
+        // canonical name alone (value_transform labels are derived there).
+        let mut prov_transform: Option<&str> = None;
+
         // Per-arch hook: bake the +1 unit-offset into Gemma 3's
         // zero-centered RMSNorm gamma so the runtime can use the plain
         // `rmsnorm(x) * weight` kernel and still produce
@@ -4499,13 +4796,34 @@ fn convert_generic(
                         *v = (*v as f64 * inv) as f32;
                     }
                 }
+                prov_transform = Some("row_rms_norm");
             }
+        }
+
+        // ── AWQ fold (exact in FP; see FoldPlan) ─────────────────────
+        if shape.len() == 1 {
+            if let Some(inv) = fold.gamma_scale.get(canonical.as_str()) {
+                base_awq::scale_vec_in_place(&mut f32s, inv);
+            }
+        } else if shape.len() == 2 {
+            let k = shape[1] as usize;
+            if let Some(r) = fold.row_scale.get(canonical.as_str()) {
+                base_awq::scale_rows_in_place(&mut f32s, k, r);
+            }
+            if let Some(sc) = fold.col_scale.get(canonical.as_str()) {
+                base_awq::scale_columns_in_place(&mut f32s, k, sc);
+            }
+        } else if shape.len() == 3 {
+            // fused MoE experts [E, N, K], flat [E·N, K]: rows carry one
+            // factor per (expert, row); columns either one shared `[K]`
+            // vector (`moe`) or one per expert `[E·K]` (`moe_down`)
+            apply_expert_fold(&mut f32s, &shape, &fold, canonical)?;
         }
 
         let f32s_for = || -> &[f32] { &f32s };
         let transplanted = passthrough.is_some();
 
-        let (entry, data) = if is_ssm_sensitive || is_sidecar {
+        let (mut entry, data) = if is_ssm_sensitive || is_sidecar {
             let mut flags = TensorFlags::empty();
             if is_ssm_a {
                 flags |= TensorFlags::SSM_A_MATRIX;
@@ -4531,40 +4849,47 @@ fn convert_generic(
                 flags,
                 checksum_xxh64: None,
                 source_ggml_type: None,
+                algo: None,
+                awq_alpha: None,
             };
             let data: Vec<u8> = f32s_for().iter().flat_map(|f| f.to_le_bytes()).collect();
             entry.length = data.len() as u64;
             (entry, data)
         } else if is_norm_like || force_f16 {
             // 1-D norms (and biases caught by the same shape check) are
-            // always emitted at f16. A profile's catch-all `**.weight`
-            // rule typically targets a quant bit-width; quantizing a
+            // emitted at f16. A profile's catch-all `**.weight` rule
+            // typically targets a quant bit-width; quantizing a
             // per-channel norm-gain wrecks the model. Override the
             // profile here so a profile that omits explicit norm
             // patterns still produces a working bundle. GLM k_b/v_b and
             // router tensors also route here via force_f16.
             //
-            // Under the mirror policy, f16 must also represent the
-            // source's values losslessly — an f32 source (Nemotron's
-            // `e_score_correction_bias`) whose values don't round-trip
-            // is widened to f32 instead of silently rounded.
-            let (bytes, dtype) = if !force_f16 && src_unquantized && !f16_lossless(f32s_for()) {
-                (
-                    f32s_for()
-                        .iter()
-                        .flat_map(|f| f.to_le_bytes())
-                        .collect::<Vec<u8>>(),
-                    TensorDtype::F32,
-                )
-            } else {
-                (
-                    f32s_for()
-                        .iter()
-                        .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
-                        .collect::<Vec<u8>>(),
-                    TensorDtype::F16,
-                )
-            };
+            // f16 must represent the source's values losslessly under the
+            // mirror policy (an f32 source like Nemotron's
+            // `e_score_correction_bias`) and under the HF lossless carry
+            // (`--target bf16`, no profile, non-mirror: a +1-shifted bf16
+            // norm gain carries more mantissa than f16 holds). Such tensors
+            // widen to f32 instead of being silently rounded; they are tiny.
+            let carry_lossless =
+                matches!(target, TargetScheme::Bf16) && ctx.profile.is_none() && !mirror;
+            let (bytes, dtype) =
+                if !force_f16 && (src_unquantized || carry_lossless) && !f16_lossless(f32s_for()) {
+                    (
+                        f32s_for()
+                            .iter()
+                            .flat_map(|f| f.to_le_bytes())
+                            .collect::<Vec<u8>>(),
+                        TensorDtype::F32,
+                    )
+                } else {
+                    (
+                        f32s_for()
+                            .iter()
+                            .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
+                            .collect::<Vec<u8>>(),
+                        TensorDtype::F16,
+                    )
+                };
             let entry = base_format::TensorEntry {
                 name: canonical.clone(),
                 dtype,
@@ -4586,6 +4911,8 @@ fn convert_generic(
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
                 source_ggml_type: None,
+                algo: None,
+                awq_alpha: None,
             };
             (entry, bytes)
         } else if src_unquantized {
@@ -4651,6 +4978,8 @@ fn convert_generic(
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
                 source_ggml_type: None,
+                algo: None,
+                awq_alpha: None,
             };
             (entry, bytes)
         } else if is_embedding {
@@ -4714,6 +5043,8 @@ fn convert_generic(
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
                 source_ggml_type: None,
+                algo: None,
+                awq_alpha: None,
             };
             entry.length = data.len() as u64;
             (entry, data)
@@ -4778,10 +5109,28 @@ fn convert_generic(
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
                 source_ggml_type: None,
+                algo: None,
+                awq_alpha: None,
             };
             entry.length = data.len() as u64;
             (entry, data)
         };
+
+        if ctx.profile.is_some()
+            && matches!(
+                entry.dtype,
+                TensorDtype::BaseQ2
+                    | TensorDtype::BaseQ3
+                    | TensorDtype::BaseQ4
+                    | TensorDtype::BaseQ5
+                    | TensorDtype::BaseQ6
+                    | TensorDtype::BaseQ8
+            )
+        {
+            let a = fold.alpha.get(canonical.as_str()).copied();
+            entry.algo = Some(if a.is_some() { "awq" } else { "rtn" }.to_string());
+            entry.awq_alpha = a;
+        }
 
         if is_spec {
             writer.add_speculator_tensor(TensorPayload { entry, data });
@@ -4795,7 +5144,9 @@ fn convert_generic(
         let mut rec = base_format::TensorProvenance {
             transplanted,
             carried: src_unquantized,
-            transform: value_transform(canonical).map(|vt| vt_label(vt).to_string()),
+            transform: value_transform(canonical)
+                .map(|vt| vt_label(vt).to_string())
+                .or(prov_transform.map(str::to_string)),
             permuted: ndims >= 2 && rope_permute(canonical).is_some(),
             ..Default::default()
         };
@@ -4860,6 +5211,8 @@ fn convert_generic(
             flags: TensorFlags::empty(),
             checksum_xxh64: None,
             source_ggml_type: None,
+            algo: None,
+            awq_alpha: None,
         };
         writer.add_speculator_tensor(TensorPayload { entry, data });
         eprintln!(
@@ -4869,6 +5222,27 @@ fn convert_generic(
                 .map(|k| format!(", default K {k}"))
                 .unwrap_or_default()
         );
+    }
+    if !fold.is_empty() {
+        let sidecar = ctx
+            .awq_profile
+            .as_ref()
+            .expect("fold plan implies a sidecar");
+        writer.set_calibration(base_format::CalibrationInfo {
+            mode: "awq".to_string(),
+            calib_tokens: sidecar.calib_tokens as u32,
+            per_layer_alpha: fold
+                .alpha
+                .iter()
+                .map(|(k, v)| (k.clone(), vec![*v]))
+                .collect(),
+            dataset: ctx
+                .profile
+                .as_ref()
+                .and_then(|p| p.calibration.as_ref())
+                .map(|c| c.dataset.clone()),
+            source_fingerprint: sidecar.source_fingerprint.clone(),
+        });
     }
     if n_passthrough > 0 || n_carried > 0 {
         eprintln!(
@@ -4906,6 +5280,12 @@ fn convert_generic(
         mmproj: real_sources(&mmproj_mapped),
         speculator: real_sources(&speculator_mapped),
         tensors: prov_tensors,
+        overlay: overlay_keep.as_ref().map(|(_, fold_modified)| {
+            serde_json::json!({
+                "spec": ctx.overlay.as_ref().unwrap().spec_json(),
+                "fold_modified": fold_modified,
+            })
+        }),
     });
 
     // Multimodal towers — preserve their HF names verbatim and route
@@ -4968,6 +5348,8 @@ fn convert_generic(
                 flags: TensorFlags::empty(),
                 checksum_xxh64: None,
                 source_ggml_type: None,
+                algo: None,
+                awq_alpha: None,
             };
             (entry, bytes)
         } else {
@@ -5038,6 +5420,8 @@ fn convert_generic(
                         flags: TensorFlags::empty(),
                         checksum_xxh64: None,
                         source_ggml_type: None,
+                        algo: None,
+                        awq_alpha: None,
                     };
                     entry.length = data.len() as u64;
                     (entry, data)
@@ -5072,6 +5456,8 @@ fn convert_generic(
                         flags: TensorFlags::empty(),
                         checksum_xxh64: None,
                         source_ggml_type: None,
+                        algo: None,
+                        awq_alpha: None,
                     };
                     (entry, bytes)
                 }
@@ -6055,6 +6441,8 @@ fn convert_synthetic_with_ctx(output: &std::path::Path, ctx: &QuantContext) -> R
             flags: TensorFlags::empty(),
             checksum_xxh64: None,
             source_ggml_type: None,
+            algo: None,
+            awq_alpha: None,
         };
         entry.length = data.len() as u64;
         writer.add_tensor(TensorPayload { entry, data });
@@ -6398,6 +6786,8 @@ fn tensor_entry(
         flags: base_format::TensorFlags::empty(),
         checksum_xxh64: None,
         source_ggml_type: None,
+        algo: None,
+        awq_alpha: None,
     }
 }
 
@@ -6413,7 +6803,7 @@ fn pack_for_target(
         TargetScheme::BaseQ5 => Ok((base_quant::base_q5::pack(weights), TensorDtype::BaseQ5)),
         TargetScheme::BaseQ6 => Ok((base_quant::base_q6::pack(weights), TensorDtype::BaseQ6)),
         TargetScheme::BaseQ8 => Ok((base_quant::base_q8::pack(weights), TensorDtype::BaseQ8)),
-        TargetScheme::Bf16 => Ok((pack_bf16(weights), TensorDtype::Bf16)),
+        TargetScheme::Bf16 => Ok(pack_carry(weights)),
         TargetScheme::Mxfp4 => Ok((base_quant::mxfp4::pack(weights), TensorDtype::Mxfp4)),
         TargetScheme::Nvfp4 => Ok((base_quant::nvfp4::pack(weights), TensorDtype::Nvfp4)),
     }
@@ -6479,6 +6869,49 @@ fn pack_bf16(weights: &[f32]) -> base_quant::Packed {
         biases: vec![],
         group_size: 0,
         scale_dtype: None,
+    }
+}
+
+/// Lossless carry for full-precision sources (`--target bf16`): store at
+/// the narrowest dtype that represents every value bit-exactly. f16 is
+/// preferred (zero-copy at load); a bf16 source that doesn't fit f16 is
+/// passed through byte-identically; anything else (f32 sources,
+/// transformed values off both grids) widens to f32. Nothing is ever
+/// rounded at conversion time — the bundle holds the checkpoint's
+/// values exactly. (The Metal runtime still narrows bf16/f32 GEMM
+/// weights to f16 at load; that is engine behavior, visible to and
+/// improvable by engine work, not a conversion loss.)
+fn pack_carry(weights: &[f32]) -> (base_quant::Packed, base_format::TensorDtype) {
+    use base_format::TensorDtype;
+    if f16_lossless(weights) {
+        let bytes: Vec<u8> = weights
+            .iter()
+            .flat_map(|&f| half::f16::from_f32(f).to_le_bytes())
+            .collect();
+        (
+            base_quant::Packed {
+                packed_weights: bytes,
+                scales: vec![],
+                biases: vec![],
+                group_size: 0,
+                scale_dtype: None,
+            },
+            TensorDtype::F16,
+        )
+    } else if bf16_lossless(weights) {
+        (pack_bf16(weights), TensorDtype::Bf16)
+    } else {
+        let bytes: Vec<u8> = weights.iter().flat_map(|f| f.to_le_bytes()).collect();
+        (
+            base_quant::Packed {
+                packed_weights: bytes,
+                scales: vec![],
+                biases: vec![],
+                group_size: 0,
+                scale_dtype: None,
+            },
+            TensorDtype::F32,
+        )
     }
 }
 
@@ -6562,8 +6995,8 @@ struct QuantContext {
     /// vocabulary (`mtp.draft_rank`), and `--mtp-draft-vocab`, its default K.
     mtp_draft_ranking: Option<Vec<u32>>,
     mtp_draft_vocab: Option<u32>,
-    /// Copy GGUF Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S super-blocks
-    /// through verbatim.
+    /// Copy GGUF Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S
+    /// super-blocks through verbatim.
     kquant_passthrough: bool,
     /// Materialize `lm_head.weight` for tied models (`plan_tied_lm_head`);
     /// false under `--no-synth-tied-head`.
@@ -6580,6 +7013,12 @@ struct QuantContext {
     /// Importance-weighted RTN from the awq_profile sidecar — see
     /// `--imatrix`.
     imatrix: bool,
+    /// Accept an AWQ sidecar whose `source_fingerprint` is not this
+    /// checkpoint's (`--no-fingerprint-check`).
+    awq_skip_fingerprint: bool,
+    /// `basert overlay`: convert only the tensors this plan keeps, gptq
+    /// entries from their codes file (see `overlay.rs`).
+    overlay: Option<overlay::OverlayPlan>,
 }
 
 impl QuantContext {
@@ -6628,7 +7067,12 @@ impl QuantContext {
             awq_profile,
             awq_applied: std::sync::atomic::AtomicUsize::new(0),
             awq_shape_skipped: std::sync::atomic::AtomicUsize::new(0),
-            awq_config: base_awq::AwqConfig::default(),
+            awq_config: base_awq::AwqConfig {
+                search_rows: args.awq_search_rows,
+                ..Default::default()
+            },
+            awq_skip_fingerprint: false,
+            overlay: None,
             target: args.target,
             allow_quant_from_quant: args.allow_quant_from_quant,
             q4_passthrough: !args.no_mlx_passthrough,
@@ -6797,58 +7241,1279 @@ impl QuantContext {
             // No stats → plain RTN below (uniform importance).
         }
 
-        // AWQ pre-process: only when sidecar carries an absmax for
-        // this tensor and we know the in_features dim. Never under
-        // --imatrix — rotation requires runtime activation scaling.
-        let weights_for_pack: Vec<f32> = match (
-            if self.imatrix {
-                &None
-            } else {
-                &self.awq_profile
-            },
-            in_features,
-        ) {
-            (Some(awq), Some(in_feat)) => {
-                if let Some(absmax) = awq.absmax(name) {
-                    if absmax.len() == in_feat {
-                        let plan = self.awq_config.search(
-                            weights,
-                            in_feat,
-                            absmax,
-                            bits,
-                            cfg.group_size,
-                            cfg.symmetric,
-                        );
-                        // Rotate weights. The runtime undoes the rotation by
-                        // pre-multiplying activations with `plan.scales`;
-                        // those scales are stored alongside the rotated
-                        // tensor in the `.base` header so the runtime can
-                        // recover the original output.
-                        eprintln!("    awq: {name} α={:.2} mse={:.4e}", plan.alpha, plan.mse);
-                        self.awq_applied
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        base_awq::awq_apply(weights, in_feat, &plan.scales)
-                    } else {
-                        eprintln!(
-                            "    awq: skipping {name} — sidecar absmax len {} != in_features {}",
-                            absmax.len(),
-                            in_feat
-                        );
-                        self.awq_shape_skipped
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        weights.to_vec()
-                    }
-                } else {
-                    // Tensor not in sidecar → plain RTN.
-                    weights.to_vec()
-                }
-            }
-            _ => weights.to_vec(),
-        };
-
-        let packed = base_quant::pack_rtn(&weights_for_pack, cfg);
+        // AWQ (when requested) was already folded into `weights` by the
+        // convert-time fold plan (see `build_awq_fold_plan`): consumer
+        // columns carry `s`, the upstream norm/linear carries `1/s`, so
+        // the packer sees final magnitudes and the runtime applies nothing.
+        let packed = base_quant::pack_rtn(weights, cfg);
         Ok((packed, dtype))
     }
+}
+
+/// Convert-time AWQ fold plan.
+///
+/// AWQ scales a linear's input channels by `s` before rounding so the
+/// grid spends its levels on salient channels; the runtime would have
+/// to multiply activations by `1/s`. baseRT applies nothing at runtime
+/// — instead the inverse is folded into whatever produced the input:
+///
+/// * norm-fed groups: `layers.N.input_norm` → {q,k,v} (full attention)
+///   or {in_proj_qkv, in_proj_z, in_proj_a, in_proj_b} (linear
+///   attention); `layers.N.post_attn_norm` → {gate, up}. One `s` per
+///   group (searched on the AWQ-marked members jointly), every consumer
+///   gets `columns *= s` (quantized or carried — carried members just
+///   compensate, exactly), the norm gets `gamma *= 1/s`. RMSNorm makes
+///   this exact: `rmsnorm(x) * (gamma/s) == (rmsnorm(x) * gamma) / s`.
+/// * `mlp.down_proj`: `s` from its own absmax over the intermediate
+///   channels; `down.columns *= s`, `up.rows *= 1/s`. Exact because
+///   down's input is `silu(gate·x) ⊙ (up·x)`, and row scaling never
+///   changes per-group affine codes along in_features.
+/// * `self_attn.o_proj`: `s` over its input (attention output, one
+///   channel per head×dim); `o.columns *= s`, `v_proj.rows *= 1/s`.
+///   Exact because attention mixes positions, never channels: scaling
+///   v's output channel scales the same channel of every head's output
+///   by the same factor. With GQA one v row feeds every query head of
+///   its group, so `s` is tied across those heads (their absmax merged
+///   by max before the search). An elementwise output gate (Qwen3.5)
+///   commutes with the scaling.
+/// * `lm_head`: `final_norm` → `lm_head`, like a norm-fed group with
+///   one consumer (refused when the embedding is tied or the MTP head
+///   is kept — both share that norm output).
+/// * no fold exists for linear_attn.out_proj (gated-norm input) and
+///   embed_tokens: AWQ requests there fall back to RTN with a warning.
+#[derive(Default)]
+struct FoldPlan {
+    /// canonical name → `s` (apply `columns *= s`)
+    col_scale: std::collections::HashMap<String, Vec<f32>>,
+    /// canonical name → `1/s` (apply `rows *= 1/s`)
+    row_scale: std::collections::HashMap<String, Vec<f32>>,
+    /// canonical 1-D name → `1/s` (apply `vec *= 1/s`): the norm gamma a
+    /// group's consumers follow, and the bias of every projection whose
+    /// rows take `1/s` (up_proj.bias under a down fold, v_proj.bias under
+    /// an o fold, a norm's own bias) — a bias rides its rows' scale, or
+    /// `W_down·s·(W_up·x/s + b)` leaves the bias term multiplied by `s`
+    /// and the full-precision function changes before quantization.
+    gamma_scale: std::collections::HashMap<String, Vec<f32>>,
+    /// tensors that actually got AWQ, with the chosen alpha
+    alpha: std::collections::BTreeMap<String, f32>,
+    /// tensors whose rule asked for AWQ but that were packed RTN
+    fallback: Vec<(String, String)>,
+    /// one report per searched/explicit fold group (what `awq-search` prints)
+    reports: Vec<FoldGroupReport>,
+}
+
+/// What the fold plan decided for one group — the converter's own record
+/// of the search, reported by `basert awq-search` so a prober can price
+/// the AWQ cell at exactly the alpha the producer will apply.
+struct FoldGroupReport {
+    kind: &'static str,
+    layer: usize,
+    /// AWQ-marked, quantized members that were searched
+    members: Vec<String>,
+    /// every tensor whose columns receive `s` (quantized or carried)
+    consumers: Vec<String>,
+    /// where `1/s` goes: the norm (gamma) or up_proj (rows)
+    upstream: String,
+    alpha: f32,
+    /// weighted reconstruction MSE at `alpha` (NaN when explicit)
+    mse: f32,
+    /// `(alpha, weighted mse)` over the grid; empty when explicit
+    curve: Vec<(f32, f32)>,
+    explicit: bool,
+    /// "meansq" (sidecar E[x²]) or "absmax2"
+    weight: &'static str,
+}
+
+impl FoldPlan {
+    fn is_empty(&self) -> bool {
+        self.alpha.is_empty()
+    }
+}
+
+const ATTN_CONSUMERS: [&str; 7] = [
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "linear_attn.in_proj_qkv.weight",
+    "linear_attn.in_proj_z.weight",
+    "linear_attn.in_proj_a.weight",
+    "linear_attn.in_proj_b.weight",
+];
+const MLP_CONSUMERS: [&str; 2] = ["mlp.gate_proj.weight", "mlp.up_proj.weight"];
+/// 2-D tensors in a block that share the norm output's width but do NOT
+/// consume it (their input comes from elsewhere in the block).
+const KNOWN_NON_CONSUMERS: [&str; 4] = [
+    "self_attn.o_proj.weight",
+    "linear_attn.out_proj.weight",
+    "mlp.down_proj.weight",
+    // MoE router (Gemma 4 `router.proj`): reads its own weightless-norm
+    // mix of the residual, never the post-attention norm's output.
+    "mlp.router.weight",
+];
+
+/// Fused 3-D MoE expert tensors (`[E, N, K]`, rows of expert e at
+/// `[e·N, (e+1)·N)` of the flat `[E·N, K]` image the packer sees).
+const MOE_GATE_UP: &str = "ffn_gate_up_exps.weight";
+const MOE_DOWN: &str = "ffn_down_exps.weight";
+/// The norm whose output feeds the routed experts (Gemma 4
+/// `pre_feedforward_layernorm_2`); nothing else consumes it.
+const MOE_NORM: &str = "pre_ffw_norm_2.weight";
+
+/// Archs whose attention applies a weightless per-head RMS norm to V
+/// (Gemma 4): a `1/s` folded into v's rows is normalized away, so the
+/// `o` fold would change the function.
+fn v_is_rms_normed(arch: &str) -> bool {
+    arch == "gemma4"
+}
+
+/// Split `layers.N.rest` → (N, rest).
+fn layer_split(canonical: &str) -> Option<(usize, &str)> {
+    let rest = canonical.strip_prefix("layers.")?;
+    let (idx, tail) = rest.split_once('.')?;
+    Some((idx.parse().ok()?, tail))
+}
+
+/// Build the fold plan: which tensors get AWQ, with which shared scale
+/// vector, and where the inverse goes. Reads the AWQ-marked members'
+/// f32 weights once here (they are read again in the main loop; the
+/// search needs the whole group before any member is packed).
+/// A fold-group member's weights for the alpha search: borrowed from the
+/// source mmap (bf16/f16, no copy) or upcast to f32 when the provider
+/// cannot expose plain bytes.
+enum MemberStore<'a> {
+    Raw(base_awq::MemberData<'a>),
+    Owned(Vec<f32>),
+}
+
+impl MemberStore<'_> {
+    fn data(&self) -> base_awq::MemberData<'_> {
+        match self {
+            MemberStore::Raw(r) => *r,
+            MemberStore::Owned(v) => base_awq::MemberData::F32(v.as_slice()),
+        }
+    }
+}
+
+/// A 1-D companion of a folded tensor takes the fold's `1/s` too: the
+/// `.bias` of a projection whose rows are scaled (y = W x + b becomes
+/// (W/s) x + b/s, so the consumer's `·s` reproduces y exactly) and the
+/// `.bias` of a norm whose gamma is scaled. Qwen2-style attention biases
+/// q/k/v, so an o_proj fold that scaled v's rows alone would change the
+/// full-precision function before quantization. `weight` is the canonical
+/// `.weight` name; its `.bias` sibling is recorded when the checkpoint has
+/// one, and a sibling of the wrong length refuses the fold.
+fn fold_companion_bias(
+    plan: &mut FoldPlan,
+    by_canon: &std::collections::HashMap<&str, (&str, Vec<u64>)>,
+    weight: &str,
+    inverse: &[f32],
+) -> Result<()> {
+    let Some(stem) = weight.strip_suffix(".weight") else {
+        return Ok(());
+    };
+    let bias = format!("{stem}.bias");
+    let Some((_, shape)) = by_canon.get(bias.as_str()) else {
+        return Ok(());
+    };
+    if shape.len() != 1 || shape[0] as usize != inverse.len() {
+        bail!(
+            "AWQ fold: {bias} has shape {shape:?} but the row scale of {weight} has {} entries",
+            inverse.len()
+        );
+    }
+    plan.gamma_scale.insert(bias, inverse.to_vec());
+    Ok(())
+}
+
+/// The AWQ fold on a fused 3-D expert tensor `[E, N, K]` (see
+/// `moe_down_fold` / the `moe` group): `row_scale` holds `E·N` factors,
+/// `col_scale` either `K` (shared by every expert) or `E·K`.
+fn apply_expert_fold(
+    f32s: &mut [f32],
+    shape: &[u64],
+    fold: &FoldPlan,
+    canonical: &str,
+) -> Result<()> {
+    let (e_n, n, k) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
+    if let Some(r) = fold.row_scale.get(canonical) {
+        if r.len() != e_n * n {
+            bail!(
+                "{canonical}: fold row scale has {} factors, want E·N = {}",
+                r.len(),
+                e_n * n
+            );
+        }
+        base_awq::scale_rows_in_place(f32s, k, r);
+    }
+    if let Some(sc) = fold.col_scale.get(canonical) {
+        if sc.len() == k {
+            base_awq::scale_columns_in_place(f32s, k, sc);
+        } else if sc.len() == e_n * k {
+            for (slab, s_e) in f32s.chunks_mut(n * k).zip(sc.chunks(k)) {
+                base_awq::scale_columns_in_place(slab, k, s_e);
+            }
+        } else {
+            bail!(
+                "{canonical}: fold column scale has {} factors, want K = {k} or E·K = {}",
+                sc.len(),
+                e_n * k
+            );
+        }
+    }
+    Ok(())
+}
+
+fn build_awq_fold_plan(
+    ctx: &QuantContext,
+    mapped: &[(String, String)],
+    provider: &dyn TensorProvider,
+    config: &base_arch::ArchConfig,
+    arch: &str,
+) -> Result<FoldPlan> {
+    use base_format::TensorDtype;
+    use base_quant::QuantAlgo;
+    use std::collections::{BTreeMap, HashMap};
+
+    let mut plan = FoldPlan::default();
+    let (Some(profile), Some(sidecar)) = (&ctx.profile, &ctx.awq_profile) else {
+        return Ok(plan);
+    };
+    if ctx.imatrix {
+        // --imatrix fits each group under the sidecar's activation weights
+        // on the ORIGINAL weights; folding s in first would weight the wrong
+        // magnitudes. imatrix keeps its precedence over AWQ.
+        eprintln!("  awq:     --imatrix set — AWQ fold disabled (imatrix takes precedence)");
+        return Ok(plan);
+    }
+
+    // canonical → (source name, shape)
+    let mut by_canon: HashMap<&str, (&str, Vec<u64>)> = HashMap::new();
+    for (src, canon) in mapped {
+        by_canon.insert(canon.as_str(), (src.as_str(), provider.source_shape(src)?));
+    }
+
+    // AWQ-requested quantized 2-D tensors (and fused 3-D MoE experts),
+    // grouped by fold group.
+    // key: (kind, layer) with kind ∈ {attn, mlp, down, o, head, moe, moe_down}
+    let mut groups: BTreeMap<(&'static str, usize), Vec<String>> = BTreeMap::new();
+    for (_, canon) in mapped {
+        let (_, shape) = &by_canon[canon.as_str()];
+        let moe_tail = layer_split(canon).filter(|(_, t)| *t == MOE_GATE_UP || *t == MOE_DOWN);
+        if shape.len() != 2 && !(shape.len() == 3 && moe_tail.is_some()) {
+            continue;
+        }
+        let Some(resolved) = profile.resolve(canon) else {
+            continue;
+        };
+        if resolved.algo != QuantAlgo::Awq {
+            continue;
+        }
+        let quant = matches!(
+            resolved.dtype,
+            TensorDtype::BaseQ2
+                | TensorDtype::BaseQ3
+                | TensorDtype::BaseQ4
+                | TensorDtype::BaseQ5
+                | TensorDtype::BaseQ6
+                | TensorDtype::BaseQ8
+        );
+        if !quant {
+            plan.fallback
+                .push((canon.clone(), "rule dtype is not a canonical quant".into()));
+            continue;
+        }
+        match layer_split(canon) {
+            Some((n, MOE_GATE_UP)) if shape.len() == 3 => {
+                groups.entry(("moe", n)).or_default().push(canon.clone())
+            }
+            Some((n, MOE_DOWN)) if shape.len() == 3 => groups
+                .entry(("moe_down", n))
+                .or_default()
+                .push(canon.clone()),
+            Some((n, tail)) if ATTN_CONSUMERS.contains(&tail) => {
+                groups.entry(("attn", n)).or_default().push(canon.clone())
+            }
+            Some((n, tail)) if MLP_CONSUMERS.contains(&tail) => {
+                groups.entry(("mlp", n)).or_default().push(canon.clone())
+            }
+            Some((n, "mlp.down_proj.weight")) => {
+                groups.entry(("down", n)).or_default().push(canon.clone())
+            }
+            Some((n, "self_attn.o_proj.weight")) => {
+                groups.entry(("o", n)).or_default().push(canon.clone())
+            }
+            None if canon == "lm_head.weight" => {
+                groups.entry(("head", 0)).or_default().push(canon.clone())
+            }
+            _ => plan
+                .fallback
+                .push((canon.clone(), "no fold path for this tensor's input".into())),
+        }
+    }
+    if groups.is_empty() {
+        return Ok(plan);
+    }
+
+    let mut n_groups = 0usize;
+    let mut groups_with_meansq = 0usize;
+    let mut groups_explicit = 0usize;
+    let mut alpha_hist: BTreeMap<String, usize> = BTreeMap::new();
+    let mut disagreements = 0usize;
+    let mut raw_members = 0usize;
+    for ((kind, layer), requested) in &groups {
+        // ── resolve the group's structure ─────────────────────────────
+        if *kind == "moe_down" {
+            moe_down_fold(
+                ctx,
+                &mut plan,
+                *layer,
+                &requested[0],
+                &by_canon,
+                provider,
+                &mut raw_members,
+            )?;
+            if let Some(a) = plan.alpha.get(&requested[0]) {
+                *alpha_hist.entry(format!("{a:.2}")).or_default() += 1;
+                n_groups += 1;
+            }
+            continue;
+        }
+        let (norm_name, consumer_tails): (String, &[&str]) = match *kind {
+            "attn" => (format!("layers.{layer}.input_norm.weight"), &ATTN_CONSUMERS),
+            "mlp" => (
+                format!("layers.{layer}.post_attn_norm.weight"),
+                &MLP_CONSUMERS,
+            ),
+            "moe" => (format!("layers.{layer}.{MOE_NORM}"), &[MOE_GATE_UP]),
+            "head" => ("final_norm.weight".to_string(), &["lm_head.weight"]),
+            _ => (String::new(), &[]),
+        };
+        // GQA tiling of the o_proj fold: o's input channel (h, d) comes
+        // from v row (h / rep, d). `None` for every other kind.
+        let mut o_tile: Option<(usize, usize, usize)> = None; // (heads, kv_heads, head_dim)
+        let refuse = |plan: &mut FoldPlan, why: String| {
+            for c in requested {
+                plan.fallback.push((c.clone(), why.clone()));
+            }
+        };
+        let mut consumers: Vec<String> = Vec::new();
+        let width: usize;
+        if *kind == "down" {
+            let down = &requested[0];
+            let up = format!("layers.{layer}.mlp.up_proj.weight");
+            let Some((_, up_shape)) = by_canon.get(up.as_str()) else {
+                refuse(
+                    &mut plan,
+                    format!("{up} missing; cannot fold 1/s into up rows"),
+                );
+                continue;
+            };
+            let down_shape = &by_canon[down.as_str()].1;
+            width = down_shape[1] as usize;
+            if up_shape.len() != 2 || up_shape[0] as usize != width {
+                refuse(
+                    &mut plan,
+                    format!("{up} shape {up_shape:?} does not feed {down} [.., {width}]"),
+                );
+                continue;
+            }
+        } else if *kind == "o" {
+            let o = &requested[0];
+            let v = format!("layers.{layer}.self_attn.v_proj.weight");
+            if v_is_rms_normed(arch) {
+                refuse(
+                    &mut plan,
+                    format!("{arch} RMS-normalizes V per head (no weight); 1/s in {v}'s rows would be normalized away"),
+                );
+                continue;
+            }
+            let Some((_, v_shape)) = by_canon.get(v.as_str()) else {
+                refuse(
+                    &mut plan,
+                    format!("{v} missing; cannot fold 1/s into v rows"),
+                );
+                continue;
+            };
+            let o_shape = &by_canon[o.as_str()].1;
+            width = o_shape[1] as usize;
+            let heads = config.num_attention_heads as usize;
+            let kv = config.num_kv_heads.max(1) as usize;
+            let hd = if config.head_dim > 0 {
+                config.head_dim as usize
+            } else {
+                width / heads.max(1)
+            };
+            if heads == 0
+                || width != heads * hd
+                || v_shape.len() != 2
+                || v_shape[0] as usize != kv * hd
+                || heads % kv != 0
+            {
+                refuse(
+                    &mut plan,
+                    format!(
+                        "{o} [.., {width}] / {v} {v_shape:?} do not match heads={heads} kv={kv} head_dim={hd}"
+                    ),
+                );
+                continue;
+            }
+            o_tile = Some((heads, kv, hd));
+        } else {
+            let Some((_, norm_shape)) = by_canon.get(norm_name.as_str()) else {
+                refuse(
+                    &mut plan,
+                    format!("{norm_name} missing; cannot fold 1/s into the norm"),
+                );
+                continue;
+            };
+            if norm_shape.len() != 1 {
+                refuse(&mut plan, format!("{norm_name} is not 1-D"));
+                continue;
+            }
+            width = norm_shape[0] as usize;
+            if *kind == "head" && config.tie_word_embeddings {
+                refuse(
+                    &mut plan,
+                    "embedding is tied to lm_head; the final norm cannot carry 1/s".into(),
+                );
+                continue;
+            }
+            let prefix = if *kind == "head" {
+                String::new()
+            } else {
+                format!("layers.{layer}.")
+            };
+            let mut unknown: Vec<String> = Vec::new();
+            if *kind == "moe" {
+                // the routed experts are the norm's only consumer
+                let gu = &requested[0];
+                let gu_shape = &by_canon[gu.as_str()].1;
+                if gu_shape[2] as usize != width {
+                    refuse(
+                        &mut plan,
+                        format!("{gu} {gu_shape:?} does not consume {norm_name} [{width}]"),
+                    );
+                    continue;
+                }
+                consumers.push(gu.clone());
+            }
+            for (canon, (_, shape)) in &by_canon {
+                if *kind == "moe" {
+                    break;
+                }
+                let Some(tail) = canon.strip_prefix(prefix.as_str()) else {
+                    continue;
+                };
+                if shape.len() != 2 || shape[1] as usize != width {
+                    continue;
+                }
+                let in_block = match *kind {
+                    "attn" => tail.starts_with("self_attn.") || tail.starts_with("linear_attn."),
+                    "head" => !tail.starts_with("layers."),
+                    _ => tail.starts_with("mlp."),
+                };
+                if !in_block {
+                    continue;
+                }
+                if consumer_tails.contains(&tail) {
+                    consumers.push(canon.to_string());
+                } else if !KNOWN_NON_CONSUMERS.contains(&tail) && tail != "embed_tokens.weight" {
+                    unknown.push(canon.to_string());
+                }
+            }
+            if !unknown.is_empty() {
+                refuse(
+                    &mut plan,
+                    format!(
+                        "unrecognized tensors sharing {norm_name}'s width: {unknown:?} — refusing the fold"
+                    ),
+                );
+                continue;
+            }
+            consumers.sort();
+        }
+
+        // ── absmax + weights for the AWQ-marked members ───────────────
+        let mut abs_vecs: Vec<&[f32]> = Vec::new();
+        let mut msq_vecs: Vec<&[f32]> = Vec::new();
+        let mut members: Vec<(String, MemberStore, base_quant::ResolvedQuant)> = Vec::new();
+        for canon in requested {
+            let Some(absmax) = sidecar.absmax(canon) else {
+                plan.fallback
+                    .push((canon.clone(), "sidecar has no absmax for it".into()));
+                continue;
+            };
+            if absmax.len() != width {
+                plan.fallback.push((
+                    canon.clone(),
+                    format!("sidecar absmax len {} != in_features {width}", absmax.len()),
+                ));
+                continue;
+            }
+            let resolved = profile.resolve_or_err(canon)?;
+            if width % resolved.group_size as usize != 0 {
+                plan.fallback.push((
+                    canon.clone(),
+                    format!(
+                        "in_features {width} % gs {} != 0 (packs bf16)",
+                        resolved.group_size
+                    ),
+                ));
+                continue;
+            }
+            abs_vecs.push(absmax);
+            if let Some(m) = sidecar.meansq(canon) {
+                if m.len() == width {
+                    msq_vecs.push(m);
+                }
+            }
+            let src = by_canon[canon.as_str()].0;
+            // Search off the source's own bf16/f16 bytes when it holds the
+            // tensor plainly; an f32 copy (2× the bf16 bytes) only for
+            // stacked/dequantized sources.
+            let store = match provider.raw_rows(src) {
+                Some(raw) => {
+                    raw_members += 1;
+                    MemberStore::Raw(raw)
+                }
+                None => MemberStore::Owned(
+                    provider
+                        .to_f32(src)
+                        .with_context(|| format!("reading {src} for AWQ search"))?,
+                ),
+            };
+            members.push((canon.clone(), store, resolved));
+        }
+        if members.is_empty() {
+            continue;
+        }
+        let (mut absmax, agree) = base_awq::merge_absmax(&abs_vecs, 1e-3);
+        if !agree {
+            disagreements += 1;
+        }
+        if let Some((heads, kv, hd)) = o_tile {
+            absmax = gqa_tile_max(&absmax, heads, kv, hd);
+        }
+        let gm: Vec<base_awq::GroupMember> = members
+            .iter()
+            .map(|(_, w, r)| base_awq::GroupMember {
+                weights: w.data(),
+                in_features: width,
+                bits: r.dtype.bits_per_weight().unwrap(),
+                group_size: r.group_size,
+                symmetric: r.symmetric,
+                scale_dtype: r.scale_dtype,
+            })
+            .collect();
+        // Error weight: E[x²] when every member carries it, else absmax².
+        let meansq = if msq_vecs.len() == members.len() {
+            let (m, _) = base_awq::merge_absmax(&msq_vecs, 1e-3);
+            Some(match o_tile {
+                Some((heads, kv, hd)) => gqa_tile_max(&m, heads, kv, hd),
+                None => m,
+            })
+        } else {
+            None
+        };
+        if meansq.is_some() {
+            groups_with_meansq += 1;
+        }
+        // Explicit alpha from the profile wins over the proxy search. All
+        // AWQ members share one s, so they must agree on the value.
+        let explicit: Vec<Option<f32>> = members.iter().map(|(_, _, r)| r.awq_alpha).collect();
+        let (awq, curve, is_explicit) =
+            match explicit_group_alpha(&explicit).with_context(|| {
+                format!(
+                    "fold group {kind}/layer {layer}: {:?}",
+                    members.iter().map(|m| &m.0).collect::<Vec<_>>()
+                )
+            })? {
+                Some(alpha) => {
+                    groups_explicit += 1;
+                    (
+                        base_awq::AwqConfig::plan_for_alpha(&absmax, alpha),
+                        Vec::new(),
+                        true,
+                    )
+                }
+                None => {
+                    let col_weight = base_awq::activation_weights_from(meansq.as_deref(), &absmax);
+                    let (plan, curve) =
+                        ctx.awq_config
+                            .search_group_weighted_curve(&gm, &absmax, &col_weight);
+                    (plan, curve, false)
+                }
+            };
+        plan.reports.push(FoldGroupReport {
+            kind,
+            layer: *layer,
+            members: members.iter().map(|m| m.0.clone()).collect(),
+            consumers: if matches!(*kind, "down" | "o") {
+                requested.clone()
+            } else {
+                consumers.clone()
+            },
+            upstream: match *kind {
+                "down" => format!("layers.{layer}.mlp.up_proj.weight"),
+                "o" => format!("layers.{layer}.self_attn.v_proj.weight"),
+                _ => norm_name.clone(),
+            },
+            alpha: awq.alpha,
+            mse: awq.mse,
+            curve,
+            explicit: is_explicit,
+            weight: if meansq.is_some() {
+                "meansq"
+            } else {
+                "absmax2"
+            },
+        });
+
+        // ── record the fold ───────────────────────────────────────────
+        if *kind == "down" {
+            let down = &requested[0];
+            let up = format!("layers.{layer}.mlp.up_proj.weight");
+            plan.col_scale.insert(down.clone(), awq.scales.clone());
+            plan.row_scale
+                .insert(up.clone(), awq.inverse_scales.clone());
+            fold_companion_bias(&mut plan, &by_canon, &up, &awq.inverse_scales)?;
+        } else if let Some((heads, kv, hd)) = o_tile {
+            let o = &requested[0];
+            let v = format!("layers.{layer}.self_attn.v_proj.weight");
+            // 1/s per v row: the (tied) value of its query-head group
+            let rep = heads / kv;
+            let mut inv_v = vec![1f32; kv * hd];
+            for g in 0..kv {
+                for d in 0..hd {
+                    inv_v[g * hd + d] = awq.inverse_scales[(g * rep) * hd + d];
+                }
+            }
+            plan.col_scale.insert(o.clone(), awq.scales.clone());
+            fold_companion_bias(&mut plan, &by_canon, &v, &inv_v)?;
+            plan.row_scale.insert(v, inv_v);
+        } else {
+            for c in &consumers {
+                plan.col_scale.insert(c.clone(), awq.scales.clone());
+            }
+            plan.gamma_scale
+                .insert(norm_name.clone(), awq.inverse_scales.clone());
+            fold_companion_bias(&mut plan, &by_canon, &norm_name, &awq.inverse_scales)?;
+        }
+        for (canon, _, _) in &members {
+            plan.alpha.insert(canon.clone(), awq.alpha);
+        }
+        *alpha_hist.entry(format!("{:.2}", awq.alpha)).or_default() += 1;
+        n_groups += 1;
+    }
+
+    eprintln!(
+        "  awq:     {} fold groups ({} with explicit awq_alpha, {} searched with sidecar E[x²], rest searched with absmax²), {} tensors folded, {} requested-but-RTN; alpha histogram {:?}; search streamed off {} source bf16/f16 members ({} upcast to f32), {}",
+        n_groups,
+        groups_explicit,
+        groups_with_meansq,
+        plan.alpha.len(),
+        plan.fallback.len(),
+        alpha_hist,
+        raw_members,
+        plan.alpha.len().saturating_sub(raw_members),
+        if ctx.awq_config.search_rows > 0 {
+            format!("{} strided rows per member", ctx.awq_config.search_rows)
+        } else {
+            "every row".to_string()
+        }
+    );
+    if disagreements > 0 {
+        eprintln!(
+            "  awq:     warning: {disagreements} group(s) had disagreeing member absmax vectors (used elementwise max)"
+        );
+    }
+    let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, why) in &plan.fallback {
+        *reasons.entry(why.as_str()).or_default() += 1;
+    }
+    for (why, n) in reasons {
+        eprintln!("  awq:     RTN fallback ×{n}: {why}");
+    }
+    Ok(plan)
+}
+
+/// The `moe_down` fold of one layer's fused experts: expert e's down
+/// slab `[D, F]` gets its columns scaled by `s_e` and the up half of its
+/// gate_up slab (rows `[F, 2F)` of `[2F, D]`) by `1/s_e` — down's input
+/// is `act(gate·x) ⊙ (up·x)`, linear in up, so every expert computes the
+/// same function. `s_e` comes from the expert's OWN statistics (the
+/// sidecar's `per_expert_*`); experts that saw no calibration row keep
+/// `s_e = 1`. One alpha serves the layer: the searched curve is the sum
+/// of the per-expert curves, each weighted by the expert's activation
+/// energy (routed rows × mean E[x²]), i.e. the expected output error.
+fn moe_down_fold(
+    ctx: &QuantContext,
+    plan: &mut FoldPlan,
+    layer: usize,
+    down: &String,
+    by_canon: &std::collections::HashMap<&str, (&str, Vec<u64>)>,
+    provider: &dyn TensorProvider,
+    raw_members: &mut usize,
+) -> Result<()> {
+    let sidecar = ctx
+        .awq_profile
+        .as_ref()
+        .expect("fold plan runs with a sidecar");
+    let profile = ctx.profile.as_ref().expect("fold plan runs with a profile");
+    let gu = format!("layers.{layer}.{MOE_GATE_UP}");
+    let mut refuse = |why: String| plan.fallback.push((down.clone(), why));
+    let (src, down_shape) = &by_canon[down.as_str()];
+    let (e_n, d, f) = (
+        down_shape[0] as usize,
+        down_shape[1] as usize,
+        down_shape[2] as usize,
+    );
+    let Some((_, gu_shape)) = by_canon.get(gu.as_str()) else {
+        refuse(format!(
+            "{gu} missing; cannot fold 1/s into the experts' up rows"
+        ));
+        return Ok(());
+    };
+    if gu_shape.len() != 3
+        || gu_shape[0] as usize != e_n
+        || gu_shape[1] as usize != 2 * f
+        || gu_shape[2] as usize != d
+    {
+        refuse(format!(
+            "{gu} {gu_shape:?} does not feed {down} {down_shape:?} as [E, 2F, D]"
+        ));
+        return Ok(());
+    }
+    let Some(absmax) = sidecar.expert_absmax(down) else {
+        refuse("sidecar has no per_expert_absmax for it (calibrated without MoE capture)".into());
+        return Ok(());
+    };
+    if absmax.len() != e_n || absmax.iter().any(|v| v.len() != f) {
+        refuse(format!("sidecar per_expert_absmax is not [{e_n}][{f}]"));
+        return Ok(());
+    }
+    let meansq = sidecar
+        .expert_meansq(down)
+        .filter(|m| m.len() == e_n && m.iter().all(|v| v.len() == f));
+    let rows: Vec<u64> = match sidecar.expert_rows(down) {
+        Some(r) if r.len() == e_n => r.to_vec(),
+        _ => absmax
+            .iter()
+            .map(|v| u64::from(v.iter().any(|&x| x > 0.0)))
+            .collect(),
+    };
+    let resolved = profile.resolve_or_err(down)?;
+    if f % resolved.group_size as usize != 0 {
+        refuse(format!(
+            "in_features {f} % gs {} != 0 (packs bf16)",
+            resolved.group_size
+        ));
+        return Ok(());
+    }
+    let active: Vec<usize> = (0..e_n).filter(|&e| rows[e] > 0).collect();
+    if active.is_empty() {
+        refuse("no expert saw a calibration row".into());
+        return Ok(());
+    }
+    let store = match provider.raw_rows(src) {
+        Some(raw) => {
+            *raw_members += 1;
+            MemberStore::Raw(raw)
+        }
+        None => MemberStore::Owned(
+            provider
+                .to_f32(src)
+                .with_context(|| format!("reading {src} for AWQ search"))?,
+        ),
+    };
+    let data = store.data();
+    let (alpha, mse, curve, explicit) = match resolved.awq_alpha {
+        Some(a) => (a, f32::NAN, Vec::new(), true),
+        None => {
+            let grid = &ctx.awq_config.alpha_grid;
+            let mut total = vec![0f64; grid.len()];
+            let mut wsum = 0f64;
+            for &e in &active {
+                let msq = meansq.map(|m| m[e].as_slice());
+                let energy = match msq {
+                    Some(m) => m.iter().map(|&v| v as f64).sum::<f64>() / f as f64,
+                    None => {
+                        absmax[e]
+                            .iter()
+                            .map(|&v| (v as f64) * (v as f64))
+                            .sum::<f64>()
+                            / f as f64
+                    }
+                };
+                let w = rows[e] as f64 * energy.max(1e-30);
+                let gm = base_awq::GroupMember {
+                    weights: data.slice(e * d * f, d * f),
+                    in_features: f,
+                    bits: resolved.dtype.bits_per_weight().unwrap(),
+                    group_size: resolved.group_size,
+                    symmetric: resolved.symmetric,
+                    scale_dtype: resolved.scale_dtype,
+                };
+                let cw = base_awq::activation_weights_from(msq, &absmax[e]);
+                let (_, c) = ctx
+                    .awq_config
+                    .search_group_weighted_curve(&[gm], &absmax[e], &cw);
+                for (t, (_, m)) in total.iter_mut().zip(c) {
+                    *t += w * m as f64;
+                }
+                wsum += w;
+            }
+            let curve: Vec<(f32, f32)> = grid
+                .iter()
+                .zip(&total)
+                .map(|(&a, &t)| (a, (t / wsum) as f32))
+                .collect();
+            let mut best = (0f32, f32::INFINITY);
+            for &(a, m) in &curve {
+                if m < best.1 {
+                    best = (a, m);
+                }
+            }
+            (best.0, best.1, curve, false)
+        }
+    };
+    // per-expert s_e at the chosen alpha; silent experts stay at 1
+    let mut col = vec![1f32; e_n * f];
+    let mut row = vec![1f32; e_n * 2 * f];
+    for &e in &active {
+        let p = base_awq::AwqConfig::plan_for_alpha(&absmax[e], alpha);
+        col[e * f..(e + 1) * f].copy_from_slice(&p.scales);
+        row[e * 2 * f + f..(e + 1) * 2 * f].copy_from_slice(&p.inverse_scales);
+    }
+    plan.col_scale.insert(down.clone(), col);
+    plan.row_scale.insert(gu.clone(), row);
+    plan.alpha.insert(down.clone(), alpha);
+    plan.reports.push(FoldGroupReport {
+        kind: "moe_down",
+        layer,
+        members: vec![down.clone()],
+        consumers: vec![down.clone()],
+        upstream: gu,
+        alpha,
+        mse,
+        curve,
+        explicit,
+        weight: if meansq.is_some() {
+            "meansq"
+        } else {
+            "absmax2"
+        },
+    });
+    if e_n > active.len() {
+        eprintln!(
+            "  awq:     layer {layer} moe_down: {} of {e_n} experts saw no calibration row (s = 1)",
+            e_n - active.len()
+        );
+    }
+    Ok(())
+}
+
+/// Tie a per-channel statistic of an attention output (`heads × hd`)
+/// across the query heads that share one kv head: every channel takes
+/// the max over its group, so the AWQ scale derived from it is identical
+/// for those heads and can be pushed into the shared v row.
+fn gqa_tile_max(v: &[f32], heads: usize, kv: usize, hd: usize) -> Vec<f32> {
+    let rep = heads / kv;
+    let mut out = v.to_vec();
+    for g in 0..kv {
+        for d in 0..hd {
+            let mut m = 0f32;
+            for r in 0..rep {
+                m = m.max(v[(g * rep + r) * hd + d]);
+            }
+            for r in 0..rep {
+                out[(g * rep + r) * hd + d] = m;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod gqa_tile_tests {
+    use super::gqa_tile_max;
+
+    #[test]
+    fn ties_channels_across_a_kv_group() {
+        // heads=4, kv=2, hd=2 → groups {0,1} and {2,3}
+        let v = [1., 2., 3., 4., 5., 6., 7., 8.];
+        let t = gqa_tile_max(&v, 4, 2, 2);
+        assert_eq!(t, vec![3., 4., 3., 4., 7., 8., 7., 8.]);
+    }
+}
+
+/// Resolve the explicit alpha of a fold group: `Ok(None)` when no member
+/// carries one (search), `Ok(Some(a))` when every member carries the
+/// same value, an error when members disagree or only some carry it.
+fn explicit_group_alpha(alphas: &[Option<f32>]) -> Result<Option<f32>> {
+    let set: Vec<f32> = alphas.iter().flatten().copied().collect();
+    if set.is_empty() {
+        return Ok(None);
+    }
+    if set.len() != alphas.len() {
+        bail!("some AWQ members carry awq_alpha and some do not; one shared scale needs one alpha");
+    }
+    let a0 = set[0];
+    if set.iter().any(|&a| (a - a0).abs() > 1e-6) {
+        bail!("AWQ members of one fold group disagree on awq_alpha: {set:?}");
+    }
+    Ok(Some(a0))
+}
+
+#[cfg(test)]
+mod explicit_alpha_tests {
+    use super::explicit_group_alpha;
+
+    #[test]
+    fn agreeing_alphas_resolve() {
+        assert_eq!(
+            explicit_group_alpha(&[Some(0.3), Some(0.3)]).unwrap(),
+            Some(0.3)
+        );
+        assert_eq!(explicit_group_alpha(&[None, None]).unwrap(), None);
+        assert_eq!(explicit_group_alpha(&[Some(0.45)]).unwrap(), Some(0.45));
+    }
+
+    #[test]
+    fn disagreeing_alphas_are_rejected() {
+        assert!(explicit_group_alpha(&[Some(0.3), Some(0.4)]).is_err());
+        assert!(explicit_group_alpha(&[Some(0.3), None]).is_err());
+    }
+}
+
+/// An HF checkpoint opened the way `convert` opens it: reader, arch
+/// config and canonical arch name.
+struct HfSource {
+    hf: base_readers::hf::HfDir,
+    config: base_arch::ArchConfig,
+    canonical_arch: &'static str,
+    model_type: String,
+}
+
+fn open_hf_source(input: &std::path::Path) -> Result<HfSource> {
+    use base_arch::hf_mapper_for_model_type;
+    use base_readers::hf::HfDir;
+    let hf = HfDir::open(input)?;
+    let model_type = hf
+        .model_type()
+        .ok_or_else(|| anyhow::anyhow!("config.json missing model_type"))?
+        .to_string();
+    let mapper = hf_mapper_for_model_type(&model_type)
+        .ok_or_else(|| anyhow::anyhow!("HF model_type {:?} not supported yet", model_type))?;
+    let config = mapper.config_from_hf(&hf.config)?;
+    Ok(HfSource {
+        hf,
+        config,
+        canonical_arch: mapper.canonical_arch(),
+        model_type,
+    })
+}
+
+/// Run `f` over the checkpoint's tensors mapped exactly as `convert_hf`
+/// maps them (expert stacking, fused-projection splitting, canonical
+/// renames): `mapped` is `(source name, canonical name)` for every tensor
+/// that lands in the main bundle, `provider` reads them as f32.
+fn with_hf_mapped<R>(
+    input: &std::path::Path,
+    f: impl FnOnce(&HfSource, &dyn TensorProvider, &[(String, String)]) -> Result<R>,
+) -> Result<R> {
+    let src = open_hf_source(input)?;
+    if src.canonical_arch == "whisper" {
+        bail!("whisper checkpoints have no canonical-quant mapping");
+    }
+    let base = HfTensorProvider { hf: &src.hf };
+    let names: Vec<String> = src.hf.tensor_names().map(|s| s.to_string()).collect();
+    let stacking = StackingProvider::build(&base, &names);
+    let names = stacking.rewritten_names();
+    let splitting = SplittingProvider::build(&stacking, &names, &src.config)?;
+    let names = splitting.rewritten_names();
+    let mut mapped: Vec<(String, String)> = Vec::new();
+    for n in &names {
+        if let Some(Canonical::Main(c)) = to_canonical_name(n, src.canonical_arch) {
+            mapped.push((n.clone(), c));
+        }
+    }
+    f(&src, &splitting, &mapped)
+}
+
+fn parse_cell(spec: &str) -> Result<(u32, u32)> {
+    let (b, g) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("--cell wants bits:group_size, got {spec:?}"))?;
+    Ok((b.trim().parse()?, g.trim().parse()?))
+}
+
+fn cmd_fingerprint(args: FingerprintArgs) -> Result<()> {
+    let hf = base_readers::hf::HfDir::open(&args.input)?;
+    println!("{}", hf_inventory_fingerprint(&hf));
+    Ok(())
+}
+
+fn cmd_awq_search(args: AwqSearchArgs) -> Result<()> {
+    let (bits, gs) = parse_cell(&args.cell)?;
+    if ![2, 3, 4, 5, 6, 8].contains(&bits) {
+        bail!("--cell bits must be one of 2,3,4,5,6,8 (got {bits})");
+    }
+    let groups: Vec<Vec<String>> = args
+        .tensors
+        .split(';')
+        .map(|g| {
+            g.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|g: &Vec<String>| !g.is_empty())
+        .collect();
+    if groups.is_empty() {
+        bail!("--tensors names no tensor");
+    }
+    // A profile that marks exactly the requested tensors AWQ at the cell;
+    // the fold plan then does what `convert` would do for that recipe.
+    let mut rules: Vec<serde_json::Value> = Vec::new();
+    for t in groups.iter().flatten() {
+        let mut r = serde_json::json!({
+            "pattern": t, "dtype": format!("base_q{bits}"), "group_size": gs,
+            "scale_dtype": args.scale_dtype, "algo": "awq",
+        });
+        if args.symmetric {
+            r["symmetric"] = serde_json::Value::Bool(true);
+        }
+        rules.push(r);
+    }
+    rules.push(serde_json::json!({"pattern": "**", "dtype": "f16"}));
+    let profile_json = serde_json::json!({
+        "name": "awq-search", "arch": "*",
+        "calibration": {"method": "awq", "tokens": 0, "dataset": "n/a"},
+        "rules": rules,
+    });
+    let profile = base_quant::QuantProfile::from_json(profile_json.to_string().as_bytes())
+        .context("building the search profile")?;
+    let sidecar = base_awq::AwqProfile::load(&args.awq_profile)
+        .with_context(|| format!("loading AWQ sidecar {}", args.awq_profile.display()))?;
+    let ctx = QuantContext {
+        profile: Some(profile),
+        awq_profile: Some(sidecar),
+        awq_config: base_awq::AwqConfig {
+            search_rows: args.awq_search_rows,
+            ..Default::default()
+        },
+        target: TargetScheme::BaseQ4,
+        allow_quant_from_quant: false,
+        kquant_passthrough: false,
+        // The search prices cells on the f32 path: no passthrough, no
+        // validation pass, no direct write, plain (non-imatrix) RTN.
+        q4_passthrough: false,
+        quantize_drafter: false,
+        keep_drafter_fc_f16: false,
+        speculator_lm_head: false,
+        mtp_draft_ranking: None,
+        mtp_draft_vocab: None,
+        synth_tied_head: false,
+        mlx_passthrough: false,
+        validate: false,
+        direct_write: false,
+        imatrix: false,
+        awq_applied: std::sync::atomic::AtomicUsize::new(0),
+        awq_shape_skipped: std::sync::atomic::AtomicUsize::new(0),
+        awq_skip_fingerprint: false,
+        overlay: None,
+    };
+    let report = with_hf_mapped(&args.input, |src, provider, mapped| {
+        let fp = hf_inventory_fingerprint(&src.hf);
+        if !args.no_fingerprint_check {
+            ctx.awq_profile
+                .as_ref()
+                .unwrap()
+                .check_fingerprint(&fp)
+                .context("AWQ sidecar does not belong to this checkpoint")?;
+        }
+        let known: std::collections::HashSet<&str> =
+            mapped.iter().map(|(_, c)| c.as_str()).collect();
+        for t in groups.iter().flatten() {
+            if !known.contains(t.as_str()) {
+                bail!("{t} is not a canonical tensor of this checkpoint (see `basert inventory`)");
+            }
+        }
+        let plan = build_awq_fold_plan(&ctx, mapped, provider, &src.config, src.canonical_arch)?;
+        let groups_json: Vec<serde_json::Value> = plan
+            .reports
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "kind": r.kind, "layer": r.layer, "members": r.members,
+                    "consumers": r.consumers, "upstream": r.upstream,
+                    "alpha": r.alpha,
+                    "mse": if r.mse.is_nan() { serde_json::Value::Null } else { serde_json::json!(r.mse) },
+                    "curve": r.curve.iter().map(|(a, m)| serde_json::json!([a, m])).collect::<Vec<_>>(),
+                    "explicit": r.explicit, "weight": r.weight,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "fingerprint": fp,
+            "cell": {"bits": bits, "group_size": gs, "scale_dtype": args.scale_dtype,
+                     "symmetric": args.symmetric},
+            "alpha_grid": ctx.awq_config.alpha_grid,
+            "search_rows": ctx.awq_config.search_rows,
+            "alpha": plan.alpha,
+            "groups": groups_json,
+            "fallback": plan.fallback.iter().map(|(t, why)| serde_json::json!([t, why])).collect::<Vec<_>>(),
+        }))
+    })?;
+    let text = serde_json::to_string_pretty(&report)?;
+    match &args.out {
+        Some(p) => std::fs::write(p, text).with_context(|| format!("writing {}", p.display()))?,
+        None => println!("{text}"),
+    }
+    Ok(())
+}
+
+fn cmd_inventory(args: InventoryArgs) -> Result<()> {
+    use std::collections::BTreeMap;
+    let report = with_hf_mapped(&args.input, |src, provider, mapped| {
+        let mut tensors: Vec<serde_json::Value> = Vec::new();
+        let mut by_canon: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+        for (s, c) in mapped {
+            let shape = provider.source_shape(s)?;
+            let dtype = src
+                .hf
+                .tensor_info(s)
+                .map(|i| format!("{:?}", i.dtype).to_uppercase())
+                .unwrap_or_else(|| "virtual".into());
+            tensors.push(serde_json::json!({
+                "source": s, "canonical": c, "shape": shape, "dtype": dtype,
+            }));
+            by_canon.insert(c.as_str(), shape);
+        }
+        // The fold groups `build_awq_fold_plan` would form, independent of
+        // any profile: every 2-D consumer of a block's norm output, and
+        // down_proj fed by up_proj's rows.
+        let mut groups: BTreeMap<(usize, &'static str), (Vec<String>, String)> = BTreeMap::new();
+        for (c, shape) in &by_canon {
+            let Some((n, tail)) = layer_split(c) else {
+                continue;
+            };
+            // fused 3-D MoE experts: gate_up after pre_ffw_norm_2 (one
+            // shared s), down fed by the experts' own up rows (s per expert)
+            if shape.len() == 3 && tail == MOE_GATE_UP {
+                groups
+                    .entry((n, "moe"))
+                    .or_insert_with(|| (Vec::new(), format!("layers.{n}.{MOE_NORM}")))
+                    .0
+                    .push(c.to_string());
+                continue;
+            }
+            if shape.len() == 3 && tail == MOE_DOWN {
+                groups
+                    .entry((n, "moe_down"))
+                    .or_insert_with(|| (Vec::new(), format!("layers.{n}.{MOE_GATE_UP}")))
+                    .0
+                    .push(c.to_string());
+                continue;
+            }
+            if shape.len() != 2 {
+                continue;
+            }
+            if ATTN_CONSUMERS.contains(&tail) {
+                groups
+                    .entry((n, "attn"))
+                    .or_insert_with(|| (Vec::new(), format!("layers.{n}.input_norm.weight")))
+                    .0
+                    .push(c.to_string());
+            } else if MLP_CONSUMERS.contains(&tail) {
+                groups
+                    .entry((n, "mlp"))
+                    .or_insert_with(|| (Vec::new(), format!("layers.{n}.post_attn_norm.weight")))
+                    .0
+                    .push(c.to_string());
+            } else if tail == "mlp.down_proj.weight" {
+                groups
+                    .entry((n, "down"))
+                    .or_insert_with(|| (Vec::new(), format!("layers.{n}.mlp.up_proj.weight")))
+                    .0
+                    .push(c.to_string());
+            } else if tail == "self_attn.o_proj.weight" {
+                groups
+                    .entry((n, "o"))
+                    .or_insert_with(|| (Vec::new(), format!("layers.{n}.self_attn.v_proj.weight")))
+                    .0
+                    .push(c.to_string());
+            }
+        }
+        if by_canon.contains_key("lm_head.weight") && !src.config.tie_word_embeddings {
+            groups
+                .entry((usize::MAX, "head"))
+                .or_insert_with(|| (Vec::new(), "final_norm.weight".to_string()))
+                .0
+                .push("lm_head.weight".to_string());
+        }
+        let fold_groups: Vec<serde_json::Value> = groups
+            .iter()
+            .map(|((n, kind), (members, upstream))| {
+                let foldable = by_canon.contains_key(upstream.as_str())
+                    && !(*kind == "o" && v_is_rms_normed(src.canonical_arch));
+                serde_json::json!({
+                    "layer": if *n == usize::MAX { serde_json::Value::Null } else { serde_json::json!(n) },
+                    "kind": kind, "consumers": members,
+                    "upstream": upstream,
+                    "fold": if matches!(*kind, "down" | "o" | "moe_down") { "rows" } else { "gamma" },
+                    "foldable": foldable,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "model_type": src.model_type,
+            "arch": src.canonical_arch,
+            "fingerprint": hf_inventory_fingerprint(&src.hf),
+            "config": {
+                "hidden_size": src.config.hidden_size,
+                "num_hidden_layers": src.config.num_hidden_layers,
+                "num_attention_heads": src.config.num_attention_heads,
+                "num_kv_heads": src.config.num_kv_heads,
+                "head_dim": src.config.head_dim,
+                "tie_word_embeddings": src.config.tie_word_embeddings,
+            },
+            "tensors": tensors,
+            "fold_groups": fold_groups,
+        }))
+    })?;
+    let text = serde_json::to_string_pretty(&report)?;
+    match &args.out {
+        Some(p) => std::fs::write(p, text).with_context(|| format!("writing {}", p.display()))?,
+        None => println!("{text}"),
+    }
+    Ok(())
+}
+
+/// Inventory fingerprint of an HF safetensors source — the string an AWQ
+/// sidecar's `source_fingerprint` must carry (contract documented in
+/// base-awq `sidecar.rs`).
+fn hf_inventory_fingerprint(hf: &base_readers::hf::HfDir) -> String {
+    use sha2::{Digest, Sha256};
+    let mut names: Vec<&str> = hf.tensor_names().collect();
+    names.sort_unstable();
+    let mut h = Sha256::new();
+    for n in names {
+        let Some(info) = hf.tensor_info(n) else {
+            continue;
+        };
+        let dims: Vec<String> = info.shape.iter().map(|d| d.to_string()).collect();
+        h.update(
+            format!(
+                "{n}\t{}\t{}\n",
+                dims.join(","),
+                format!("{:?}", info.dtype).to_uppercase()
+            )
+            .as_bytes(),
+        );
+    }
+    format!("inv-sha256:{:x}", h.finalize())
 }
 
 fn cmd_sign(args: SignArgs) -> Result<()> {
@@ -7934,7 +9599,7 @@ mod rope_permute_tests {
 #[cfg(test)]
 mod gguf_passthrough_tests {
     use super::{
-        kquant_passes_through, kquant_passthrough_entry, rope_permute_rows,
+        expert_stack_kquant, kquant_passes_through, kquant_passthrough_entry, rope_permute_rows,
         unconvertible_expert_stack, unpermute_rope_rows,
     };
     use base_readers::gguf::{GgmlType, TensorInfo};
@@ -8050,6 +9715,7 @@ mod gguf_passthrough_tests {
     fn passthrough_entry_describes_gguf_super_blocks() {
         use base_format::{ComputeRegion, Layout, TensorDtype};
         for (ty, want_dtype, want_code) in [
+            (GgmlType::Q2K, TensorDtype::BaseQ2, 10u32),
             (GgmlType::Q3K, TensorDtype::BaseQ3, 11u32),
             (GgmlType::Q4K, TensorDtype::BaseQ4, 12u32),
             (GgmlType::Q5K, TensorDtype::BaseQ5, 13u32),
@@ -8083,12 +9749,14 @@ mod gguf_passthrough_tests {
         }
     }
 
-    /// MoE expert stacks stay off the passthrough path whatever their type
-    /// (the expert GEMM has no k-quant kernels); dense and shared-expert
-    /// weights of the same types still pass through.
+    /// MoE expert stacks pass through only in the types the expert GEMM
+    /// dispatches (Q4_K, Q5_K, IQ4_XS — `expert_stack_kquant`) and stay off the
+    /// passthrough path in every other type; dense and shared-expert weights
+    /// of every type still pass through.
     #[test]
     fn expert_stacks_are_not_passed_through() {
         for ty in [
+            GgmlType::Q2K,
             GgmlType::Q3K,
             GgmlType::Q4K,
             GgmlType::Q5K,
@@ -8099,13 +9767,19 @@ mod gguf_passthrough_tests {
             GgmlType::Iq3Xxs,
             GgmlType::Iq3S,
         ] {
+            let expert = expert_stack_kquant(ty);
+            assert_eq!(
+                expert,
+                matches!(ty, GgmlType::Q4K | GgmlType::Q5K | GgmlType::Iq4Xs),
+                "{ty:?}"
+            );
             for (name, want) in [
                 ("blk.0.attn_q.weight", true),
                 ("blk.0.ffn_gate_shexp.weight", true),
-                ("blk.0.ffn_gate_exps.weight", false),
-                ("blk.0.ffn_up_exps.weight", false),
-                ("blk.0.ffn_down_exps.weight", false),
-                ("blk.0.ffn_gate_up_exps.weight", false),
+                ("blk.0.ffn_gate_exps.weight", expert),
+                ("blk.0.ffn_up_exps.weight", expert),
+                ("blk.0.ffn_down_exps.weight", expert),
+                ("blk.0.ffn_gate_up_exps.weight", expert),
             ] {
                 let t = TensorInfo {
                     name: name.into(),
@@ -8378,5 +10052,259 @@ mod row_group_tests {
         assert_eq!((dt, p.group_size), (TensorDtype::BaseQ4, 64));
         let (p, _) = pack(1888, 2, TargetScheme::BaseQ4);
         assert_eq!(p.group_size, 32);
+    }
+}
+
+#[cfg(test)]
+mod moe_fold_tests {
+    //! Fused 3-D MoE experts: the `moe` / `moe_down` AWQ folds preserve
+    //! the expert FFN's function, the fold plan forms them from a sidecar
+    //! with per-expert stats (and skips silent experts), Gemma 4 refuses
+    //! the `o` fold, the router no longer blocks the dense-MLP fold, and
+    //! a 3-D gptq overlay entry packs byte-identically to convert's RTN.
+    use super::*;
+    use std::collections::HashMap;
+
+    const E: usize = 3; // experts
+    const D: usize = 64; // hidden (gate_up in_features, down out_features)
+    const F: usize = 64; // expert ffn width
+
+    fn rng(seed: &mut u64) -> f32 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    }
+    fn randv(n: usize, seed: &mut u64, amp: f32) -> Vec<f32> {
+        (0..n).map(|_| amp * rng(seed)).collect()
+    }
+    fn gelu(x: f32) -> f32 {
+        0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044715 * x * x * x)).tanh())
+    }
+    fn rmsnorm(x: &[f32], g: &[f32]) -> Vec<f32> {
+        let ms = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+        let inv = 1.0 / (ms + 1e-6).sqrt();
+        x.iter().zip(g).map(|(v, g)| v * inv * g).collect()
+    }
+    fn matvec(w: &[f32], rows: usize, k: usize, x: &[f32]) -> Vec<f32> {
+        (0..rows)
+            .map(|i| (0..k).map(|j| w[i * k + j] * x[j]).sum())
+            .collect()
+    }
+    /// expert e on residual h: down_e · (gelu(gate_e·n) ⊙ up_e·n), n = rmsnorm(h)·gamma
+    fn expert_out(gu: &[f32], down: &[f32], gamma: &[f32], h: &[f32], e: usize) -> Vec<f32> {
+        let n = rmsnorm(h, gamma);
+        let gu_e = &gu[e * 2 * F * D..(e + 1) * 2 * F * D];
+        let y = matvec(gu_e, 2 * F, D, &n);
+        let act: Vec<f32> = (0..F).map(|i| gelu(y[i]) * y[F + i]).collect();
+        matvec(&down[e * D * F..(e + 1) * D * F], D, F, &act)
+    }
+
+    struct VecProvider(HashMap<String, (Vec<u64>, Vec<f32>)>);
+    impl TensorProvider for VecProvider {
+        fn source_shape(&self, name: &str) -> Result<Vec<u64>> {
+            Ok(self.0[name].0.clone())
+        }
+        fn to_f32(&self, name: &str) -> Result<Vec<f32>> {
+            Ok(self.0[name].1.clone())
+        }
+    }
+
+    fn awq_ctx(names: &[&str], sidecar: base_awq::AwqProfile) -> QuantContext {
+        let mut rules: Vec<serde_json::Value> = names
+            .iter()
+            .map(|t| {
+                serde_json::json!({"pattern": t, "dtype": "base_q4", "group_size": 64,
+                                        "scale_dtype": "bf16", "algo": "awq"})
+            })
+            .collect();
+        rules.push(serde_json::json!({"pattern": "**", "dtype": "f16"}));
+        let pj = serde_json::json!({"name": "t", "arch": "*",
+            "calibration": {"method": "awq", "tokens": 0, "dataset": "n/a"}, "rules": rules});
+        QuantContext {
+            profile: Some(base_quant::QuantProfile::from_json(pj.to_string().as_bytes()).unwrap()),
+            awq_profile: Some(sidecar),
+            awq_config: base_awq::AwqConfig::default(),
+            target: TargetScheme::BaseQ4,
+            allow_quant_from_quant: false,
+            kquant_passthrough: false,
+            q4_passthrough: false,
+            quantize_drafter: false,
+            keep_drafter_fc_f16: false,
+            speculator_lm_head: false,
+            mtp_draft_ranking: None,
+            mtp_draft_vocab: None,
+            synth_tied_head: false,
+            mlx_passthrough: false,
+            validate: false,
+            direct_write: false,
+            imatrix: false,
+            awq_applied: std::sync::atomic::AtomicUsize::new(0),
+            awq_shape_skipped: std::sync::atomic::AtomicUsize::new(0),
+            awq_skip_fingerprint: false,
+            overlay: None,
+        }
+    }
+
+    #[test]
+    fn moe_folds_preserve_the_expert_function() {
+        let mut seed = 7u64;
+        let gu = randv(E * 2 * F * D, &mut seed, 0.3);
+        let down = randv(E * D * F, &mut seed, 0.3);
+        let gamma: Vec<f32> = randv(D, &mut seed, 0.5).iter().map(|v| 1.0 + v).collect();
+        let gu_n = "layers.0.ffn_gate_up_exps.weight";
+        let down_n = "layers.0.ffn_down_exps.weight";
+        let norm_n = "layers.0.pre_ffw_norm_2.weight";
+        let mut src = HashMap::new();
+        src.insert(
+            gu_n.to_string(),
+            (vec![E as u64, 2 * F as u64, D as u64], gu.clone()),
+        );
+        src.insert(
+            down_n.to_string(),
+            (vec![E as u64, D as u64, F as u64], down.clone()),
+        );
+        src.insert(norm_n.to_string(), (vec![D as u64], gamma.clone()));
+        // gemma4 attention + dense MLP next to the router, for the o / mlp checks
+        for (n, sh) in [
+            ("layers.0.self_attn.v_proj.weight", vec![64u64, D as u64]),
+            ("layers.0.self_attn.o_proj.weight", vec![D as u64, 64]),
+            ("layers.0.mlp.gate_proj.weight", vec![128, D as u64]),
+            ("layers.0.mlp.up_proj.weight", vec![128, D as u64]),
+            ("layers.0.mlp.router.weight", vec![E as u64, D as u64]),
+        ] {
+            let n_el = sh.iter().product::<u64>() as usize;
+            src.insert(n.to_string(), (sh, randv(n_el, &mut seed, 0.3)));
+        }
+        src.insert(
+            "layers.0.post_attn_norm.weight".into(),
+            (vec![D as u64], vec![1.0; D]),
+        );
+        // sidecar: pooled + per-expert stats; expert 2 never routed
+        let mut sc = base_awq::AwqProfile::default();
+        let pos = |n: usize, seed: &mut u64| -> Vec<f32> {
+            (0..n).map(|_| 0.05 + rng(seed).abs() * 4.0).collect()
+        };
+        for n in [
+            "layers.0.self_attn.o_proj.weight",
+            "layers.0.mlp.gate_proj.weight",
+            "layers.0.mlp.up_proj.weight",
+        ] {
+            sc.per_tensor_absmax.insert(n.into(), pos(D, &mut seed));
+        }
+        sc.per_tensor_absmax.insert(gu_n.into(), pos(D, &mut seed));
+        let mut pa = vec![pos(F, &mut seed), pos(F, &mut seed), vec![0.0; F]];
+        pa[1][3] = 40.0; // an outlier channel so alpha > 0 pays
+        sc.per_tensor_absmax.insert(down_n.into(), pa[0].clone());
+        sc.per_expert_meansq.insert(
+            down_n.into(),
+            pa.iter()
+                .map(|v| v.iter().map(|x| x * x / 4.0).collect())
+                .collect(),
+        );
+        sc.per_expert_absmax.insert(down_n.into(), pa);
+        sc.per_expert_rows.insert(down_n.into(), vec![11, 5, 0]);
+        let names = [
+            gu_n,
+            down_n,
+            "layers.0.self_attn.o_proj.weight",
+            "layers.0.mlp.gate_proj.weight",
+            "layers.0.mlp.up_proj.weight",
+        ];
+        let ctx = awq_ctx(&names, sc);
+        let mapped: Vec<(String, String)> = src.keys().map(|k| (k.clone(), k.clone())).collect();
+        let prov = VecProvider(src.clone());
+        let plan = build_awq_fold_plan(
+            &ctx,
+            &mapped,
+            &prov,
+            &base_arch::ArchConfig::default(),
+            "gemma4",
+        )
+        .unwrap();
+
+        let kinds: Vec<&str> = plan.reports.iter().map(|r| r.kind).collect();
+        assert!(
+            kinds.contains(&"moe") && kinds.contains(&"moe_down") && kinds.contains(&"mlp"),
+            "{kinds:?}"
+        );
+        assert!(
+            plan.fallback
+                .iter()
+                .any(|(t, why)| t.ends_with("o_proj.weight") && why.contains("RMS-normalizes V")),
+            "{:?}",
+            plan.fallback
+        );
+        assert!(
+            plan.col_scale.contains_key("layers.0.mlp.gate_proj.weight"),
+            "router must not block the mlp fold"
+        );
+        let col = &plan.col_scale[down_n];
+        assert_eq!(col.len(), E * F);
+        assert!(
+            col[2 * F..].iter().all(|&v| v == 1.0),
+            "silent expert keeps s = 1"
+        );
+        let row = &plan.row_scale[gu_n];
+        assert_eq!(row.len(), E * 2 * F);
+        assert!(row[..F].iter().all(|&v| v == 1.0), "gate half untouched");
+        assert!(
+            plan.alpha[down_n] > 0.0,
+            "outlier channel should pick alpha > 0"
+        );
+        assert_eq!(plan.col_scale[gu_n].len(), D);
+        assert!(plan.gamma_scale.contains_key(norm_n));
+
+        // apply exactly as convert does and compare every expert's output
+        let mut gu2 = gu.clone();
+        apply_expert_fold(&mut gu2, &[E as u64, 2 * F as u64, D as u64], &plan, gu_n).unwrap();
+        let mut down2 = down.clone();
+        apply_expert_fold(&mut down2, &[E as u64, D as u64, F as u64], &plan, down_n).unwrap();
+        let mut gamma2 = gamma.clone();
+        base_awq::scale_vec_in_place(&mut gamma2, &plan.gamma_scale[norm_n]);
+        for e in 0..E {
+            let h = randv(D, &mut seed, 1.0);
+            let a = expert_out(&gu, &down, &gamma, &h, e);
+            let b = expert_out(&gu2, &down2, &gamma2, &h, e);
+            let scale = a.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1e-6);
+            for (x, y) in a.iter().zip(&b) {
+                assert!((x - y).abs() / scale < 1e-4, "expert {e}: {x} vs {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn moe_down_without_expert_stats_falls_back() {
+        let down_n = "layers.0.ffn_down_exps.weight";
+        let gu_n = "layers.0.ffn_gate_up_exps.weight";
+        let mut src = HashMap::new();
+        src.insert(
+            gu_n.to_string(),
+            (
+                vec![E as u64, 2 * F as u64, D as u64],
+                vec![0.1; E * 2 * F * D],
+            ),
+        );
+        src.insert(
+            down_n.to_string(),
+            (vec![E as u64, D as u64, F as u64], vec![0.1; E * D * F]),
+        );
+        let mut sc = base_awq::AwqProfile::default();
+        sc.per_tensor_absmax.insert(down_n.into(), vec![1.0; F]); // pooled only: an old runtime
+        let ctx = awq_ctx(&[down_n], sc);
+        let mapped: Vec<(String, String)> = src.keys().map(|k| (k.clone(), k.clone())).collect();
+        let plan = build_awq_fold_plan(
+            &ctx,
+            &mapped,
+            &VecProvider(src),
+            &Default::default(),
+            "gemma4",
+        )
+        .unwrap();
+        assert!(plan.col_scale.is_empty() && plan.row_scale.is_empty());
+        assert!(plan
+            .fallback
+            .iter()
+            .any(|(t, w)| t == down_n && w.contains("per_expert_absmax")));
     }
 }

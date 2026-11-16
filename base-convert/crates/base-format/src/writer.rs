@@ -1,6 +1,4 @@
-use crate::header::{
-    Header, HeaderFlags, MmprojBundle, SpeculatorBundle, TensorDtype, TensorEntry,
-};
+use crate::header::{Header, HeaderFlags, MmprojBundle, SpeculatorBundle, TensorEntry};
 use crate::slots::{write_slots, Slot};
 use crate::{Error, Result, BLOB_ALIGNMENT, FORMAT_VERSION, MAGIC, PREFIX_LEN};
 use std::fs::File;
@@ -348,6 +346,12 @@ impl<W: Write + Seek> BaseWriter<W> {
         self.mmproj_config = cfg;
     }
 
+    /// Record the calibration block (AWQ mode, token count, per-tensor
+    /// alphas) — see `Header::calibration`.
+    pub fn set_calibration(&mut self, info: crate::CalibrationInfo) {
+        self.header.calibration = Some(info);
+    }
+
     pub fn add_slot(&mut self, slot: Slot) {
         self.slots.push(slot);
     }
@@ -357,29 +361,6 @@ impl<W: Write + Seek> BaseWriter<W> {
     /// architecture-specific paths.
     pub fn set_provenance<T: serde::Serialize>(&mut self, prov: T) {
         self.header.provenance = Some(serde_json::to_value(prov).expect("serializing provenance"));
-    }
-
-    /// Stamp `target_backend` from CONTENT instead of trusting the caller's
-    /// default (every construction site hardcodes Metal, so CUDA-only bundles
-    /// carried a `metal` tag and failed a kernel lookup only after a full
-    /// download + load). The one CUDA-only content class today: base_q6 MoE
-    /// expert slabs (`*_exps.*` tensors) — Metal ships no q6 MoE kernels.
-    /// bf16-scale q8/q4 bundles stay `metal` (universal): both backends carry
-    /// the `_sbf16` kernel families.
-    ///
-    /// Call from EVERY finish path. It used to live inline in the buffered
-    /// `finish` only, which the streaming rewrite silently turned into dead
-    /// code for real bundles: `create`/`create_direct` both set `stream`, so
-    /// they return through `finish_streaming`/`finish_direct` and never
-    /// reached it. Requires `header.tensors` to already be populated.
-    fn stamp_target_backend_from_content(&mut self) {
-        let q6_experts = |ts: &[TensorEntry]| {
-            ts.iter()
-                .any(|t| t.name.contains("_exps.") && t.dtype == TensorDtype::BaseQ6)
-        };
-        if q6_experts(&self.header.tensors) {
-            self.header.target_backend = crate::header::TargetBackend::CudaSm121;
-        }
     }
 
     /// Publish the speculator sub-bundle in the header (arch, config,
@@ -431,7 +412,14 @@ impl<W: Write + Seek> BaseWriter<W> {
         }
         self.header.tensors = entries;
 
-        self.stamp_target_backend_from_content();
+        // `target_backend` stays the caller's (Metal) default. From 90baf519
+        // until 2026-09-26 the writer stamped any bundle holding a base_q6
+        // MoE expert slab (`*_exps.*`) as `cuda_sm121`, because Metal had no
+        // q6 MoE kernels then; f81b88c4 (2026-07-20) added them
+        // (`moe_expert_gemm_base_q6[_sbf16]`, `moe_simd_gemm_q6`, dispatch
+        // gate `moe_quant_dtype_supported`), and the stale stamp made Metal
+        // refuse every q6-expert bundle and overlay at open. Re-introduce a
+        // content stamp here only for a class a backend truly cannot run.
 
         // Multimodal sub-bundle entries land in the same weights blob,
         // continuing past the LM tensors. Their entries go into
@@ -569,7 +557,6 @@ impl<W: Write + Seek> BaseWriter<W> {
 
         // Finalize the header from the streamed entries.
         self.header.tensors = std::mem::take(&mut s.lm_entries);
-        self.stamp_target_backend_from_content();
         if !s.mmproj_entries.is_empty() {
             let arch = self
                 .mmproj_arch
@@ -636,7 +623,6 @@ impl<W: Write + Seek> BaseWriter<W> {
         let mut s = self.stream.take().expect("finish_direct without stream");
 
         self.header.tensors = std::mem::take(&mut s.lm_entries);
-        self.stamp_target_backend_from_content();
         if !s.mmproj_entries.is_empty() {
             let arch = self
                 .mmproj_arch

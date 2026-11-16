@@ -422,6 +422,8 @@ pub fn cmd_convert_lora(args: ConvertLoraArgs) -> Result<()> {
                     flags: base_format::TensorFlags::empty(),
                     checksum_xxh64: None,
                     source_ggml_type: None,
+                    algo: None,
+                    awq_alpha: None,
                 },
                 data: f32s_to_f16_bytes(data),
             });

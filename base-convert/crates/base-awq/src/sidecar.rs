@@ -5,11 +5,24 @@
 //! `baseRT_calibrate` tool, future) and consumed by the converter
 //! at convert time via `--awq-profile <path>`.
 //!
-//! On-disk format: JSON. Keys are canonical .base tensor names of
-//! linear-layer weights; values are per-input-channel absmax floats
-//! covering the calibration set. The sidecar's `source_fingerprint`
-//! must match the model's fingerprint (sha256 of source weights) to
-//! guarantee profile/model alignment — the converter rejects mismatch.
+//! On-disk format: JSON. `per_tensor_absmax`: keys are canonical .base
+//! tensor names of linear-layer weights; values are per-input-channel
+//! absmax floats covering the calibration set. Optional
+//! `per_tensor_meansq` (same keys/lengths): per-channel mean of `x_j²`
+//! over the calibration positions — when present it is the error weight
+//! of the alpha search (see `activation_weights_from`); `absmax²` is the
+//! fallback. Unknown extra keys are ignored.
+//!
+//! `source_fingerprint` contract (checked by base-convert for HF
+//! safetensors sources): the string `inv-sha256:<hex>` where `<hex>` is
+//! the SHA-256 of the source's tensor inventory — one line per tensor,
+//! sorted by tensor name, `"{name}\t{d0,d1,...}\t{DTYPE}\n"` with the
+//! safetensors header names verbatim (e.g.
+//! `model.language_model.layers.0.mlp.up_proj.weight`), shape dims
+//! joined by `,`, and the safetensors dtype string upper-cased
+//! (`BF16`, `F16`, `F32`, ...). Every line ends with `\n`. A sidecar
+//! whose fingerprint is `null` is accepted with a warning; a mismatch
+//! is an error. Producers that can't compute it may leave it null.
 
 use crate::AwqProfile;
 use anyhow::{anyhow, Context, Result};
@@ -68,18 +81,49 @@ impl AwqProfile {
         None
     }
 
-    /// Validate the profile against an expected source fingerprint
-    /// (typically sha256 of the .base header without the sig field,
-    /// or sha256 of the source weights). Fails if mismatch.
+    /// Lookup the optional per-input-channel `E[x_j²]` vector.
+    pub fn meansq(&self, tensor_name: &str) -> Option<&[f32]> {
+        self.per_tensor_meansq
+            .get(tensor_name)
+            .map(|v| v.as_slice())
+    }
+
+    /// Per-expert absmax rows `[E][K]` of a fused 3-D expert tensor.
+    pub fn expert_absmax(&self, tensor_name: &str) -> Option<&[Vec<f32>]> {
+        self.per_expert_absmax
+            .get(tensor_name)
+            .map(|v| v.as_slice())
+    }
+
+    /// Per-expert `E[x_j²]` rows `[E][K]` of a fused 3-D expert tensor.
+    pub fn expert_meansq(&self, tensor_name: &str) -> Option<&[Vec<f32>]> {
+        self.per_expert_meansq
+            .get(tensor_name)
+            .map(|v| v.as_slice())
+    }
+
+    /// Routed rows per expert `[E]` of a fused 3-D expert tensor.
+    pub fn expert_rows(&self, tensor_name: &str) -> Option<&[u64]> {
+        self.per_expert_rows.get(tensor_name).map(|v| v.as_slice())
+    }
+
+    /// Validate the profile against the source's inventory fingerprint
+    /// (see the module doc for the contract). A mismatch is an error; a
+    /// sidecar with no fingerprint is accepted with a warning so
+    /// producers that cannot compute it still work.
     pub fn check_fingerprint(&self, expected: &str) -> Result<()> {
         match &self.source_fingerprint {
             Some(actual) if actual == expected => Ok(()),
             Some(actual) => Err(anyhow!(
                 "AWQ profile fingerprint {actual:?} does not match model fingerprint {expected:?}"
             )),
-            None => Err(anyhow!(
-                "AWQ profile has no source_fingerprint; cannot validate against model {expected:?}"
-            )),
+            None => {
+                eprintln!(
+                    "  awq:     warning: sidecar has no source_fingerprint; \
+                     cannot verify it was measured on this checkpoint ({expected})"
+                );
+                Ok(())
+            }
         }
     }
 }
@@ -117,6 +161,36 @@ mod tests {
     }
 
     #[test]
+    fn per_expert_round_trip_and_legacy_parse() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut p = make_profile();
+        let n = "layers.0.ffn_down_exps.weight".to_string();
+        p.per_tensor_absmax.insert(n.clone(), vec![2.0, 3.0]);
+        p.per_expert_absmax.insert(
+            n.clone(),
+            vec![vec![1.0, 3.0], vec![2.0, 0.5], vec![0.0, 0.0]],
+        );
+        p.per_expert_meansq.insert(
+            n.clone(),
+            vec![vec![0.5, 1.0], vec![1.5, 0.1], vec![0.0, 0.0]],
+        );
+        p.per_expert_rows.insert(n.clone(), vec![7, 9, 0]);
+        p.save(tmp.path()).unwrap();
+        let q = AwqProfile::load(tmp.path()).unwrap();
+        assert_eq!(q.expert_absmax(&n).unwrap()[1], vec![2.0, 0.5]);
+        assert_eq!(q.expert_meansq(&n).unwrap()[0], vec![0.5, 1.0]);
+        assert_eq!(q.expert_rows(&n), Some([7u64, 9, 0].as_slice()));
+        // a pre-MoE sidecar (no per_expert_* keys) still parses
+        let legacy =
+            br#"{"source_fingerprint":null,"calib_tokens":3,"per_tensor_absmax":{"a":[1.0]}}"#;
+        let l: AwqProfile = serde_json::from_slice(legacy).unwrap();
+        assert!(l.expert_absmax("a").is_none() && l.per_expert_rows.is_empty());
+        // and an empty per-expert map is not written back
+        let json = serde_json::to_string(&l).unwrap();
+        assert!(!json.contains("per_expert"));
+    }
+
+    #[test]
     fn lookup_missing_tensor_returns_none() {
         let p = make_profile();
         assert!(p.absmax("does.not.exist").is_none());
@@ -133,5 +207,12 @@ mod tests {
     fn fingerprint_match_succeeds() {
         let p = make_profile();
         p.check_fingerprint("abc123").unwrap();
+    }
+
+    #[test]
+    fn fingerprint_absent_is_accepted() {
+        let mut p = make_profile();
+        p.source_fingerprint = None;
+        p.check_fingerprint("anything").unwrap();
     }
 }
