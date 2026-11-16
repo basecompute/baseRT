@@ -119,6 +119,10 @@ impl Fixture {
             .env("BASERT_SUPERFLUID_SOURCE", &self.assets)
             .env("BASERT_STATE_DIR", &self.state)
             .env("BASERT_LIB", &self.lib)
+            // `basert serve` speculates by default, which reads the model
+            // cache and the catalog: the fixture's, and the bundled catalog.
+            .env("BASERT_MODELS_DIR", self.tmp.path().join("models-cache"))
+            .env("BASERT_CATALOG_OFFLINE", "1")
             .env("FAKE_SUPERFLUID_PROBE_LOG", self.probe_log())
             .env_remove("BASERT_SUPERFLUID_AUTO_INSTALL")
             .env_remove("FAKE_SUPERFLUID_UNREADY")
@@ -424,7 +428,8 @@ fn serve_execs_superfluid_with_the_cpp_servers_command_line_translated() {
     assert_eq!(code, 0, "{out}{err}");
     let want = format!(
         "ARGS: serve --model {} --runtime basert --sessions {} --host 127.0.0.1 --port 9000 \
-         --max-batch 2 --api-key k --offline --no-park --sessions-cache --no-tui --no-http-qos-header",
+         --max-batch 2 --api-key k --offline --no-park --sessions-cache --no-tui --no-http-qos-header \
+         --speculate auto",
         f.model(),
         sessions.display()
     );
@@ -466,6 +471,18 @@ fn superfluids_own_flags_pass_through_and_print_command_shows_the_start() {
         )),
         "{out}"
     );
+    // `--speculate off` is handed over alone: no default `auto` beside it.
+    let (code, out, err) = run(f.basert().args(["serve", f.model(), "--speculate", "off"]));
+    assert_eq!(code, 0, "{out}{err}");
+    let args = out
+        .lines()
+        .find(|l| l.starts_with("ARGS: serve"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(
+        args.ends_with("--no-http-qos-header --speculate off"),
+        "{args}"
+    );
+    assert_eq!(args.matches("--speculate").count(), 1, "{args}");
 
     // --print-command shows the start and runs nothing, installed or not.
     let (code, out, err) =
@@ -487,6 +504,7 @@ fn superfluids_own_flags_pass_through_and_print_command_shows_the_start() {
         "{line}"
     );
     assert!(line.contains("--port 9001"), "{line}");
+    assert!(line.ends_with("--speculate auto"), "the default: {line}");
     assert!(!out.contains("ARGS:"), "{out}");
     let g = fixture();
     let (code, out, _) = run(g.basert().args(["serve", g.model(), "--print-command"]));
@@ -728,4 +746,258 @@ fn serve_help_version_and_a_missing_model() {
     let (code, _, err) = run(f.basert().args(["serve", missing.to_str().unwrap()]));
     assert_eq!(code, 1);
     assert!(err.contains("Failed to load model"), "{err}");
+}
+
+/// A header-only bundle (the reader never reaches a blob) of `arch`, with no
+/// speculator head.
+fn headless_bundle(path: &Path, arch: &str) {
+    use base_format::{
+        AlignmentConfig, Header, HeaderFlags, ModelConfig, QuantScheme, SourceInfo, TargetBackend,
+        TokenizerBlob, FORMAT_VERSION, MAGIC,
+    };
+    let h = Header {
+        schema: 1,
+        arch: arch.to_string(),
+        quant_scheme: QuantScheme::F16,
+        min_hw: "apple_m1".to_string(),
+        created: "2026-11-16T00:00:00Z".to_string(),
+        base_rt_version: "0.1.0-test".to_string(),
+        source: SourceInfo {
+            format: "test".to_string(),
+            sha256: "0".repeat(64),
+            filename: "synthetic".to_string(),
+        },
+        tokenizer: TokenizerBlob {
+            fields: Default::default(),
+        },
+        config: ModelConfig {
+            fields: [("hidden_size".to_string(), serde_json::json!(8))]
+                .into_iter()
+                .collect(),
+        },
+        metadata: Default::default(),
+        target_backend: TargetBackend::Metal,
+        quant_profile: String::new(),
+        alignment: AlignmentConfig::default(),
+        flags: HeaderFlags::empty(),
+        layers: vec![],
+        tensors: vec![],
+        mmproj: None,
+        speculator: None,
+        calibration: None,
+        provenance: None,
+        sig: None,
+    };
+    let json = h.to_canonical_json().unwrap();
+    let mut bytes = MAGIC.to_vec();
+    bytes.extend(FORMAT_VERSION.to_le_bytes());
+    bytes.extend((json.len() as u64).to_le_bytes());
+    bytes.extend(json);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+}
+
+/// The default `auto` pulls a catalog model again when its installed file
+/// has no MTP head and the catalog's current file has one, as `--speculate
+/// auto` does — but never under `--offline`: the start serves the installed
+/// file. Through the whole `basert serve <id>` path, with the Hub at a dead
+/// address, so a pull is seen to start and fail, never to download.
+#[test]
+fn the_default_auto_pulls_a_model_again_for_its_head_except_offline() {
+    let f = fixture();
+    let cache = f.tmp.path().join("models-cache");
+    let id = "basecompute/gemma-4-E4B-it";
+    let vdir = cache.join(id).join("default-q8");
+    let installed = vdir.join("model.base");
+    headless_bundle(&installed, "gemma4");
+    fs::write(
+        vdir.join("hub.json"),
+        serde_json::json!({
+            "id": id, "source_kind": "catalog", "hf_repo": id, "revision": "main",
+            "variant": "default-q8", "pulled_at": "0", "base_sha256": "b".repeat(64),
+            "file": "gemma-4-E4B-it-Q8.base"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // The catalog (read as cached: BASERT_CATALOG_OFFLINE) publishes another
+    // file of this variant, with Google's head in it.
+    fs::write(
+        cache.join(".catalog-cache.json"),
+        serde_json::json!({"schema": 1, "models": [{
+            "id": id, "hf_repo": id, "file": "gemma-4-E4B-it-Q8.base", "quant": "default-q8",
+            "sha256": "a".repeat(64), "speculator": "gemma4-mtp"
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    let start = |extra: &[&str]| {
+        run(f
+            .basert()
+            .env("HF_ENDPOINT", "http://127.0.0.1:9")
+            .args(["serve", &format!("{id}:default-q8"), "--print-command"])
+            .args(extra))
+    };
+    let pulled_again = "pulling it again for --speculate auto";
+
+    // The default: pulled again, like a hand-given `auto` (the pull fails here).
+    let (code, out, err) = start(&[]);
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(err.contains(pulled_again), "{err}");
+    let (code, _, err) = start(&["--speculate", "auto"]);
+    assert_eq!(code, 1);
+    assert!(err.contains(pulled_again), "{err}");
+
+    // --offline: nothing is pulled, the installed file is served under `auto`.
+    let (code, out, err) = start(&["--offline"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!err.contains("pulling"), "{err}");
+    assert!(out.contains(&installed.display().to_string()), "{out}");
+    assert!(out.trim_end().ends_with("--speculate auto"), "{out}");
+
+    // --speculate off: nothing asked of the head, nothing pulled.
+    let (code, out, err) = start(&["--speculate", "off"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(!err.contains("pulling"), "{err}");
+}
+
+/// An HTTP responder on 127.0.0.1 that answers every request 404 and counts
+/// them; returns its base URL and the count.
+fn count_requests() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                line.clear();
+            }
+            seen.fetch_add(1, Ordering::SeqCst);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+    });
+    (base, hits)
+}
+
+/// `--offline` keeps the default `auto` off the network: a start given a
+/// model by path reads the catalog only as cached, never from the Hub. Run
+/// without the fixture's `BASERT_CATALOG_OFFLINE`, the catalog URL at a local
+/// responder that counts what reaches it, the model cache empty (no cached
+/// catalog, so an online read would go out).
+#[test]
+fn the_default_auto_reads_no_catalog_online_under_offline() {
+    use std::sync::atomic::Ordering;
+    let f = fixture();
+    assert_eq!(run(f.basert().args(["superfluid", "install"])).0, 0);
+    let (url, hits) = count_requests();
+    let start = |extra: &[&str]| {
+        run(f
+            .basert()
+            .env_remove("BASERT_CATALOG_OFFLINE")
+            .env("BASERT_CATALOG_URL", format!("{url}/catalog.json"))
+            .args(["serve", f.model(), "--print-command"])
+            .args(extra))
+    };
+
+    // Online, the default `auto` reads the catalog (answered 404 here; the
+    // start goes on with the bundled one): the responder sees it.
+    let (code, out, err) = start(&[]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(hits.load(Ordering::SeqCst) >= 1, "the online read is seen");
+
+    for extra in [
+        &["--offline"][..],
+        &["--speculate", "auto", "--offline"],
+        &["--speculate", "off"],
+    ] {
+        let before = hits.load(Ordering::SeqCst);
+        let (code, out, err) = start(extra);
+        assert_eq!(code, 0, "{extra:?}: {out}{err}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            before,
+            "{extra:?} read the catalog online"
+        );
+    }
+    let (_, out, _) = start(&["--offline"]);
+    assert!(
+        out.trim_end().ends_with("--speculate auto"),
+        "still the default: {out}"
+    );
+}
+
+/// `basert serve <hub id> --offline` resolves the id from what is installed
+/// and the catalog as cached, never from the Hub: an installed model starts
+/// with no request, and one that is not installed is refused with the pull
+/// to run instead of being downloaded. Without the fixture's
+/// `BASERT_CATALOG_OFFLINE`, the catalog URL and the Hub at a local responder
+/// that counts requests.
+#[test]
+fn a_hub_id_start_under_offline_reads_no_catalog_and_pulls_nothing() {
+    use std::sync::atomic::Ordering;
+    let f = fixture();
+    assert_eq!(run(f.basert().args(["superfluid", "install"])).0, 0);
+    let id = "basecompute/gemma-4-E4B-it";
+    let installed = f
+        .tmp
+        .path()
+        .join("models-cache")
+        .join(id)
+        .join("default-q8")
+        .join("model.base");
+    headless_bundle(&installed, "gemma4");
+    let (url, hits) = count_requests();
+    let start = |model: &str, extra: &[&str]| {
+        run(f
+            .basert()
+            .env_remove("BASERT_CATALOG_OFFLINE")
+            .env("BASERT_CATALOG_URL", format!("{url}/catalog.json"))
+            .env("HF_ENDPOINT", &url)
+            .args(["serve", model, "--print-command"])
+            .args(extra))
+    };
+
+    // Online, resolving the id reads the catalog: the responder sees it.
+    let (code, out, err) = start(&format!("{id}:default-q8"), &["--speculate", "off"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(hits.load(Ordering::SeqCst) >= 1, "the online read is seen");
+
+    // --offline, installed: the installed file, no request.
+    for extra in [&["--offline"][..], &["--offline", "--speculate", "off"]] {
+        let before = hits.load(Ordering::SeqCst);
+        let (code, out, err) = start(&format!("{id}:default-q8"), extra);
+        assert_eq!(code, 0, "{extra:?}: {out}{err}");
+        assert!(
+            out.contains(&installed.display().to_string()),
+            "{extra:?}: {out}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            before,
+            "{extra:?} reached the network"
+        );
+    }
+
+    // --offline, not installed: refused with the pull to run, no request.
+    let before = hits.load(Ordering::SeqCst);
+    let (code, out, err) = start("basecompute/Qwen3-4B:default-q4", &["--offline"]);
+    assert_ne!(code, 0, "{out}{err}");
+    assert!(
+        err.contains("--offline") && err.contains("basert pull basecompute/Qwen3-4B:default-q4"),
+        "{err}"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        before,
+        "a model not installed reached the network"
+    );
 }

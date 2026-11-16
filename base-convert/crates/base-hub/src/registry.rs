@@ -532,6 +532,15 @@ impl MergedRegistry {
         Ok(Self::new(root, catalog))
     }
 
+    /// [`Self::load`] with no network: the catalog as cached, else the
+    /// bundled copy ([`Catalog::load_cached`]), for a caller told to stay
+    /// offline (`basert serve --offline`).
+    pub fn load_cached() -> Result<Self> {
+        let root = cache::models_dir()?;
+        let catalog = CatalogRegistry::from_catalog(Catalog::load_cached(&root));
+        Ok(Self::new(root, catalog))
+    }
+
     /// Build from the cache root + the hosted catalog fetched past the cache
     /// ([`Catalog::load_fresh`]): what a pull turns to when the cached rows
     /// look behind the Hub. None when it cannot be fetched.

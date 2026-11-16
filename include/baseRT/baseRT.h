@@ -64,7 +64,7 @@ extern "C" {
 
 #define BASERT_VERSION_MAJOR 0
 #define BASERT_VERSION_MINOR 5
-#define BASERT_VERSION_PATCH 0
+#define BASERT_VERSION_PATCH 1
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
@@ -311,6 +311,25 @@ void baseRT_set_decode_replay(int mode);
 ///   ms = 0   → block indefinitely in the GPU wait (opt out of the bound).
 /// No-op on non-Metal backends. Process-wide; read once per wait.
 void baseRT_set_gpu_wait_timeout_ms(double ms);
+
+/// GPU fault state of a model. The backend flags a command buffer that
+/// failed (GPU out of memory, a fault) or did not complete within the wait
+/// timeout above; the kernels of that pass never wrote their outputs, and
+/// the KV / recurrent state of the sequence it was advancing is undefined.
+/// baseRT_gpu_error() returns 1 when such a fault has been observed on this
+/// model since load or since the last baseRT_clear_gpu_error() — whether
+/// the call that hit it reported it (BASERT_ERR_GPU / a failure return) or
+/// recovered internally. While the backend's flag is pending, every forward
+/// pass (baseRT_prefill, baseRT_decode_step, baseRT_prefill_logits*,
+/// baseRT_calibrate_prefill, baseRT_batch_step_fused_logits*) and every
+/// logits readback (baseRT_read_logits, baseRT_read_batch_logits) fails with
+/// BASERT_ERR_GPU without touching the device; nothing clears the flag
+/// behind the caller. A measurement tool should check this after every item
+/// and stop: the state after a fault is untrustworthy. baseRT_clear_gpu_error()
+/// resets both the backend flag and the model's record (the caller then
+/// re-prefills its sequences). Returns 0 for a null model.
+int baseRT_gpu_error(baseRT_model_t model);
+void baseRT_clear_gpu_error(baseRT_model_t model);
 
 /// Free all resources associated with a model.
 void baseRT_free_model(baseRT_model_t model);

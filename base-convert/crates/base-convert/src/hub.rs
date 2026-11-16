@@ -565,7 +565,10 @@ fn auto_pull_and_resolve(
 /// the token, or by the `--variant` launcher flag (`default_variant`) for
 /// tokens without an inline `:variant` — the inline form wins. With neither,
 /// the sole installed variant is used (and it's an error to resolve a model
-/// with several installed without naming one). An uninstalled model is fetched
+/// with several installed without naming one). Under `offline` (`basert serve
+/// --offline`) only what is installed resolves, against the catalog as cached
+/// (MergedRegistry::load_cached), and anything else is refused with the pull
+/// to run. Otherwise an uninstalled model is fetched
 /// on demand — preferring the pre-converted basecompute mirror, else converting
 /// the source repo — so `basert chat`/`serve <id>` Just Works.
 /// What `--speculate` asks of the model's own MTP head in a runtime
@@ -669,6 +672,7 @@ fn resolve_hub_model(
     token: &str,
     default_variant: Option<&str>,
     mtp: Option<&str>,
+    offline: bool,
 ) -> Result<PathBuf> {
     let (id, inline) = token
         .split_once(':')
@@ -686,17 +690,34 @@ fn resolve_hub_model(
 
     // Inline `:variant` wins over the `--variant` flag.
     let variant = inline.or(default_variant);
-    let reg = MergedRegistry::load()?;
+    let reg = if offline {
+        MergedRegistry::load_cached()?
+    } else {
+        MergedRegistry::load()?
+    };
+    let refuse = || {
+        anyhow::anyhow!(
+            "{token}: not installed, and --offline forbids a download; run `basert pull {}` \
+             first, or start without --offline",
+            variant.map_or_else(|| id.to_string(), |v| format!("{id}:{v}"))
+        )
+    };
 
     if let Some(v) = variant {
         if let Some(p) = installed_best_variant(&reg, id, v) {
             return serve_ready(&reg, id, p, mtp);
+        }
+        if offline {
+            return Err(refuse());
         }
         return auto_pull_and_resolve(&reg, id, Some(v));
     }
 
     if let Some(p) = installed_single_path(&reg, id)? {
         return serve_ready(&reg, id, p, mtp);
+    }
+    if offline {
+        return Err(refuse());
     }
     auto_pull_and_resolve(&reg, id, None)
 }
@@ -705,15 +726,18 @@ fn resolve_hub_model(
 /// `basert chat org/model` (positional) and `basert serve --model org/model`
 /// (repeatable flag) both Just Work after `basert pull`. `default_variant`
 /// comes from the `--variant` launcher flag and applies to ids without an
-/// inline `:variant`.
+/// inline `:variant`. Under `--offline` nothing reaches the network: ids
+/// resolve to what is installed, or are refused (resolve_hub_model).
 fn resolve_model_args(rest: &[String], default_variant: Option<&str>) -> Result<Vec<String>> {
     // `--speculate mtp-head` / `auto` asks for the model's own head: a stale
-    // catalog file without one is pulled again on the way (serve_ready).
-    let mtp = mtp_speculation_asked(rest);
+    // catalog file without one is pulled again on the way (serve_ready) —
+    // never under `--offline`, which serves the installed file as it is.
+    let offline = rest.iter().any(|a| a == "--offline");
+    let mtp = mtp_speculation_asked(rest).filter(|_| !offline);
     rest.iter()
         .map(|arg| {
             if looks_like_hub_id(arg) {
-                Ok(resolve_hub_model(arg, default_variant, mtp)?
+                Ok(resolve_hub_model(arg, default_variant, mtp, offline)?
                     .to_string_lossy()
                     .into_owned())
             } else if let Some((kind, id)) = speculate_drafter_id(arg) {
@@ -721,7 +745,7 @@ fn resolve_model_args(rest: &[String], default_variant: Option<&str>) -> Result<
                 // it drafts for: catalogue lookup, pull, convert-on-pull,
                 // variant selection, hub cache. A drafter was the one model a
                 // user had to fetch and convert by hand and then name by path.
-                let path = resolve_hub_model(id, default_variant, None)?;
+                let path = resolve_hub_model(id, default_variant, None, offline)?;
                 Ok(format!("{kind}:{}", path.to_string_lossy()))
             } else {
                 Ok(arg.clone())
@@ -799,7 +823,8 @@ fn speculate_auto_directive(reg: &MergedRegistry, model: &Path) -> Option<(Strin
 
 /// `basert serve <model> --speculate auto`, the model already a path: the
 /// drafter the catalog pairs with that model (auto_drafter_row) is pulled when
-/// it is not installed — the road `--speculate dflash:<id>` takes — and the
+/// no copy of it, of any variant, is where superfluid's `auto` looks
+/// (paired_drafter_present) — the road `--speculate dflash:<id>` takes — and the
 /// args go on as they came. `auto` stays superfluid's to settle: it takes that
 /// installed drafter first (it reads the same catalog, the cache's
 /// `.catalog-cache.json`, even under the `--offline` every start hands it) and
@@ -807,26 +832,50 @@ fn speculate_auto_directive(reg: &MergedRegistry, model: &Path) -> Option<(Strin
 /// refused by the engine) gives way to the bundle's own head, then to plain
 /// decoding. Naming the file here (`dflash:<path>`) would make it an explicit
 /// choice, which superfluid refuses at startup instead. Nothing is pulled for
-/// another strategy or none, several models or a `--model-dir` (superfluid's
-/// one `--speculate` is not one model's there), a model with nothing paired,
-/// or under the user's own `--offline`; a drafter that could not be fetched is
-/// said and never stops the start.
+/// another strategy, several models or a `--model-dir` (superfluid's one
+/// `--speculate` is not one model's there), a model with nothing paired, or
+/// under the user's own `--offline`; a drafter that could not be fetched is
+/// said and never stops the start. The default `auto` (no `--speculate`,
+/// with_default_speculation) comes here as the hand-given one does. Under
+/// `--offline` it returns before the registry loads, since loading reads the
+/// hosted catalog when the cached one is missing or old.
 fn prepare_speculate_auto(rest: Vec<String>) -> Vec<String> {
-    if !speculate_auto_asked(&rest) {
+    if !speculate_auto_asked(&rest) || rest.iter().any(|a| a == "--offline") {
         return rest;
     }
     let Ok(reg) = MergedRegistry::load() else {
         return rest;
     };
-    prepare_speculate_auto_with(rest, &reg, |token| resolve_hub_model(token, None, None))
+    prepare_speculate_auto_with(rest, &reg, |token, replace| {
+        if !replace {
+            return resolve_hub_model(token, None, None, false);
+        }
+        eprintln!(
+            "basert serve: --speculate auto: the installed {token} is not the catalog's file — pulling it again"
+        );
+        cmd_pull(PullArgs {
+            id: token.to_string(),
+            profile: None,
+            target: None,
+            revision: "main".to_string(),
+            file: None,
+            force: true,
+            dry_run: false,
+        })?;
+        let (id, variant) = token.split_once(':').unwrap_or((token, ""));
+        installed_best_variant(&MergedRegistry::load()?, id, variant)
+            .with_context(|| format!("pulled {token} again but could not locate it"))
+    })
 }
 
 /// prepare_speculate_auto over a given registry, `fetch` resolving (pulling)
-/// a drafter's `<id>:<variant>` to its installed path.
+/// a drafter's `<id>:<variant>` to its installed path; its `replace` is true
+/// when that variant's install is not the catalog's file, which the pull
+/// must replace (a resolve would take the installed one).
 fn prepare_speculate_auto_with(
     rest: Vec<String>,
     reg: &MergedRegistry,
-    fetch: impl FnOnce(&str) -> Result<PathBuf>,
+    fetch: impl FnOnce(&str, bool) -> Result<PathBuf>,
 ) -> Vec<String> {
     if !speculate_auto_asked(&rest) || rest.iter().any(|a| a == "--offline") {
         return rest;
@@ -846,7 +895,16 @@ fn prepare_speculate_auto_with(
     let Some((_, token)) = speculate_drafter_id(&directive) else {
         return rest;
     };
-    match fetch(token) {
+    if paired_drafter_present(reg, &drafter, Path::new(model)) {
+        return rest;
+    }
+    // The catalog's own variant may hold another file (an older release, a
+    // partial download): paired_drafter_present did not count it, and the
+    // pull goes over it.
+    let replace = token
+        .split_once(':')
+        .is_some_and(|(id, variant)| reg.local.installed_path(id, variant).is_some());
+    match fetch(token, replace) {
         Ok(path) => eprintln!(
             "basert serve: --speculate auto: {drafter} is installed ({}); superfluid's auto drafts \
              with it first, the model's own head and plain decoding behind it",
@@ -858,6 +916,77 @@ fn prepare_speculate_auto_with(
         ),
     }
     rest
+}
+
+/// Whether a copy of the catalog's drafter `drafter`, of any variant, is
+/// where superfluid's `auto` looks for it beside `target`
+/// (`speculate_resolve::auto_search_dirs` / `missing_auto_drafter`): a
+/// hub-cache install of that id (`<root>/<org>/<repo>/<variant>/model.base`),
+/// or a file named after one of its catalog files in the target's directory,
+/// its `drafters/`, or `drafters/` one level up. superfluid's `auto` takes
+/// such a copy when it fits the target and gives way to the model's own head
+/// when it does not, so the catalog's variant is pulled only when there is
+/// no copy at all.
+fn paired_drafter_present(reg: &MergedRegistry, drafter: &str, target: &Path) -> bool {
+    let in_cache = cache::variant_dir(&reg.root, drafter, "any")
+        .ok()
+        .and_then(|v| v.parent().map(Path::to_path_buf))
+        .and_then(|repo| std::fs::read_dir(repo).ok())
+        .is_some_and(|variants| {
+            variants.flatten().any(|v| {
+                let path = cache::base_artifact_path(&v.path());
+                let variant = v.file_name();
+                let row = reg
+                    .catalog
+                    .rows(drafter)
+                    .find(|r| variant.to_str() == Some(r.quant.as_str()));
+                path.is_file() && catalog_copy_matches(row, &path)
+            })
+        });
+    if in_cache {
+        return true;
+    }
+    let dir = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut dirs = vec![dir.to_path_buf(), dir.join("drafters")];
+    if let Some(up) = dir.parent() {
+        dirs.push(up.join("drafters"));
+    }
+    reg.catalog.rows(drafter).any(|row| {
+        dirs.iter().any(|d| {
+            let path = d.join(&row.file);
+            path.is_file() && catalog_copy_matches(Some(row), &path)
+        })
+    })
+}
+
+/// Whether the file at `path` is the one the catalog pins for its row, as
+/// superfluid's `digest_refusal` judges it before `auto` may take a drafter:
+/// a row with no sha256 pins nothing (any file is taken); a pinned one wants
+/// its size, and its sha256 where a pull recorded the bytes' sha256 beside
+/// the file (`hub.json`), so no gigabyte file is hashed at a start. A copy
+/// the catalog does not pin — no row for it — is taken too.
+fn catalog_copy_matches(row: Option<&CatalogEntry>, path: &Path) -> bool {
+    let Some((row, want)) = row.and_then(|r| {
+        r.sha256
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| (r, s))
+    }) else {
+        return true;
+    };
+    if let Some(size) = row.size {
+        if std::fs::metadata(path).map(|m| m.len()).ok() != Some(size) {
+            return false;
+        }
+    }
+    let recorded = path
+        .parent()
+        .and_then(|dir| cache::read_sidecar(dir).ok().flatten())
+        .and_then(|sidecar| sidecar.base_sha256);
+    recorded.is_none_or(|got| got.eq_ignore_ascii_case(want))
 }
 
 /// `<strategy>:<hub id>` for the strategies that take a drafter artifact —
@@ -961,6 +1090,15 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
         // forwarding (the runtime binary doesn't know it) and apply it during
         // hub-id resolution.
         let (variant_flag, rest) = extract_variant_flag(rest)?;
+        // `basert serve` speculates by default: no `--speculate` is `auto`,
+        // in front of everything below, so the default pulls what a
+        // hand-given `auto` pulls (the model file with its head here, the
+        // drafter in prepare_speculate_auto).
+        let rest = if cmd == "serve" {
+            crate::serve::with_default_speculation(rest)
+        } else {
+            rest
+        };
         let rest = resolve_model_args(&rest, variant_flag.as_deref())?;
         if cmd == "serve" {
             return crate::serve::run(&prepare_speculate_auto(rest));
@@ -1998,6 +2136,7 @@ fn pull_and_convert(
         synthetic: false,
         profile: profile_path,
         awq_profile: None,
+        awq_search_rows: 0,
         allow_quant_from_quant: false,
         no_mlx_passthrough: false,
         // Drafter sidecars (DFlash / DSpark / EAGLE-3) are pulled at the
@@ -4485,7 +4624,7 @@ mod tests {
     fn resolve_hub_model_rejects_empty_variant() {
         // A trailing `:` (empty variant) is a typo — error before any pull,
         // rather than silently resolving to the q4 default.
-        let err = resolve_hub_model("basecompute/Gemma-4-E2B-it:", None, None)
+        let err = resolve_hub_model("basecompute/Gemma-4-E2B-it:", None, None, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("empty variant"), "{err}");
@@ -4866,9 +5005,12 @@ mod tests {
     /// `auto` takes that drafter first and keeps its fallbacks, so a copy it
     /// cannot use (here a cached file of another shape) gives way to the
     /// model's head, where `dflash:<path>` would fail the start. The marked
-    /// drafter is fetched once; nothing is fetched for several models, a
-    /// `--model-dir`, the user's `--offline` or a strategy named by hand, and a
-    /// failed fetch leaves the args as they came too.
+    /// drafter is fetched once, also for a start that names no strategy (the
+    /// default `auto`), and only while no copy of it is installed (any variant,
+    /// in the hub cache or beside the model); nothing is fetched for several models, a
+    /// `--model-dir`, the user's `--offline` or another strategy named by
+    /// hand (`off` included), and a failed fetch leaves the args as they came
+    /// too.
     #[test]
     fn auto_prepares_the_marked_drafter_and_stays_auto() {
         use base_format::{FORMAT_VERSION, MAGIC};
@@ -4894,16 +5036,20 @@ mod tests {
         let model = tmp.path().join("models").join("Qwen3.8-27B-Q4.base");
         bundle(&model, "qwen35", 5120);
         let model = model.to_string_lossy().into_owned();
-        // A cached drafter superfluid cannot use: another architecture and width.
+        // Where a pull would install the drafter (no copy anywhere yet).
         let stale = tmp
             .path()
             .join("cache/basecompute/Qwen3.8-27B-DFlash2/default-q4/model.base");
-        bundle(&stale, "llama", 8);
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let run = |rest: Vec<String>, ok: bool| {
             let fetched = std::cell::RefCell::new(Vec::<String>::new());
-            let out = prepare_speculate_auto_with(rest.clone(), &reg, |token| {
-                fetched.borrow_mut().push(token.to_string());
+            let out = prepare_speculate_auto_with(rest.clone(), &reg, |token, replace| {
+                // `again`: the pull is to replace the installed file.
+                fetched.borrow_mut().push(if replace {
+                    format!("{token} again")
+                } else {
+                    token.to_string()
+                });
                 if ok {
                     Ok(stale.clone())
                 } else {
@@ -4921,7 +5067,12 @@ mod tests {
         assert_eq!(run(args(&[&model, "--speculate", "auto"]), true), marked);
         assert_eq!(run(args(&["--speculate=auto", &model]), true), marked);
         assert_eq!(run(args(&[&model, "--speculate", "auto"]), false), marked);
+        // No `--speculate` is `auto` (with_default_speculation): the same pull.
+        let default = |v: &[&str]| crate::serve::with_default_speculation(args(v));
+        assert_eq!(run(default(&[&model]), true), marked);
         let none = Vec::<String>::new();
+        assert_eq!(run(default(&[&model, "--speculate", "off"]), true), none);
+        assert_eq!(run(default(&[&model, "--offline"]), true), none);
         assert_eq!(
             run(args(&[&model, "--speculate", "auto", "--offline"]), true),
             none
@@ -4942,5 +5093,76 @@ mod tests {
             ),
             none
         );
+
+        // A copy of the drafter already where superfluid's `auto` looks, of
+        // any variant, that is the catalog's file for its variant (its size,
+        // and its sha256 where a pull recorded one; missing_auto_drafter with
+        // digest_refusal): nothing is fetched, by default or by hand. A sparse
+        // file of the catalog's size stands in for the real bytes.
+        let sized = |path: &Path, size: u64| {
+            bundle(path, "qwen35", 5120);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        };
+        const F16_SIZE: u64 = 3_849_185_280; // the catalog's default-f16 file
+                                             // In the hub cache as `default-f16`, not the catalog's `default-q4`:
+        let f16 = tmp
+            .path()
+            .join("cache/basecompute/Qwen3.8-27B-DFlash2/default-f16/model.base");
+        sized(&f16, F16_SIZE);
+        assert_eq!(run(default(&[&model]), true), none);
+        assert_eq!(run(args(&[&model, "--speculate", "auto"]), true), none);
+        // Not the catalog's file (another size: an older release, a partial
+        // download): superfluid refuses it, so it is no copy, and the
+        // catalog's variant is fetched.
+        sized(&f16, 4096);
+        assert_eq!(run(default(&[&model]), true), marked);
+        // The catalog's size, but a pull recorded another sha256 for it.
+        sized(&f16, F16_SIZE);
+        let mut sidecar = HubSidecar {
+            id: "basecompute/Qwen3.8-27B-DFlash2".into(),
+            source_kind: "catalog".into(),
+            hf_repo: "basecompute/Qwen3.8-27B-DFlash2".into(),
+            source_repo: None,
+            revision: "main".into(),
+            variant: "default-f16".into(),
+            profile: None,
+            pulled_at: "0".into(),
+            base_sha256: Some("0".repeat(64)),
+            file: None,
+        };
+        cache::write_sidecar(f16.parent().unwrap(), &sidecar).unwrap();
+        assert_eq!(run(default(&[&model]), true), marked);
+        // ...and the catalog's sha256: a copy.
+        sidecar.base_sha256 = reg
+            .catalog
+            .rows("basecompute/Qwen3.8-27B-DFlash2")
+            .find(|r| r.quant == "default-f16")
+            .and_then(|r| r.sha256.clone());
+        assert!(sidecar.base_sha256.is_some(), "the catalog pins the file");
+        cache::write_sidecar(f16.parent().unwrap(), &sidecar).unwrap();
+        assert_eq!(run(default(&[&model]), true), none);
+        std::fs::remove_dir_all(f16.parent().unwrap()).unwrap();
+        // Beside the model, under one of the catalog's file names for it: the
+        // same rule.
+        let beside = tmp
+            .path()
+            .join("models/drafters/Qwen3.8-27B-DFlash2-F16.base");
+        sized(&beside, F16_SIZE);
+        assert_eq!(run(default(&[&model]), true), none);
+        sized(&beside, 4096);
+        assert_eq!(run(default(&[&model]), true), marked);
+        std::fs::remove_file(&beside).unwrap();
+        // The catalog's own variant (`default-q4`) holding another file:
+        // pulled again, so the catalog's file takes its place (a resolve
+        // would hand back the installed one).
+        bundle(&stale, "llama", 8);
+        let again: Vec<String> = marked.iter().map(|t| format!("{t} again")).collect();
+        assert_eq!(run(default(&[&model]), true), again);
+        assert_eq!(run(args(&[&model, "--speculate", "auto"]), true), again);
     }
 }

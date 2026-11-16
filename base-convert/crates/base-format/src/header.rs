@@ -468,6 +468,17 @@ pub struct TensorEntry {
     /// the bundle's `quant_scheme`, no GGUF-native dispatch needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_ggml_type: Option<u32>,
+
+    /// Weight-rounding algorithm that produced a quantized tensor
+    /// ("rtn" | "awq"). Provenance only — AWQ scales are folded into
+    /// the neighbouring norm/linear at convert time, so the runtime has
+    /// nothing to apply (awq_scale_offset/length stay absent). Absent on
+    /// bundles written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algo: Option<String>,
+    /// AWQ alpha chosen for this tensor's fold group (algo = "awq").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awq_alpha: Option<f32>,
 }
 
 fn is_default_region(r: &ComputeRegion) -> bool {
@@ -500,6 +511,13 @@ pub struct CalibrationInfo {
     pub calib_tokens: u32,
     #[serde(default)]
     pub per_layer_alpha: BTreeMap<String, Vec<f32>>,
+    /// Calibration dataset identifier (from the quant profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    /// Fingerprint of the source checkpoint the sidecar was measured on
+    /// (see base-awq `sidecar.rs` for the contract).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,6 +554,10 @@ pub struct Provenance {
     pub speculator: Vec<String>,
     /// Bundle tensor name -> provenance record.
     pub tensors: BTreeMap<String, TensorProvenance>,
+    /// `basert overlay`: the spec this subset bundle was built from and the
+    /// tensors carried only because an AWQ fold modified them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1003,6 +1025,8 @@ mod tests {
             flags: TensorFlags::empty(),
             checksum_xxh64: None,
             source_ggml_type: None,
+            algo: None,
+            awq_alpha: None,
         };
         let s = serde_json::to_string(&entry).unwrap();
         assert!(!s.contains("scale_dtype"), "scale_dtype: None should skip");
@@ -1033,6 +1057,8 @@ mod tests {
             flags: TensorFlags::empty(),
             checksum_xxh64: None,
             source_ggml_type: None,
+            algo: None,
+            awq_alpha: None,
         };
         let s = serde_json::to_string(&entry).unwrap();
         let back: TensorEntry = serde_json::from_str(&s).unwrap();

@@ -162,6 +162,13 @@ impl Catalog {
         }
     }
 
+    /// The catalog as cached under `cache_dir` (whatever its age), else the
+    /// bundled copy, never fetched: what [`Self::load`] gives with
+    /// `$BASERT_CATALOG_OFFLINE` set, for a caller told to stay offline.
+    pub fn load_cached(cache_dir: &Path) -> Self {
+        Self::cache_or_bundled(&cache_dir.join(CACHE_FILE))
+    }
+
     /// The hosted catalog fetched past the cache, and written to it: for a
     /// caller with reason to think the cache is behind the Hub — a pull whose
     /// bytes fail the cached row's sha256, when a bundle's row and file changed

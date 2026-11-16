@@ -112,6 +112,8 @@ fn make_entry(
         flags: TensorFlags::empty(),
         checksum_xxh64: None,
         source_ggml_type: None,
+        algo: None,
+        awq_alpha: None,
     }
 }
 

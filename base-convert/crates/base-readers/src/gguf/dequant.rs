@@ -102,6 +102,7 @@ impl GgmlType {
             Q6K => (256, 210),
             Q8K => (256, 292),
             Iq4Xs => (256, 136), // fp16 d + 2-byte scales_h + 4-byte scales_l + 128 bytes
+            Iq4Nl => (32, 18),   // fp16 d + 16 bytes (32 x 4-bit kvalues_iq4nl indices)
             Iq2Xs => (256, 74),  // fp16 d + 32 x u16 grid/sign indices + 8 scale bytes
             Iq2S => (256, 82),   // fp16 d + 32 grid + 32 sign + 8 qh + 8 scale bytes
             Iq3Xxs => (256, 98), // fp16 d + 64 grid indices + 32 scale/sign bytes
@@ -165,6 +166,7 @@ pub fn dequant_to_f32(info: &TensorInfo, bytes: &[u8]) -> Result<Vec<f32>> {
         GgmlType::Q5K => dequant_q5_k(bytes, n),
         GgmlType::Q6K => dequant_q6_k(bytes, n),
         GgmlType::Iq4Xs => dequant_iq4_xs(bytes, n),
+        GgmlType::Iq4Nl => dequant_iq4_nl(bytes, n),
         other => bail!(
             "dequant_to_f32: {:?} not yet implemented (tensor {:?})",
             other,
@@ -689,6 +691,40 @@ fn dequant_iq4_xs(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+const IQ4_NL_BLOCK: usize = 18; // 2 (d) + 16 (qs)
+const QK4_NL: usize = 32;
+
+/// ggml dequantize_row_iq4_nl: the 32-element sibling of IQ4_XS with a single
+/// per-block d and no sub-block scales — value = d * kvalues_iq4nl[q], q the
+/// low nibble of qs[j] for j < 16 and the high nibble of qs[j - 16] for
+/// j >= 16. Unsloth's dynamic GGUFs put a few ffn tensors in this type.
+fn dequant_iq4_nl(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+    if n % QK4_NL != 0 {
+        bail!("IQ4_NL element count {n} not a multiple of {QK4_NL}");
+    }
+    let n_blocks = n / QK4_NL;
+    if bytes.len() != n_blocks * IQ4_NL_BLOCK {
+        bail!(
+            "IQ4_NL byte length mismatch: got {}, expected {}",
+            bytes.len(),
+            n_blocks * IQ4_NL_BLOCK
+        );
+    }
+    let mut out = Vec::with_capacity(n);
+    for b in 0..n_blocks {
+        let base = b * IQ4_NL_BLOCK;
+        let d = f16::from_le_bytes([bytes[base], bytes[base + 1]]).to_f32();
+        let qs = &bytes[base + 2..base + IQ4_NL_BLOCK];
+        for &q in qs {
+            out.push(d * KVALUES_IQ4NL[(q & 0xF) as usize] as f32);
+        }
+        for &q in qs {
+            out.push(d * KVALUES_IQ4NL[(q >> 4) as usize] as f32);
+        }
+    }
+    Ok(out)
+}
+
 const Q6_K_BLOCK: usize = 210; // 128 (ql) + 64 (qh) + 16 (scales) + 2 (d)
 
 fn dequant_q6_k(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
@@ -827,5 +863,35 @@ mod tests {
         assert_eq!(out[32], -0.5 * -127.0); // d * (31 - 32) * kvalue
         assert_eq!(out[48], -0.5 * -10.0);
         assert_eq!(out[64], 0.5 * -32.0 * -127.0); // ls = 0 for the zeroed sub-blocks
+    }
+
+    /// IQ4_NL: d * kvalue, the 16 low nibbles then the 16 high nibbles of a
+    /// 32-element block; blocks are 18 bytes.
+    #[test]
+    fn iq4_nl_dequant_matches_ggml_layout() {
+        assert_eq!(GgmlType::Iq4Nl.block_geometry(), (32, 18));
+        let mut block = vec![0u8; 36];
+        block[0..2].copy_from_slice(&half::f16::from_f32(0.25).to_le_bytes());
+        block[18..20].copy_from_slice(&half::f16::from_f32(-2.0).to_le_bytes());
+        for j in 0..16 {
+            block[2 + j] = 8 | (15 << 4); // values 1 (low) and 113 (high)
+            block[20 + j] = 7; // values -10 (low) and -127 (high)
+        }
+        let out = dequant_iq4_nl(&block, 64).unwrap();
+        assert_eq!(out[0], 0.25);
+        assert_eq!(out[15], 0.25);
+        assert_eq!(out[16], 0.25 * 113.0);
+        assert_eq!(out[31], 0.25 * 113.0);
+        assert_eq!(out[32], -2.0 * -10.0);
+        assert_eq!(out[48], -2.0 * -127.0);
+        assert!(dequant_iq4_nl(&block, 48).is_err());
+        assert!(dequant_iq4_nl(&block[..20], 32).is_err());
+        let info = TensorInfo {
+            name: "t".into(),
+            shape: vec![32, 2],
+            ggml_type: GgmlType::Iq4Nl,
+            data_offset: 0,
+        };
+        assert_eq!(dequant_to_f32(&info, &block).unwrap(), out);
     }
 }

@@ -61,6 +61,8 @@ fn entry(name: &str, shape: Vec<u64>) -> TensorEntry {
         flags: TensorFlags::empty(),
         checksum_xxh64: None,
         source_ggml_type: None,
+        algo: None,
+        awq_alpha: None,
     }
 }
 
@@ -466,10 +468,10 @@ fn rejects_unknown_version() {
 }
 
 #[test]
-fn target_backend_stamped_from_content() {
-    // q6 MoE expert slabs are CUDA-only (no Metal q6 MoE kernels): the
-    // writer must override the caller's Metal default so Metal builds
-    // reject the bundle at open, not at kernel lookup.
+fn target_backend_not_stamped_for_q6_experts() {
+    // q6 MoE expert slabs run on Metal since f81b88c4 (q6 MoE kernels):
+    // the writer must NOT stamp them CUDA-only (it did until 2026-09-26,
+    // which made Metal refuse every q6-expert bundle at open).
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let header = make_header();
     let mut writer = BaseWriter::create(tmp.path(), header).unwrap();
@@ -481,10 +483,9 @@ fn target_backend_stamped_from_content() {
     });
     writer.finish().unwrap();
     let reader = BaseReader::open(tmp.path()).unwrap();
-    assert_eq!(reader.header().target_backend, TargetBackend::CudaSm121);
+    assert_eq!(reader.header().target_backend, TargetBackend::Metal);
 
-    // ...but a DENSE q6 tensor (or q6 outside the expert slabs) stays
-    // universal — Metal has dense q6 kernels.
+    // ...and a DENSE q6 tensor stays universal too.
     let tmp2 = tempfile::NamedTempFile::new().unwrap();
     let mut writer = BaseWriter::create(tmp2.path(), make_header()).unwrap();
     let mut e = entry("layers.0.self_attn.q_proj.weight", vec![4, 8]);
