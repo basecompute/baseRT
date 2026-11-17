@@ -27,6 +27,7 @@ fn install(root: &Path, id: &str, variant: &str) -> PathBuf {
             profile: None,
             pulled_at: "2026-06-24T00:00:00Z".into(),
             base_sha256: None,
+            file: None,
         },
     )
     .unwrap();

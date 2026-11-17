@@ -2,7 +2,7 @@
 
 `basert` is a single front-end with three kinds of commands:
 
-- **Native** (run by the CLI itself): `pull`, `list`, `convert`, `inspect`,
+- **Native** (run by the CLI itself): `pull`, `list`, `rm`, `convert`, `inspect`,
   `sign`, `verify`, `keygen`, `add-speculator`, `superfluid`, `self`. These
   are the model hub, the converter, and installation management.
 - **Forwarded** (dispatched to the engine): `chat`, `complete`, `bench`,
