@@ -6,7 +6,7 @@
 
 Pull a model from HuggingFace, chat with it, or serve it over OpenAI-, Anthropic- and Ollama-compatible APIs — all from one CLI.
 
-[![Docs](https://img.shields.io/badge/docs-docs%2F-5b8fa8)](docs/index.md)
+[![Docs](https://img.shields.io/badge/docs-basert.basecompute.co-5b8fa8)](https://basert.basecompute.co)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon%20%C2%B7%20NVIDIA%20GB10%20%C2%B7%20AMD%20Strix-black)](#requirements)
 [![Bindings](https://img.shields.io/badge/bindings-Python%20%C2%B7%20Node%20%C2%B7%20Rust%20%C2%B7%20Swift-444)](docs/bindings/index.md)
@@ -32,7 +32,7 @@ public C API, and language bindings for Python, Node, Rust, and Swift.
 - **Bindings everywhere** — Python, Node, Rust, and Swift over a stable C API.
 - **A drop-in coding-agent backend** — see [below](#use-it-as-a-coding-agent).
 
-> **Documentation:** [`docs/`](docs/index.md). The server's API is documented at [docs.basecompute.co](https://docs.basecompute.co).
+> **Documentation:** **[basert.basecompute.co](https://basert.basecompute.co)** (source in [`docs/`](docs/index.md)). The server's API is documented at [docs.basecompute.co](https://docs.basecompute.co).
 
 ## Requirements
 
@@ -175,7 +175,7 @@ Full flag reference: [CLI reference](docs/cli/reference.md).
 | [`include/baseRT/`](include/baseRT/) | The stable public C API (`baseRT.h`, `types.h`). |
 | [`bindings/`](bindings/) | Python, Node, Rust, and Swift. |
 | [`benchmarks/`](benchmarks/) | Scripts and reference results. |
-| [`docs/`](docs/index.md) | The documentation site. |
+| [`docs/`](docs/index.md) | The documentation site ([basert.basecompute.co](https://basert.basecompute.co)). |
 
 This repository — the CLI, `.base` format, public headers, and bindings — is
 licensed under **Apache-2.0**. The engine ships as a separate prebuilt binary
@@ -184,7 +184,7 @@ under its own license; see
 
 ## Links
 
-- **[Documentation](docs/index.md)** · [Server API](docs/reference/server-api.md) · [`.base` format](base-convert/FORMAT.md)
+- **[Documentation](https://basert.basecompute.co)** · [Server API](docs/reference/server-api.md) · [`.base` format](base-convert/FORMAT.md)
 - [Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md)
 
 ## License
