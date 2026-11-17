@@ -7,8 +7,9 @@
 //! On-disk: a plain UTF-8 text file with one wikitext line per text
 //! line (matches the standard distribution at
 //! `wikitext-103-raw/wiki.train.raw` from the HF Datasets mirror).
-//! No Python deps; the user downloads the file once and points the
-//! converter at it via `--calib-file <path>`.
+//! No Python deps; the user downloads the file once. The converter does
+//! not read it: AWQ takes the activation sidecar (`--awq-profile`) that a
+//! calibration run over this text records.
 //!
 //! This module deliberately doesn't tokenize — that's the runtime's
 //! job at calibration time, since it must use the model's own
@@ -120,9 +121,8 @@ mod tests {
 
     #[test]
     fn skips_empty_lines_and_headings() {
-        let f = write_temp(
-            " \n = Title = \n  \nFirst paragraph.\n \n = = Subsection = = \nSecond.\n",
-        );
+        let f =
+            write_temp(" \n = Title = \n  \nFirst paragraph.\n \n = = Subsection = = \nSecond.\n");
         let mut r = WikiTextReader::open(f.path()).unwrap();
         let text = r.read_n_lines(5).unwrap();
         assert!(text.contains("First paragraph."));
@@ -149,7 +149,11 @@ mod tests {
         let mut r = WikiTextReader::open(f.path()).unwrap();
         let got = r.read_chars(50).unwrap();
         assert!(got.len() >= 50, "got {} chars", got.len());
-        assert!(got.len() < 100, "should stop near target, got {}", got.len());
+        assert!(
+            got.len() < 100,
+            "should stop near target, got {}",
+            got.len()
+        );
     }
 
     #[test]

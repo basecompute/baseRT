@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
-__version__ = "0.2.3"
+__version__ = "0.5.2"
 
 # ---------------------------------------------------------------------------
 # Library loading
@@ -41,18 +41,35 @@ def _lib_names() -> list[str]:
     return ["libbaseRT.so"]  # Linux / other Unix
 
 
+def _installed_engine_dirs() -> list[Path]:
+    """Where install.sh and Homebrew put the prebuilt engine."""
+    install_dir = os.environ.get("BASERT_INSTALL_DIR") or str(Path.home() / ".basert")
+    return [
+        Path(install_dir),                                      # install.sh
+        Path("/opt/homebrew/opt/basert/libexec"),               # brew, macOS
+        Path("/home/linuxbrew/.linuxbrew/opt/basert/libexec"),  # brew, Linux
+    ]
+
+
 def _find_library() -> str:
     """Locate the BaseRT shared library."""
     env = os.environ.get("BASERT_LIB_PATH")
     if env:
         return env
 
-    # Walk upward from this file to find the project build directory, trying
-    # each platform-appropriate filename in each candidate directory.
+    # Try each platform-appropriate filename in each candidate directory, in
+    # order: the engine bundled inside the PyPI wheel, a source checkout's
+    # build directory, then a prebuilt engine installed by install.sh or
+    # Homebrew. The checkout comes before the installed copies so a fresh
+    # local build is never shadowed by an older release. The working
+    # directory is tried last: whatever folder the script runs in must never
+    # outrank an installed engine, or a project could ship its own library.
     here = Path(__file__).resolve().parent
     search_dirs = [
+        here / "_engine",                     # pip install basert
         here / ".." / ".." / ".." / "build",  # bindings/python/baseRT -> build/
         here / ".." / ".." / "build",
+        *_installed_engine_dirs(),
         Path("build"),
     ]
     names = _lib_names()
@@ -63,8 +80,9 @@ def _find_library() -> str:
                 return str(resolved)
 
     raise OSError(
-        f"Cannot find {' / '.join(names)}. Set BASERT_LIB_PATH or build with "
-        "`make shared`."
+        f"Cannot find {' / '.join(names)}. Install the engine (`pip install "
+        "basert`, `brew install basecompute/tap/basert`, or install.sh), set BASERT_LIB_PATH, "
+        "or build with `make shared`."
     )
 
 
@@ -138,6 +156,12 @@ class BaseRTModelConfig(ctypes.Structure):
         ("gdn_key_head_dim", ctypes.c_uint32),
         ("gdn_value_head_dim", ctypes.c_uint32),
         ("gdn_conv_kernel", ctypes.c_uint32),
+        # Nemotron-H hybrid Mamba-2 SSM (0 = not a Mamba-2 hybrid)
+        ("ssm_state_size", ctypes.c_uint32),
+        ("ssm_conv_kernel", ctypes.c_uint32),
+        ("ssm_num_groups", ctypes.c_uint32),
+        ("ssm_inner_size", ctypes.c_uint32),
+        ("ssm_num_heads", ctypes.c_uint32),
         # Mixture-of-Experts (0 = dense)
         ("n_experts", ctypes.c_uint32),
         ("n_experts_used", ctypes.c_uint32),
@@ -146,6 +170,7 @@ class BaseRTModelConfig(ctypes.Structure):
         ("expert_gating", ctypes.c_uint8),
         ("norm_topk_prob", ctypes.c_uint8),
         ("_moe_pad", ctypes.c_uint8 * 2),
+        ("expert_weights_scale", ctypes.c_float),
         # Vision tower
         ("vision_n_layers", ctypes.c_uint32),
         ("vision_dim", ctypes.c_uint32),
@@ -207,6 +232,27 @@ class BaseRTModelConfig(ctypes.Structure):
         ("vision_pos_embed_w", ctypes.c_uint32),
         ("vision_adapter_dim", ctypes.c_uint32),
         ("video_token_id", ctypes.c_uint32),
+        # GLM 5.2 / glm-dsa
+        ("q_lora_rank", ctypes.c_uint32),
+        ("kv_lora_rank", ctypes.c_uint32),
+        ("qk_nope_head_dim", ctypes.c_uint32),
+        ("qk_rope_head_dim", ctypes.c_uint32),
+        ("v_head_dim", ctypes.c_uint32),
+        ("routed_scaling_factor", ctypes.c_float),
+        ("first_k_dense_replace", ctypes.c_uint32),
+        ("nextn_predict_layers", ctypes.c_uint32),
+        ("indexer_head_count", ctypes.c_uint32),
+        ("indexer_key_length", ctypes.c_uint32),
+        ("indexer_top_k", ctypes.c_uint32),
+        # gpt-oss
+        ("rope_yarn_beta_fast", ctypes.c_float),
+        ("rope_yarn_beta_slow", ctypes.c_float),
+        ("swiglu_limit", ctypes.c_float),
+        ("swiglu_alpha", ctypes.c_float),
+        ("attention_sinks", ctypes.c_uint8),
+        ("attention_bias", ctypes.c_uint8),
+        ("rope_yarn_truncate", ctypes.c_uint8),
+        ("_gptoss_pad", ctypes.c_uint8),
     ]
 
 

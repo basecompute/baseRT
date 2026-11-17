@@ -9,8 +9,12 @@
 use crate::{AwqMode, ConvertArgs, ListArgs, PullArgs, RmArgs, TargetScheme};
 use anyhow::{bail, Context, Result};
 use base_hub::cache::{self, HubSidecar};
+use base_hub::catalog::CatalogEntry;
 use base_hub::fetch::{self, Fetcher, HfFetcher};
-use base_hub::registry::{MergedRegistry, ModelEntry, ModelRef, Registry, SourceKind};
+use base_hub::parts::{self, Artifact, Grouped};
+use base_hub::registry::{
+    CatalogRegistry, MergedRegistry, ModelEntry, ModelRef, Registry, SourceKind,
+};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -61,7 +65,10 @@ fn want_source_file(name: &str) -> bool {
 /// `default-q4` → `q4`, `base_q8` → `q8`, `Llama-3.2-1B-Instruct-Q4` → `q4`,
 /// `bf16` → `bf16`.
 fn quant_tag(s: &str) -> String {
-    s.rsplit(['-', '_']).next().unwrap_or(s).to_ascii_lowercase()
+    s.rsplit(['-', '_'])
+        .next()
+        .unwrap_or(s)
+        .to_ascii_lowercase()
 }
 
 /// True when `tag` names a quant scheme we know how to label on disk.
@@ -72,6 +79,85 @@ fn is_quant_tag(tag: &str) -> bool {
     )
 }
 
+/// The sizes a release names its `.base` files by instead of a quant (the
+/// BaseQuant repos' `-XS`/`-Small`/`-Medium`/`-Large`/`-XL`), smallest first.
+const SIZE_NAMES: [&str; 5] = ["xs", "small", "medium", "large", "xl"];
+
+/// The size a pull takes from such a release when nothing names one.
+const DEFAULT_SIZE: &str = "medium";
+
+/// The size `name` spells, case aside (`Medium` → `medium`).
+fn size_name(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    SIZE_NAMES.iter().copied().find(|s| *s == n)
+}
+
+/// The size a `.base` is named by (`Foo-Medium.base` → `medium`), if any.
+fn size_tag(file: &str) -> Option<&'static str> {
+    size_name(&quant_tag(&base_file_stem(file)))
+}
+
+/// The sizes a repo's `.base` files come in, smallest first, or None when
+/// none is named by size.
+fn sizes_offered(files: &Grouped) -> Option<String> {
+    let sizes: Vec<&str> = SIZE_NAMES
+        .iter()
+        .copied()
+        .filter(|s| files.artifacts.iter().any(|f| size_tag(&f.name) == Some(s)))
+        .collect();
+    (!sizes.is_empty()).then(|| sizes.join(", "))
+}
+
+/// The `.base` a plain pull takes from a repo whose files are named by size
+/// and none by quant: the one of [`DEFAULT_SIZE`], else the sole file.
+/// None when the repo is not such a release, so the quant rule applies; an
+/// incomplete part set of that size is an error saying why, never another
+/// size.
+fn default_size_file(files: &Grouped) -> Result<Option<String>> {
+    let quant_named = |n: &str| is_quant_tag(&quant_tag(&base_file_stem(n)));
+    let sized = files.artifacts.iter().any(|f| size_tag(&f.name).is_some())
+        || files.malformed.iter().any(|(n, _)| size_tag(n).is_some());
+    if !sized
+        || files.artifacts.iter().any(|f| quant_named(&f.name))
+        || files.malformed.iter().any(|(n, _)| quant_named(n))
+    {
+        return Ok(None);
+    }
+    let mediums: Vec<&Artifact> = files
+        .artifacts
+        .iter()
+        .filter(|f| size_tag(&f.name) == Some(DEFAULT_SIZE))
+        .collect();
+    match mediums.as_slice() {
+        [one] => return Ok(Some(one.name.clone())),
+        [] => {}
+        many => bail!(
+            "{DEFAULT_SIZE} names several files in this repo ({}); take one with --file",
+            many.iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+    if let Some((name, why)) = files
+        .malformed
+        .iter()
+        .find(|(n, _)| size_tag(n) == Some(DEFAULT_SIZE))
+    {
+        bail!("{name}: the {DEFAULT_SIZE} publication is incomplete ({why})");
+    }
+    if let ([only], []) = (files.artifacts.as_slice(), files.malformed.as_slice()) {
+        return Ok(Some(only.name.clone()));
+    }
+    Ok(None)
+}
+
+/// Whether the pull names a quant (`--profile`, `--target`) rather than
+/// taking the default one.
+fn quant_named(args: &PullArgs) -> bool {
+    args.profile.is_some() || args.target.is_some()
+}
+
 /// The quant the user is asking for, derived from `--profile` (its filename)
 /// or, failing that, `--target`.
 fn quant_token(args: &PullArgs) -> String {
@@ -80,7 +166,7 @@ fn quant_token(args: &PullArgs) -> String {
             return quant_tag(stem);
         }
     }
-    quant_tag(target_str(args.target))
+    quant_tag(target_str(args.target_scheme()))
 }
 
 /// `path/to/Foo-Q4.base` → `Foo-Q4`.
@@ -89,29 +175,168 @@ fn base_file_stem(f: &str) -> String {
     b.strip_suffix(".base").unwrap_or(b).to_string()
 }
 
-/// List the `.base` artifacts a repo hosts (empty when it ships none).
-fn list_base_files(fetcher: &dyn Fetcher, repo: &str, revision: &str) -> Result<Vec<String>> {
+/// List the `.base` artifacts a repo hosts (empty when it ships none). A
+/// bundle the Hub's 50 GB file cap forced into `.base.part-NNN` pieces shows
+/// up once, under its logical `.base` name.
+fn list_base_files(fetcher: &dyn Fetcher, repo: &str, revision: &str) -> Result<Grouped> {
     let files = fetcher
         .list_files(repo, revision)
         .with_context(|| format!("listing files in {repo}@{revision}"))?;
-    Ok(files.into_iter().filter(|f| f.ends_with(".base")).collect())
+    let grouped = parts::group(files);
+    for (name, why) in &grouped.malformed {
+        eprintln!("  skipping {name}: {why}");
+    }
+    Ok(grouped)
 }
 
-/// Pick the `.base` whose quant tag matches `want`. Falls back to the sole
-/// artifact when the repo has exactly one; errors when several are present and
+/// Pick the `.base` whose quant tag matches `want`. A malformed part set
+/// carrying that quant is an error saying why, never a fall-through to a
+/// different quant. Falls back to the sole artifact when the repo has
+/// exactly one and nothing malformed; errors when several are present and
 /// none match.
-fn select_base_file<'a>(files: &'a [String], want: &str) -> Result<&'a String> {
-    if let Some(f) = files.iter().find(|f| quant_tag(&base_file_stem(f)) == want) {
+fn select_base_file<'a>(files: &'a Grouped, want: &str) -> Result<&'a Artifact> {
+    if let Some(f) = files
+        .artifacts
+        .iter()
+        .find(|f| quant_tag(&base_file_stem(&f.name)) == want)
+    {
         return Ok(f);
     }
-    if let [only] = files {
+    if let Some((name, why)) = files
+        .malformed
+        .iter()
+        .find(|(n, _)| quant_tag(&base_file_stem(n)) == want)
+    {
+        bail!("{name}: the {want} publication is incomplete ({why})");
+    }
+    if let ([only], []) = (files.artifacts.as_slice(), files.malformed.as_slice()) {
         return Ok(only);
     }
-    let avail: Vec<String> = files.iter().map(|f| quant_tag(&base_file_stem(f))).collect();
+    let avail: Vec<String> = files
+        .artifacts
+        .iter()
+        .map(|f| quant_tag(&base_file_stem(&f.name)))
+        .chain(
+            files
+                .malformed
+                .iter()
+                .map(|(n, _)| format!("{} (incomplete)", quant_tag(&base_file_stem(n)))),
+        )
+        .collect();
+    if let Some(sizes) = sizes_offered(files) {
+        bail!(
+            "no .base for quant {want:?} in this repo: its files are named by size \
+             ({sizes}); take one as `<id>:<size>` or by name with --file: {}",
+            file_names(files)
+        );
+    }
     bail!(
-        "no pre-converted .base for quant {want:?} in this repo; it offers: {}",
-        avail.join(", ")
+        "no pre-converted .base for quant {want:?} in this repo; it offers: {} \
+         (or take one by name with --file: {})",
+        avail.join(", "),
+        file_names(files)
     )
+}
+
+/// Whether `name`, as given to `--file`, names the repo file `f`: by its
+/// whole path when `name` has a directory, else by its file name; the
+/// `.base` extension is optional either way.
+fn names_file(name: &str, f: &str) -> bool {
+    let bare = |s: &str| s.strip_suffix(".base").unwrap_or(s).to_string();
+    if name.contains('/') {
+        bare(name) == bare(f)
+    } else {
+        base_file_stem(f) == bare(name)
+    }
+}
+
+/// Pick the `.base` that `name` names (see [`names_file`]). A file name
+/// shared by several directories must be given with its path; a malformed
+/// part set by that name is an error saying why; no match lists the names
+/// there are.
+fn select_named_base_file<'a>(files: &'a Grouped, name: &str) -> Result<&'a Artifact> {
+    let hits: Vec<&Artifact> = files
+        .artifacts
+        .iter()
+        .filter(|f| names_file(name, &f.name))
+        .collect();
+    let broken: Vec<&(String, String)> = files
+        .malformed
+        .iter()
+        .filter(|(n, _)| names_file(name, n))
+        .collect();
+    match (hits.as_slice(), broken.as_slice()) {
+        ([one], []) => Ok(one),
+        ([], [(n, why)]) => bail!("{n}: this publication is incomplete ({why})"),
+        ([], []) => bail!(
+            "no .base named {name:?} in this repo; it has: {}",
+            file_names(files)
+        ),
+        _ => bail!(
+            "{name:?} names several files in this repo ({}); give its path",
+            hits.iter()
+                .map(|f| f.name.clone())
+                .chain(broken.iter().map(|(n, _)| format!("{n} (incomplete)")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn file_names(files: &Grouped) -> String {
+    files
+        .artifacts
+        .iter()
+        .map(|f| f.name.clone())
+        .chain(
+            files
+                .malformed
+                .iter()
+                .map(|(n, _)| format!("{n} (incomplete)")),
+        )
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The variant a `.base` picked by quant installs under: the artifact's own
+/// quant when it carries one (so a `-Q8.base` never lands in a `default-q4`
+/// dir); otherwise what was requested.
+fn base_variant(file: &str, want: &str) -> String {
+    let file_tag = quant_tag(&base_file_stem(file));
+    if is_quant_tag(&file_tag) {
+        format!("default-{file_tag}")
+    } else if size_tag(file).is_some() {
+        // a file named by size is its own variant, as `--file` installs it
+        named_variant(file)
+    } else {
+        format!("default-{want}")
+    }
+}
+
+/// Variants of files taken by `--file` that no catalog row publishes start
+/// with this, so none is ever a catalog row's or a quant's: the resolver
+/// reaches one only by its exact name.
+pub(crate) const NAMED_VARIANT_PREFIX: &str = "file-";
+
+/// The variant a `--file` pull installs a file the catalog does not publish
+/// under: the prefix, its path in the repo made readable (`Foo-Medium.base`
+/// → `file-foo-medium-…`) and cut to 64 bytes so the directory name stays
+/// well inside a filesystem's 255-byte limit, and the first 8 hex digits of the
+/// path's sha256, so paths the readable part folds together (`a/model.base`,
+/// `a-model.base`, `A-Model.base`, two long paths sharing a prefix) still get
+/// variants of their own.
+fn named_variant(file: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let path = file.strip_suffix(".base").unwrap_or(file);
+    let mut readable = path.replace('/', "-").to_ascii_lowercase();
+    let mut end = readable.len().min(64);
+    while !readable.is_char_boundary(end) {
+        end -= 1;
+    }
+    readable.truncate(end);
+    let digest = Sha256::digest(file.as_bytes());
+    let short: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{NAMED_VARIANT_PREFIX}{readable}-{short}")
 }
 
 /// Decide whether `token` should be treated as a hub model id rather than a
@@ -169,11 +394,9 @@ fn installed_single_path(reg: &MergedRegistry, id: &str) -> Result<Option<PathBu
     let hits: Vec<&ModelEntry> = installed.iter().filter(|r| r.id == id).collect();
     match hits.as_slice() {
         [] => Ok(None),
-        [one] => Ok(Some(
-            one.path
-                .clone()
-                .with_context(|| format!("installed model `{id}` has no artifact path"))?,
-        )),
+        [one] => Ok(Some(one.path.clone().with_context(|| {
+            format!("installed model `{id}` has no artifact path")
+        })?)),
         many => {
             // Multiple variants installed — e.g. a universal `default-q4` cached
             // before the backend-qualified catalog entries existed, plus a native
@@ -185,25 +408,43 @@ fn installed_single_path(reg: &MergedRegistry, id: &str) -> Result<Option<PathBu
             // foreign-native bundle it simply won't be present.
             let backend = base_hub::registry::CatalogRegistry::client_backend();
             let native_prefix = format!("{backend}-");
-            let native: Vec<&ModelEntry> =
-                many.iter().copied().filter(|r| r.variant.starts_with(&native_prefix)).collect();
+            let native: Vec<&ModelEntry> = many
+                .iter()
+                .copied()
+                .filter(|r| r.variant.starts_with(&native_prefix))
+                .collect();
             let pick = if native.len() == 1 {
                 Some(native[0])
             } else if native.is_empty() {
-                let uni: Vec<&ModelEntry> =
-                    many.iter().copied().filter(|r| r.variant.starts_with("default-")).collect();
+                let uni: Vec<&ModelEntry> = many
+                    .iter()
+                    .copied()
+                    .filter(|r| r.variant.starts_with("default-"))
+                    .collect();
                 (uni.len() == 1).then(|| uni[0])
             } else {
                 None
             };
+            // Files of a release in sizes, each under its own `file-…`
+            // variant: the default size, when it is the one installed.
+            let pick = pick.or_else(|| {
+                let sized: Vec<&ModelEntry> = many
+                    .iter()
+                    .copied()
+                    .filter(|r| r.file.as_deref().and_then(size_tag) == Some(DEFAULT_SIZE))
+                    .collect();
+                (sized.len() == 1).then(|| sized[0])
+            });
             if let Some(one) = pick {
-                return Ok(Some(
-                    one.path
-                        .clone()
-                        .with_context(|| format!("installed model `{id}` has no artifact path"))?,
-                ));
+                return Ok(Some(one.path.clone().with_context(|| {
+                    format!("installed model `{id}` has no artifact path")
+                })?));
             }
-            let variants = many.iter().map(|r| r.variant.as_str()).collect::<Vec<_>>().join(", ");
+            let variants = many
+                .iter()
+                .map(|r| r.variant.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             bail!("model `{id}` has multiple installed variants ({variants}) — specify one as `{id}:<variant>`")
         }
     }
@@ -220,6 +461,9 @@ fn installed_best_variant(reg: &MergedRegistry, id: &str, want: &str) -> Option<
     if let Some(p) = reg.local.installed_path(id, want) {
         return Some(p); // exact variant name present
     }
+    if let Some(size) = size_name(want) {
+        return installed_size_path(reg, id, size);
+    }
     let want_bits = base_hub::registry::quant_bits(want).unwrap_or(want);
     let backend = base_hub::registry::CatalogRegistry::client_backend();
     let native_prefix = format!("{backend}-");
@@ -232,7 +476,7 @@ fn installed_best_variant(reg: &MergedRegistry, id: &str, want: &str) -> Option<
     let runnable = |v: &str| -> bool {
         match v.split_once('-') {
             Some((slot, _)) if KNOWN_BACKENDS.contains(&slot) => slot == backend, // native only
-            _ => true,                                                            // default-*, bare bits, etc.
+            _ => true, // default-*, bare bits, etc.
         }
     };
     let installed = reg.local.list().ok()?;
@@ -241,7 +485,10 @@ fn installed_best_variant(reg: &MergedRegistry, id: &str, want: &str) -> Option<
         .filter(|r| {
             r.id == id
                 && runnable(&r.variant)
-                && base_hub::registry::quant_bits(&r.variant).unwrap_or(r.variant.as_str()) == want_bits
+                // a file taken by name answers only to its exact variant
+                && !r.variant.starts_with(NAMED_VARIANT_PREFIX)
+                && base_hub::registry::quant_bits(&r.variant).unwrap_or(r.variant.as_str())
+                    == want_bits
         })
         .collect();
     if matches.is_empty() {
@@ -252,14 +499,32 @@ fn installed_best_variant(reg: &MergedRegistry, id: &str, want: &str) -> Option<
     matches[0].path.clone()
 }
 
+/// The install of `id` that holds the `.base` named by `size` (`:medium`):
+/// a file taken by name or as a release's default size installs under its
+/// own `file-…` variant, recording the file, which is the only way its size
+/// is known.
+fn installed_size_path(reg: &MergedRegistry, id: &str, size: &str) -> Option<PathBuf> {
+    reg.local
+        .list()
+        .ok()?
+        .into_iter()
+        .find(|r| {
+            r.id == id
+                && r.variant.starts_with(NAMED_VARIANT_PREFIX)
+                && r.file.as_deref().and_then(size_tag) == Some(size)
+        })
+        .and_then(|r| r.path)
+}
+
 /// Fetch a not-yet-installed model on demand, then return its artifact path.
 /// Prefers the pre-converted basecompute mirror; otherwise converts the source
 /// repo on pull. Progress (download + quantization) is shown by `cmd_pull`.
-fn auto_pull_and_resolve(reg: &MergedRegistry, id: &str, want_variant: Option<&str>) -> Result<PathBuf> {
+fn auto_pull_and_resolve(
+    reg: &MergedRegistry,
+    id: &str,
+    want_variant: Option<&str>,
+) -> Result<PathBuf> {
     let pull_id = preconverted_id(reg, id);
-    let target = want_variant
-        .map(|v| target_from_quant(&quant_tag(v)))
-        .unwrap_or(TargetScheme::BaseQ4);
 
     if pull_id != id {
         eprintln!("{id}: not installed — using pre-converted {pull_id}");
@@ -267,21 +532,26 @@ fn auto_pull_and_resolve(reg: &MergedRegistry, id: &str, want_variant: Option<&s
         eprintln!("{id}: not installed — fetching (download + convert if needed)");
     }
 
+    // The variant goes with the id: the pull `basert pull <id>:<variant>`
+    // makes, so a catalog variant or a `file-…` one is fetched as named, not
+    // as the quant its last segment happens to spell.
     cmd_pull(PullArgs {
-        id: pull_id.clone(),
+        id: want_variant.map_or_else(|| pull_id.clone(), |v| format!("{pull_id}:{v}")),
         profile: None,
-        target,
+        target: None,
         revision: "main".to_string(),
+        file: None,
         force: false,
         dry_run: false,
     })
     .with_context(|| format!("auto-fetching {pull_id}"))?;
 
     // Re-scan and return the freshly-installed artifact (registered under the
-    // pulled id, which may differ from the requested one).
+    // pulled id, which may differ from the requested one): the variant as
+    // named, or for a quant (`:q8`) the slot it installed under.
     let reg2 = MergedRegistry::load()?;
     if let Some(v) = want_variant {
-        if let Some(p) = reg2.local.installed_path(&pull_id, v) {
+        if let Some(p) = installed_best_variant(&reg2, &pull_id, v) {
             return Ok(p);
         }
     }
@@ -295,11 +565,118 @@ fn auto_pull_and_resolve(reg: &MergedRegistry, id: &str, want_variant: Option<&s
 /// the token, or by the `--variant` launcher flag (`default_variant`) for
 /// tokens without an inline `:variant` — the inline form wins. With neither,
 /// the sole installed variant is used (and it's an error to resolve a model
-/// with several installed without naming one). An uninstalled model is fetched
+/// with several installed without naming one). Under `offline` (`basert serve
+/// --offline`) only what is installed resolves, against the catalog as cached
+/// (MergedRegistry::load_cached), and anything else is refused with the pull
+/// to run. Otherwise an uninstalled model is fetched
 /// on demand — preferring the pre-converted basecompute mirror, else converting
 /// the source repo — so `basert chat`/`serve <id>` Just Works.
-fn resolve_hub_model(token: &str, default_variant: Option<&str>) -> Result<PathBuf> {
-    let (id, inline) = token.split_once(':').map_or((token, None), |(i, v)| (i, Some(v)));
+/// What `--speculate` asks of the model's own MTP head in a runtime
+/// command's args: bare `mtp-head`, or `auto`, which takes that head before
+/// any drafter. None when speculation is off or not asked for, a drafter is
+/// named, or the strategy needs no head (`prompt-lookup`).
+pub(crate) fn mtp_speculation_asked(rest: &[String]) -> Option<&str> {
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let v = if a == "--speculate" {
+            it.next().map(String::as_str)
+        } else {
+            a.strip_prefix("--speculate=")
+        };
+        if let Some(v) = v {
+            return matches!(v, "mtp-head" | "auto").then_some(v);
+        }
+    }
+    None
+}
+
+/// An installed catalog file that cannot serve the speculation asked for,
+/// though the catalog's current file could: it carries no MTP head, or one
+/// of another version than the row's `speculator_version`, while the row for
+/// the same id and variant says the published file has one (`speculator:
+/// mtp`, or `gemma4-mtp` for Gemma 4's embedded head) and is another file
+/// (its sha256 differs). Only a file the catalog installed qualifies —
+/// pulling it again replaces like with like; a conversion or a file from
+/// elsewhere is left alone. Returns the variant to pull again.
+fn stale_head_variant(reg: &MergedRegistry, id: &str, path: &Path) -> Option<String> {
+    let sidecar = cache::read_sidecar(path.parent()?).ok()??;
+    if sidecar.source_kind != "catalog" {
+        return None;
+    }
+    let row = reg.catalog.rows(id).find(|e| e.quant == sidecar.variant)?;
+    if !matches!(row.speculator.as_deref(), Some("mtp" | "gemma4-mtp")) {
+        return None;
+    }
+    let same_file = matches!((&row.sha256, &sidecar.base_sha256), (Some(want), Some(got)) if want.eq_ignore_ascii_case(got));
+    if same_file {
+        return None;
+    }
+    let header = base_format::BaseReader::read_header(path).ok()?;
+    let stale = match (&header.speculator, &row.speculator_version) {
+        // No head at all.
+        (None, _) => true,
+        // A head of another version than the one the catalog publishes.
+        (Some(have), Some(want)) => {
+            have.config.get("head_version").and_then(|v| v.as_str()) != Some(want.as_str())
+        }
+        // A head, and the catalog names no version to hold it to.
+        (Some(_), None) => false,
+    };
+    stale.then_some(sidecar.variant)
+}
+
+/// The installed artifact to serve, pulled again first when `--speculate
+/// <directive>` asks for its MTP head and the catalog's current file has one
+/// this file lacks (stale_head_variant). Without a speculation request the
+/// file is served as it is, with no word said.
+fn serve_ready(
+    reg: &MergedRegistry,
+    id: &str,
+    path: PathBuf,
+    mtp: Option<&str>,
+) -> Result<PathBuf> {
+    let Some(directive) = mtp else {
+        return Ok(path);
+    };
+    // Under `auto` a target the catalog pairs with a drafter drafts with that
+    // drafter, which prepare_speculate_auto installs and superfluid's `auto`
+    // takes first: its own head is not what the start will use, so a file
+    // without one is not pulled again for it.
+    if directive == "auto" && auto_drafter_row(reg, id).is_some() {
+        return Ok(path);
+    }
+    let Some(variant) = stale_head_variant(reg, id, &path) else {
+        return Ok(path);
+    };
+    eprintln!(
+        "{id} [{variant}]: the installed file carries no MTP head and the catalog's current one does — \
+         pulling it again for --speculate {directive}"
+    );
+    cmd_pull(PullArgs {
+        id: format!("{id}:{variant}"),
+        profile: None,
+        target: None,
+        revision: "main".to_string(),
+        file: None,
+        force: true,
+        dry_run: false,
+    })
+    .with_context(|| format!("pulling {id}:{variant} again"))?;
+    let reg2 = MergedRegistry::load()?;
+    installed_best_variant(&reg2, id, &variant).with_context(|| {
+        format!("pulled {id}:{variant} again but could not locate the installed artifact")
+    })
+}
+
+fn resolve_hub_model(
+    token: &str,
+    default_variant: Option<&str>,
+    mtp: Option<&str>,
+    offline: bool,
+) -> Result<PathBuf> {
+    let (id, inline) = token
+        .split_once(':')
+        .map_or((token, None), |(i, v)| (i, Some(v)));
 
     // A trailing/empty `:` is a typo, not "default variant" — fail loudly so it
     // doesn't silently resolve to q4.
@@ -313,17 +690,34 @@ fn resolve_hub_model(token: &str, default_variant: Option<&str>) -> Result<PathB
 
     // Inline `:variant` wins over the `--variant` flag.
     let variant = inline.or(default_variant);
-    let reg = MergedRegistry::load()?;
+    let reg = if offline {
+        MergedRegistry::load_cached()?
+    } else {
+        MergedRegistry::load()?
+    };
+    let refuse = || {
+        anyhow::anyhow!(
+            "{token}: not installed, and --offline forbids a download; run `basert pull {}` \
+             first, or start without --offline",
+            variant.map_or_else(|| id.to_string(), |v| format!("{id}:{v}"))
+        )
+    };
 
     if let Some(v) = variant {
         if let Some(p) = installed_best_variant(&reg, id, v) {
-            return Ok(p);
+            return serve_ready(&reg, id, p, mtp);
+        }
+        if offline {
+            return Err(refuse());
         }
         return auto_pull_and_resolve(&reg, id, Some(v));
     }
 
     if let Some(p) = installed_single_path(&reg, id)? {
-        return Ok(p);
+        return serve_ready(&reg, id, p, mtp);
+    }
+    if offline {
+        return Err(refuse());
     }
     auto_pull_and_resolve(&reg, id, None)
 }
@@ -332,17 +726,280 @@ fn resolve_hub_model(token: &str, default_variant: Option<&str>) -> Result<PathB
 /// `basert chat org/model` (positional) and `basert serve --model org/model`
 /// (repeatable flag) both Just Work after `basert pull`. `default_variant`
 /// comes from the `--variant` launcher flag and applies to ids without an
-/// inline `:variant`.
+/// inline `:variant`. Under `--offline` nothing reaches the network: ids
+/// resolve to what is installed, or are refused (resolve_hub_model).
 fn resolve_model_args(rest: &[String], default_variant: Option<&str>) -> Result<Vec<String>> {
+    // `--speculate mtp-head` / `auto` asks for the model's own head: a stale
+    // catalog file without one is pulled again on the way (serve_ready) —
+    // never under `--offline`, which serves the installed file as it is.
+    let offline = rest.iter().any(|a| a == "--offline");
+    let mtp = mtp_speculation_asked(rest).filter(|_| !offline);
     rest.iter()
         .map(|arg| {
             if looks_like_hub_id(arg) {
-                Ok(resolve_hub_model(arg, default_variant)?.to_string_lossy().into_owned())
+                Ok(resolve_hub_model(arg, default_variant, mtp, offline)?
+                    .to_string_lossy()
+                    .into_owned())
+            } else if let Some((kind, id)) = speculate_drafter_id(arg) {
+                // `--speculate dflash:<id>` takes the SAME road as the model
+                // it drafts for: catalogue lookup, pull, convert-on-pull,
+                // variant selection, hub cache. A drafter was the one model a
+                // user had to fetch and convert by hand and then name by path.
+                let path = resolve_hub_model(id, default_variant, None, offline)?;
+                Ok(format!("{kind}:{}", path.to_string_lossy()))
             } else {
                 Ok(arg.clone())
             }
         })
         .collect()
+}
+
+/// Whether a runtime command's args ask for `--speculate auto` (two words or
+/// `--speculate=auto`); false when speculation is not asked for, or is asked
+/// for by name.
+fn speculate_auto_asked(rest: &[String]) -> bool {
+    for (i, a) in rest.iter().enumerate() {
+        if a == "--speculate" {
+            return rest.get(i + 1).map(String::as_str) == Some("auto");
+        }
+        if let Some(v) = a.strip_prefix("--speculate=") {
+            return v == "auto";
+        }
+    }
+    false
+}
+
+/// The drafter the catalog has `--speculate auto` serve target `id` with
+/// (`speculator_auto` on a sidecar row of a kind `--speculate` takes), on a
+/// Metal client: the pairings marked so far were measured there (Qwen3.8-27B
+/// and Qwen3.6-35B-A3B with DFlash2 against their in-bundle heads, M5 Pro,
+/// 2026-11), so another backend keeps superfluid's own choice until measured.
+fn auto_drafter_row<'a>(
+    reg: &'a MergedRegistry,
+    id: &str,
+) -> Option<&'a base_hub::catalog::CatalogEntry> {
+    if base_hub::registry::CatalogRegistry::client_backend() != "metal" {
+        return None;
+    }
+    reg.catalog.auto_drafter(id).filter(|row| {
+        matches!(
+            row.speculator.as_deref(),
+            Some("dflash" | "dspark" | "eagle3")
+        )
+    })
+}
+
+/// The catalog id of the target a served `.base` is: the id its hub-cache
+/// sidecar records for a file the catalog installed, else — a bundle kept
+/// outside the cache and served by path — the one catalog target that
+/// publishes a file of that name. None for a conversion of the user's own.
+fn catalog_target_id(reg: &MergedRegistry, path: &Path) -> Option<String> {
+    if let Some(sidecar) = path
+        .parent()
+        .and_then(|dir| cache::read_sidecar(dir).ok().flatten())
+    {
+        return (sidecar.source_kind == "catalog").then_some(sidecar.id);
+    }
+    let file = path.file_name()?.to_str()?;
+    reg.catalog.target_id_of_file(file).map(str::to_string)
+}
+
+/// What `--speculate auto` becomes for the one model `basert serve` starts
+/// with, as `(--speculate value over catalog ids, the drafter's id)`: the
+/// drafter the catalog pairs with it (auto_drafter_row), at the file that
+/// row names. None when the choice stays superfluid's: the bundle carries
+/// Google's Gemma 4 head (`gemma4-mtp`, which `auto` takes first and no
+/// drafter replaces), the model is not a catalog target, or the catalog
+/// pairs it with nothing.
+fn speculate_auto_directive(reg: &MergedRegistry, model: &Path) -> Option<(String, String)> {
+    if crate::serve::embedded_head_kind(model).as_deref() == Some("gemma4-mtp") {
+        return None;
+    }
+    let id = catalog_target_id(reg, model)?;
+    let row = auto_drafter_row(reg, &id)?;
+    let kind = row.speculator.as_deref()?;
+    Some((format!("{kind}:{}:{}", row.id, row.quant), row.id.clone()))
+}
+
+/// `basert serve <model> --speculate auto`, the model already a path: the
+/// drafter the catalog pairs with that model (auto_drafter_row) is pulled when
+/// no copy of it, of any variant, is where superfluid's `auto` looks
+/// (paired_drafter_present) — the road `--speculate dflash:<id>` takes — and the
+/// args go on as they came. `auto` stays superfluid's to settle: it takes that
+/// installed drafter first (it reads the same catalog, the cache's
+/// `.catalog-cache.json`, even under the `--offline` every start hands it) and
+/// keeps its fallbacks, so a copy it cannot use (stale, of another shape, or
+/// refused by the engine) gives way to the bundle's own head, then to plain
+/// decoding. Naming the file here (`dflash:<path>`) would make it an explicit
+/// choice, which superfluid refuses at startup instead. Nothing is pulled for
+/// another strategy, several models or a `--model-dir` (superfluid's one
+/// `--speculate` is not one model's there), a model with nothing paired, or
+/// under the user's own `--offline`; a drafter that could not be fetched is
+/// said and never stops the start. The default `auto` (no `--speculate`,
+/// with_default_speculation) comes here as the hand-given one does. Under
+/// `--offline` it returns before the registry loads, since loading reads the
+/// hosted catalog when the cached one is missing or old.
+fn prepare_speculate_auto(rest: Vec<String>) -> Vec<String> {
+    if !speculate_auto_asked(&rest) || rest.iter().any(|a| a == "--offline") {
+        return rest;
+    }
+    let Ok(reg) = MergedRegistry::load() else {
+        return rest;
+    };
+    prepare_speculate_auto_with(rest, &reg, |token, replace| {
+        if !replace {
+            return resolve_hub_model(token, None, None, false);
+        }
+        eprintln!(
+            "basert serve: --speculate auto: the installed {token} is not the catalog's file — pulling it again"
+        );
+        cmd_pull(PullArgs {
+            id: token.to_string(),
+            profile: None,
+            target: None,
+            revision: "main".to_string(),
+            file: None,
+            force: true,
+            dry_run: false,
+        })?;
+        let (id, variant) = token.split_once(':').unwrap_or((token, ""));
+        installed_best_variant(&MergedRegistry::load()?, id, variant)
+            .with_context(|| format!("pulled {token} again but could not locate it"))
+    })
+}
+
+/// prepare_speculate_auto over a given registry, `fetch` resolving (pulling)
+/// a drafter's `<id>:<variant>` to its installed path; its `replace` is true
+/// when that variant's install is not the catalog's file, which the pull
+/// must replace (a resolve would take the installed one).
+fn prepare_speculate_auto_with(
+    rest: Vec<String>,
+    reg: &MergedRegistry,
+    fetch: impl FnOnce(&str, bool) -> Result<PathBuf>,
+) -> Vec<String> {
+    if !speculate_auto_asked(&rest) || rest.iter().any(|a| a == "--offline") {
+        return rest;
+    }
+    let Ok(crate::serve::Parsed::Serve(o)) = crate::serve::parse(&rest) else {
+        return rest;
+    };
+    let [model] = o.models.as_slice() else {
+        return rest;
+    };
+    if o.model_dir.is_some() {
+        return rest;
+    }
+    let Some((directive, drafter)) = speculate_auto_directive(reg, Path::new(model)) else {
+        return rest;
+    };
+    let Some((_, token)) = speculate_drafter_id(&directive) else {
+        return rest;
+    };
+    if paired_drafter_present(reg, &drafter, Path::new(model)) {
+        return rest;
+    }
+    // The catalog's own variant may hold another file (an older release, a
+    // partial download): paired_drafter_present did not count it, and the
+    // pull goes over it.
+    let replace = token
+        .split_once(':')
+        .is_some_and(|(id, variant)| reg.local.installed_path(id, variant).is_some());
+    match fetch(token, replace) {
+        Ok(path) => eprintln!(
+            "basert serve: --speculate auto: {drafter} is installed ({}); superfluid's auto drafts \
+             with it first, the model's own head and plain decoding behind it",
+            path.display()
+        ),
+        Err(e) => eprintln!(
+            "basert serve: --speculate auto: {drafter} could not be fetched ({e:#}); \
+             superfluid's auto settles among what is installed"
+        ),
+    }
+    rest
+}
+
+/// Whether a copy of the catalog's drafter `drafter`, of any variant, is
+/// where superfluid's `auto` looks for it beside `target`
+/// (`speculate_resolve::auto_search_dirs` / `missing_auto_drafter`): a
+/// hub-cache install of that id (`<root>/<org>/<repo>/<variant>/model.base`),
+/// or a file named after one of its catalog files in the target's directory,
+/// its `drafters/`, or `drafters/` one level up. superfluid's `auto` takes
+/// such a copy when it fits the target and gives way to the model's own head
+/// when it does not, so the catalog's variant is pulled only when there is
+/// no copy at all.
+fn paired_drafter_present(reg: &MergedRegistry, drafter: &str, target: &Path) -> bool {
+    let in_cache = cache::variant_dir(&reg.root, drafter, "any")
+        .ok()
+        .and_then(|v| v.parent().map(Path::to_path_buf))
+        .and_then(|repo| std::fs::read_dir(repo).ok())
+        .is_some_and(|variants| {
+            variants.flatten().any(|v| {
+                let path = cache::base_artifact_path(&v.path());
+                let variant = v.file_name();
+                let row = reg
+                    .catalog
+                    .rows(drafter)
+                    .find(|r| variant.to_str() == Some(r.quant.as_str()));
+                path.is_file() && catalog_copy_matches(row, &path)
+            })
+        });
+    if in_cache {
+        return true;
+    }
+    let dir = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut dirs = vec![dir.to_path_buf(), dir.join("drafters")];
+    if let Some(up) = dir.parent() {
+        dirs.push(up.join("drafters"));
+    }
+    reg.catalog.rows(drafter).any(|row| {
+        dirs.iter().any(|d| {
+            let path = d.join(&row.file);
+            path.is_file() && catalog_copy_matches(Some(row), &path)
+        })
+    })
+}
+
+/// Whether the file at `path` is the one the catalog pins for its row, as
+/// superfluid's `digest_refusal` judges it before `auto` may take a drafter:
+/// a row with no sha256 pins nothing (any file is taken); a pinned one wants
+/// its size, and its sha256 where a pull recorded the bytes' sha256 beside
+/// the file (`hub.json`), so no gigabyte file is hashed at a start. A copy
+/// the catalog does not pin — no row for it — is taken too.
+fn catalog_copy_matches(row: Option<&CatalogEntry>, path: &Path) -> bool {
+    let Some((row, want)) = row.and_then(|r| {
+        r.sha256
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| (r, s))
+    }) else {
+        return true;
+    };
+    if let Some(size) = row.size {
+        if std::fs::metadata(path).map(|m| m.len()).ok() != Some(size) {
+            return false;
+        }
+    }
+    let recorded = path
+        .parent()
+        .and_then(|dir| cache::read_sidecar(dir).ok().flatten())
+        .and_then(|sidecar| sidecar.base_sha256);
+    recorded.is_none_or(|got| got.eq_ignore_ascii_case(want))
+}
+
+/// `<strategy>:<hub id>` for the strategies that take a drafter artifact —
+/// `dflash:basecompute/Qwen3-4B-DFlash`, `eagle3:org/head:default-q4`. Returns
+/// None for a path (`dflash:./x.base`, which keeps working unchanged), for a
+/// strategy that takes no artifact (`prompt-lookup`, `mtp-head`), and for
+/// anything that is not id-shaped.
+fn speculate_drafter_id(token: &str) -> Option<(&str, &str)> {
+    let (kind, rest) = token.split_once(':')?;
+    if !matches!(kind, "dflash" | "dspark" | "eagle3" | "draft-model") {
+        return None;
+    }
+    looks_like_hub_id(rest).then_some((kind, rest))
 }
 
 /// Pull a `--variant <v>` / `--variant=<v>` selector out of the forwarded args,
@@ -380,26 +1037,86 @@ fn extract_variant_flag(rest: &[String]) -> Result<(Option<String>, Vec<String>)
     Ok((variant, out))
 }
 
+const COMPUTEARENA_HARNESS_ENV: &str = "COMPUTEARENA_BASERT_HARNESS";
+const LEGACY_COMPUTEARENA_HARNESS_ENV: &str = "BASERT_COMPUTEARENA_HARNESS";
+const BENCHMARK_HARNESS_BINARY: &str = "basert-benchmark-harness";
+
+fn bundled_computearena_harness(
+    exe_dir: Option<&Path>,
+    environment_override: bool,
+) -> Option<PathBuf> {
+    if environment_override {
+        return None;
+    }
+    let exe_dir = exe_dir?;
+
+    // Published BaseRT packages keep the launcher and harness together.
+    let sibling = exe_dir.join(BENCHMARK_HARNESS_BINARY);
+    if sibling.is_file() {
+        return Some(sibling);
+    }
+
+    // A source build places the Rust launcher under
+    // tools/base-convert/target/{debug,release}, while CMake publishes the
+    // native harness under build/. Recognize that layout so the documented
+    // developer build works exactly like an installed release.
+    exe_dir.ancestors().find_map(|directory| {
+        let workspace_manifest = directory.join("tools/base-convert/Cargo.toml");
+        let harness = directory.join("build").join(BENCHMARK_HARNESS_BINARY);
+        (workspace_manifest.is_file() && harness.is_file()).then_some(harness)
+    })
+}
+
 /// Forward `basert <cmd> [args…]` to the matching runtime binary. Searches for
 /// `basert-<cmd>` (release layout) then `baseRT_<cmd>` (local dev build),
-/// looking next to this executable first and then on `PATH`. On success the
+/// looking next to this executable first and then on `PATH`. `basert serve`
+/// has no runtime binary: it runs superfluid (`crate::serve`). On success the
 /// current process is replaced (`exec`), so this only returns on failure.
 pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let (cmd, rest) = argv.split_first().context("no command given")?;
-    // `--variant <v>` is a launcher-level model selector; strip it before
-    // forwarding (the runtime binary doesn't know it) and apply it during
-    // hub-id resolution.
-    let (variant_flag, rest) = extract_variant_flag(rest)?;
-    let rest = resolve_model_args(&rest, variant_flag.as_deref())?;
-    let candidates = [format!("basert-{cmd}"), format!("baseRT_{cmd}")];
+    let is_computearena = cmd == "computearena";
+    let (candidates, rest) = if is_computearena {
+        // ComputeArena is independently distributed and owns runtime
+        // selection. Preserve its arguments and select the BaseRT adapter —
+        // no variant resolution.
+        let mut forwarded = Vec::with_capacity(rest.len() + 1);
+        forwarded.push("basert".to_string());
+        forwarded.extend_from_slice(rest);
+        (vec!["computearena".to_string()], forwarded)
+    } else {
+        // `--variant <v>` is a launcher-level model selector; strip it before
+        // forwarding (the runtime binary doesn't know it) and apply it during
+        // hub-id resolution.
+        let (variant_flag, rest) = extract_variant_flag(rest)?;
+        // `basert serve` speculates by default: no `--speculate` is `auto`,
+        // in front of everything below, so the default pulls what a
+        // hand-given `auto` pulls (the model file with its head here, the
+        // drafter in prepare_speculate_auto).
+        let rest = if cmd == "serve" {
+            crate::serve::with_default_speculation(rest)
+        } else {
+            rest
+        };
+        let rest = resolve_model_args(&rest, variant_flag.as_deref())?;
+        if cmd == "serve" {
+            return crate::serve::run(&prepare_speculate_auto(rest));
+        }
+        (vec![format!("basert-{cmd}"), format!("baseRT_{cmd}")], rest)
+    };
 
-    // Prefer a binary sitting next to `basert` (how the release ships); fall
-    // back to a bare name, which `Command` resolves against `PATH`.
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf));
+    // Prefer a binary sitting next to `basert` (how the release ships; for the
+    // versions layout, in the version this launcher runs from); fall back to a
+    // bare name, which `Command` resolves against `PATH`.
+    let exe_dir = crate::selfupdate::bundle_dir().ok();
+    let harness_environment_override = std::env::var_os(COMPUTEARENA_HARNESS_ENV).is_some()
+        || std::env::var_os(LEGACY_COMPUTEARENA_HARNESS_ENV).is_some();
+    let bundled_harness = if is_computearena {
+        bundled_computearena_harness(exe_dir.as_deref(), harness_environment_override)
+    } else {
+        None
+    };
     let mut targets: Vec<PathBuf> = Vec::new();
     if let Some(dir) = &exe_dir {
         for name in &candidates {
@@ -413,10 +1130,22 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
 
     for target in &targets {
         // exec() returns only on failure; ENOENT means try the next candidate.
-        let err = Command::new(target).args(&rest).exec();
+        let mut command = Command::new(target);
+        command.args(&rest);
+        if let Some(harness) = &bundled_harness {
+            command.env(COMPUTEARENA_HARNESS_ENV, harness);
+        }
+        let err = command.exec();
         if err.kind() != std::io::ErrorKind::NotFound {
             return Err(err).with_context(|| format!("launching {}", target.display()));
         }
+    }
+    if is_computearena {
+        bail!(
+            "ComputeArena is not installed.\n\
+             Install it from https://computearena.ai/quickstart, then run \
+             `basert computearena` again."
+        )
     }
     if RUNTIME_COMMANDS.contains(&cmd.as_str()) {
         bail!(
@@ -431,16 +1160,330 @@ pub fn dispatch_external(argv: Vec<String>) -> Result<()> {
 /// Commands served by the BaseRT runtime rather than this binary. Used only
 /// to shape the not-found error above; dispatch itself is name-driven, so
 /// commands absent from this list (or from `basert --help`) still dispatch.
-const RUNTIME_COMMANDS: [&str; 6] =
-    ["serve", "chat", "complete", "bench", "transcribe", "profile"];
+const RUNTIME_COMMANDS: [&str; 5] = ["chat", "complete", "bench", "transcribe", "profile"];
 
 pub fn cmd_pull(args: PullArgs) -> Result<()> {
     let reg = MergedRegistry::load()?;
+    // Resolved against whichever catalog the attempt is given: the cached one
+    // first, the live one if the cached rows prove to be behind the Hub.
+    with_fresh_catalog_on_mismatch(&reg, MergedRegistry::load_fresh, |reg| {
+        let fetcher = HfFetcher::new(cache::hf_staging_dir(&reg.root))?;
+        if let Some((id, variant)) = args.id.split_once(':') {
+            return pull_variant(reg, &args, id, variant, &fetcher);
+        }
+        pull_id(reg, &args, &fetcher)
+    })
+}
+
+/// Where `basert pull <id>:<variant>` gets the variant from (see
+/// [`variant_source`]).
+#[derive(Debug, PartialEq)]
+enum VariantSource {
+    /// The catalog row the variant names, pulled as a plain pull of it is.
+    Catalog(ModelRef),
+    /// A `.base` in the id's repo that no catalog row publishes, pulled as
+    /// `--file` would pull it.
+    File(String),
+    /// A quant, pulled as `--target` would pull it.
+    Quant(TargetScheme),
+}
+
+/// What a pull says of a variant installed already.
+fn say_installed(id: &str, variant: &str, path: &Path, dry_run: bool) {
+    if dry_run {
+        println!(
+            "plan: {id} [{variant}] already installed at {}",
+            path.display()
+        );
+    } else {
+        eprintln!(
+            "{id} [{variant}] already installed: {}\n  (use --force to re-pull)",
+            path.display()
+        );
+    }
+}
+
+/// `basert pull <id>:<variant>`: the variant as `basert list` names it, the
+/// form `basert chat` and `serve` already take. An installed variant is left
+/// as it is (no request to the Hub); otherwise it is pulled from where
+/// [`variant_source`] says. `--file`, `--profile` and `--target` each name what
+/// the variant names, so none goes with one.
+fn pull_variant(
+    reg: &MergedRegistry,
+    args: &PullArgs,
+    id: &str,
+    variant: &str,
+    fetcher: &dyn Fetcher,
+) -> Result<()> {
+    if variant.is_empty() {
+        bail!(
+            "empty variant after ':' in `{}` — name a variant (e.g. `{id}:default-q8`) \
+             or drop the colon. Run `basert list` to see installed variants.",
+            args.id
+        );
+    }
+    let given = [
+        args.file.as_ref().map(|_| "--file"),
+        args.profile.as_ref().map(|_| "--profile"),
+        args.target.map(|_| "--target"),
+    ];
+    if let Some(flag) = given.into_iter().flatten().next() {
+        bail!(
+            "`{}` names the variant, and so does {flag}: give one",
+            args.id
+        );
+    }
+    if !args.force {
+        if let Some(path) = reg.local.installed_path(id, variant) {
+            say_installed(id, variant, &path, args.dry_run);
+            return Ok(());
+        }
+    }
+    let pull = |file: Option<String>, target: Option<TargetScheme>| PullArgs {
+        id: id.to_string(),
+        profile: None,
+        target,
+        revision: args.revision.clone(),
+        file,
+        force: args.force,
+        dry_run: args.dry_run,
+    };
+    match variant_source(reg, id, variant, &args.revision, fetcher)? {
+        VariantSource::Catalog(r) => pull_catalog_row(reg, args, &r, fetcher),
+        VariantSource::File(file) => {
+            let named = pull(Some(file.clone()), args.target);
+            pull_named_file(reg, &named, &file, fetcher)
+        }
+        VariantSource::Quant(target) => pull_id(reg, &pull(None, Some(target)), fetcher),
+    }
+}
+
+/// The catalog row a variant named, pulled as a plain pull of it is: left as
+/// it is when installed, else its file from its own repo and revision,
+/// checked against its checksums. The row is carried through, never looked
+/// up again by its file name, which other rows of the id may share.
+fn pull_catalog_row(
+    reg: &MergedRegistry,
+    args: &PullArgs,
+    r: &ModelRef,
+    fetcher: &dyn Fetcher,
+) -> Result<()> {
+    let ModelRef::Catalog { id, variant, .. } = r else {
+        unreachable!("pull_catalog_row called with non-catalog ref");
+    };
+    if !args.force {
+        if let Some(path) = reg.local.installed_path(id, variant) {
+            say_installed(id, variant, &path, args.dry_run);
+            return Ok(());
+        }
+    }
+    if args.dry_run {
+        print_plan(r, variant);
+        return Ok(());
+    }
+    pull_catalog(&reg.root, r, fetcher)
+}
+
+/// The `--target` a variant spells, taken whole: a quant tag (`q8`, `bf16`),
+/// bare or under the prefix a converted variant or a `--target` value carries
+/// (`default-q8`, `base-q8`, `base_q8`). `None` for anything else, so a name
+/// that only ends in a quant (`default-q8-custom`, `typo-q8`) is not one.
+fn target_alias(variant: &str) -> Option<TargetScheme> {
+    let v = variant.to_ascii_lowercase();
+    let tag = ["default-", "base-", "base_"]
+        .iter()
+        .find_map(|p| v.strip_prefix(p))
+        .unwrap_or(&v);
+    is_quant_tag(tag).then(|| target_from_quant(tag))
+}
+
+/// Where the variant `variant` of `id` comes from, in this order: a catalog
+/// row of the id by that name (`default-q8`, `cuda-q4mix`), as `basert list
+/// --remote` shows it, refused when it is for another backend; the repo file
+/// a `file-…` variant was named for, looked for where `--file` looks; for a
+/// width named on its own (`q8`, `f16`), the catalog's row of it for this
+/// client; a quant `--target` takes, spelled as [`target_alias`] reads it.
+/// Anything else, a name that merely contains a width included, is an error
+/// naming the catalog's variants.
+fn variant_source(
+    reg: &MergedRegistry,
+    id: &str,
+    variant: &str,
+    revision: &str,
+    fetcher: &dyn Fetcher,
+) -> Result<VariantSource> {
+    // A row this client can run before one it can't, which is refused
+    // saying which backend it is for.
+    let mut rows: Vec<&CatalogEntry> = reg
+        .catalog
+        .rows(id)
+        .filter(|e| e.quant == variant)
+        .collect();
+    rows.sort_by_key(|e| !CatalogRegistry::backend_ok(e));
+    if let Some(e) = rows.first() {
+        if !CatalogRegistry::backend_ok(e) {
+            bail!(
+                "{variant} is the {} bundle of {}; this client runs {}",
+                e.backend.as_deref().unwrap_or_default(),
+                e.id,
+                CatalogRegistry::client_backend()
+            );
+        }
+        return Ok(VariantSource::Catalog(CatalogRegistry::entry_to_ref(e)));
+    }
+    if variant.starts_with(NAMED_VARIANT_PREFIX) {
+        return named_variant_file(reg, id, variant, revision, fetcher).map(VariantSource::File);
+    }
+    // A width named on its own: the catalog's row of it for this client,
+    // native before universal, as a plain pull picks one. The whole name
+    // must be the width; a `file-…` one can spell one (`file-model-q4-…`).
+    if base_hub::registry::quant_bits(variant) == Some(variant) {
+        match reg.catalog.resolve_with_status(id, Some(variant)) {
+            (Some(r), _) => return Ok(VariantSource::Catalog(r)),
+            (None, true) => bail!(
+                "{id} has no {variant} bundle for the {} backend this client runs",
+                CatalogRegistry::client_backend()
+            ),
+            (None, false) => {}
+        }
+    }
+    // A size (`medium`): the file of that size in the id's repo, pulled as
+    // `--file` pulls it.
+    if let Some(size) = size_name(variant) {
+        return size_variant_file(reg, id, size, revision, fetcher).map(VariantSource::File);
+    }
+    if let Some(target) = target_alias(variant) {
+        return Ok(VariantSource::Quant(target));
+    }
+    let listed: Vec<String> = reg
+        .catalog
+        .rows(id)
+        .filter(|e| CatalogRegistry::backend_ok(e))
+        .map(|e| e.quant.clone())
+        .collect();
+    let listed = if listed.is_empty() {
+        String::new()
+    } else {
+        format!("; the catalog lists {}", listed.join(", "))
+    };
+    bail!(
+        "{id} has no variant {variant:?}{listed}. Name one `basert list --remote` shows, \
+         a quant (q4, q8, bf16, …), a size (xs, small, medium, large, xl), or a file \
+         with --file"
+    )
+}
+
+/// Where the files of `id` are: the repos (with revisions) its catalog rows
+/// use, else the id's own repo at `revision`.
+fn repo_sources(reg: &MergedRegistry, id: &str, revision: &str) -> Vec<(String, String)> {
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for e in reg.catalog.rows(id) {
+        let at = (e.hf_repo.clone(), e.revision.clone());
+        if !sources.contains(&at) {
+            sources.push(at);
+        }
+    }
+    if sources.is_empty() {
+        sources.push((id.to_string(), revision.to_string()));
+    }
+    sources
+}
+
+/// The `.base` of `id` named by `size` (`:medium` → `Foo-Medium.base`),
+/// looked for where `--file` looks. A size the release does not come in
+/// names the sizes it does; one found in several places must be given as a
+/// file with its path.
+fn size_variant_file(
+    reg: &MergedRegistry,
+    id: &str,
+    size: &str,
+    revision: &str,
+    fetcher: &dyn Fetcher,
+) -> Result<String> {
+    let sources = repo_sources(reg, id, revision);
+    let mut names = Vec::new();
+    let mut sizes = Vec::new();
+    for (repo, revision) in &sources {
+        let files = list_base_files(fetcher, repo, revision)?;
+        if let Some(offered) = sizes_offered(&files) {
+            sizes.push(offered);
+        }
+        names.extend(files.artifacts.iter().map(|f| f.name.clone()));
+    }
+    let hits: Vec<&String> = names.iter().filter(|n| size_tag(n) == Some(size)).collect();
+    match hits.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] if sizes.is_empty() => bail!(
+            "{id} has no {size} .base: its files are not named by size ({}); name a \
+             variant `basert list --remote` shows, a quant, or a file with --file",
+            names.join(", ")
+        ),
+        [] => bail!(
+            "{id} has no {size} .base; it comes in: {}",
+            sizes.join(", ")
+        ),
+        many => bail!(
+            "{size} names several files of {id} ({}); give one with --file and its path",
+            many.iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The repo file the `file-…` variant `variant` was named for (see
+/// [`named_variant`]), looked for where `--file` looks: the repos the id's
+/// catalog rows use, else the id's own. A file the catalog publishes installs
+/// under its row's variant, never a `file-…` one, so it is not that file.
+fn named_variant_file(
+    reg: &MergedRegistry,
+    id: &str,
+    variant: &str,
+    revision: &str,
+    fetcher: &dyn Fetcher,
+) -> Result<String> {
+    let sources = repo_sources(reg, id, revision);
+    let mut names = Vec::new();
+    for (repo, revision) in &sources {
+        let files = list_base_files(fetcher, repo, revision)?;
+        names.extend(files.artifacts.iter().map(|f| f.name.clone()));
+    }
+    let Some(file) = names.iter().find(|f| named_variant(f) == variant) else {
+        bail!(
+            "no .base in {} is the file of {variant}; there are: {}",
+            sources
+                .iter()
+                .map(|(r, v)| format!("{r}@{v}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            names.join(", ")
+        );
+    };
+    if let Some(e) = reg.catalog.rows(id).find(|e| e.file == *file) {
+        bail!(
+            "{file} is the catalog's {} of {}: pull {}:{}",
+            e.quant,
+            e.id,
+            e.id,
+            e.quant
+        );
+    }
+    Ok(file.clone())
+}
+
+/// `basert pull <id>`, with no `:variant`.
+fn pull_id(reg: &MergedRegistry, args: &PullArgs, fetcher: &dyn Fetcher) -> Result<()> {
     let root = reg.root.clone();
-    let want = quant_token(&args);
+    let want = quant_token(args);
+    if let Some(file) = &args.file {
+        return pull_named_file(reg, args, file, fetcher);
+    }
     let r = reg.resolve(&args.id, &args.revision, Some(&want), args.force)?;
 
-    if args.dry_run {
+    // A raw repo's plan is read off its listing (which file, or that none
+    // fits), as the pull would; the rest is settled here.
+    if args.dry_run && !matches!(r, ModelRef::HuggingFace { .. }) {
         print_plan(&r, &want);
         return Ok(());
     }
@@ -457,7 +1500,13 @@ pub fn cmd_pull(args: PullArgs) -> Result<()> {
         // Serve it directly when it's what the user wants; otherwise grab the
         // requested quant straight from the same repo rather than silently
         // handing back the cataloged one.
-        ModelRef::Catalog { id, hf_repo, revision, variant, .. } => {
+        ModelRef::Catalog {
+            id,
+            hf_repo,
+            revision,
+            variant,
+            ..
+        } => {
             // Match on the QUANT BITS, not the raw variant string: the resolver
             // may hand back a backend-native variant (e.g. `cuda-q4mix`) that
             // satisfies a `q4` request but whose `quant_tag` ("q4mix") isn't the
@@ -467,34 +1516,299 @@ pub fn cmd_pull(args: PullArgs) -> Result<()> {
             // installed_best_variant / the catalog resolver's bit-aware match.
             let want_bits = base_hub::registry::quant_bits(&want).unwrap_or(&want);
             if base_hub::registry::quant_bits(variant).unwrap_or(variant) == want_bits {
-                pull_catalog(&root, &r)
+                pull_catalog(&root, &r, fetcher)
             } else {
-                let fetcher = HfFetcher::new(cache::hf_staging_dir(&root))?;
-                let base_files = list_base_files(&fetcher, hf_repo, revision)?;
-                pull_base_direct(&root, &args, id, hf_repo, revision, &fetcher, &base_files)
+                let base_files = list_base_files(fetcher, hf_repo, revision)?;
+                pull_base_direct(
+                    &root,
+                    args,
+                    id,
+                    hf_repo,
+                    revision,
+                    fetcher,
+                    &base_files,
+                    None,
+                    None,
+                )
             }
         }
         // A raw HF repo: if it already hosts pre-converted `.base` artifacts
         // (e.g. the basecompute org), download the matching one directly — no
         // local conversion. Otherwise treat it as source safetensors.
         ModelRef::HuggingFace { id, repo, revision } => {
-            let fetcher = HfFetcher::new(cache::hf_staging_dir(&root))?;
-            let base_files = list_base_files(&fetcher, repo, revision)?;
-            if base_files.is_empty() {
-                pull_and_convert(&root, &args, id, repo, revision)
-            } else {
-                pull_base_direct(&root, &args, id, repo, revision, &fetcher, &base_files)
-            }
+            pull_hf_repo(reg, args, id, repo, revision, fetcher)
         }
     }
+}
+
+/// `basert pull <id>` of a raw Hub repo: its pre-converted `.base` when it
+/// hosts any, else the source safetensors converted here.
+fn pull_hf_repo(
+    reg: &MergedRegistry,
+    args: &PullArgs,
+    id: &str,
+    repo: &str,
+    revision: &str,
+    fetcher: &dyn Fetcher,
+) -> Result<()> {
+    let base_files = list_base_files(fetcher, repo, revision)?;
+    // A repo holding only a half-uploaded split bundle is still a
+    // `.base` repo: it gets the incomplete-publication error, not a
+    // conversion attempt.
+    if base_files.artifacts.is_empty() && base_files.malformed.is_empty() {
+        if args.dry_run {
+            let r = ModelRef::HuggingFace {
+                id: id.to_string(),
+                repo: repo.to_string(),
+                revision: revision.to_string(),
+            };
+            print_plan(&r, &quant_token(args));
+            return Ok(());
+        }
+        return pull_and_convert(&reg.root, args, id, repo, revision);
+    }
+    // A release in sizes (the BaseQuant repos): with no file and no quant
+    // named, its default size, pulled as `--file` pulls it, so both land in
+    // one install.
+    if args.file.is_none() && !quant_named(args) {
+        if let Some(file) = default_size_file(&base_files)? {
+            eprintln!(
+                "{id}: a release in sizes; taking {file} (`{id}:<size>` or --file takes another)"
+            );
+            let named = PullArgs {
+                id: args.id.clone(),
+                profile: None,
+                target: args.target,
+                revision: args.revision.clone(),
+                file: Some(file.clone()),
+                force: args.force,
+                dry_run: args.dry_run,
+            };
+            return pull_named_file(reg, &named, &file, fetcher);
+        }
+    }
+    if args.dry_run {
+        let want = quant_token(args);
+        let artifact = select_base_file(&base_files, &want)?;
+        println!(
+            "plan: pull {} from {repo}@{revision} → {id} [{}] (no conversion)",
+            artifact.name,
+            base_variant(&artifact.name, &want)
+        );
+        return Ok(());
+    }
+    pull_base_direct(
+        &reg.root,
+        args,
+        id,
+        repo,
+        revision,
+        fetcher,
+        &base_files,
+        None,
+        None,
+    )
+}
+
+/// `pull --file`: download the named `.base` from the id's repo (the catalog's
+/// repo for a catalog id, else the id itself) into its own variant.
+fn pull_named_file(
+    reg: &MergedRegistry,
+    args: &PullArgs,
+    file: &str,
+    fetcher: &dyn Fetcher,
+) -> Result<()> {
+    // A file a catalog row of the id publishes is that row's: taken from its
+    // repo and revision, refused when it is for another backend, and
+    // installed under its variant (`cuda-q4mix`), as a catalog pull of it
+    // would be. Any other file comes from the id's repo (its catalog repo,
+    // else the id itself), whatever quant or backend the catalog lists.
+    let rows: Vec<&CatalogEntry> = reg
+        .catalog
+        .rows(&args.id)
+        .filter(|e| names_file(file, &e.file))
+        .collect();
+    let listed = match rows.as_slice() {
+        [] => None,
+        [one] => Some(*one),
+        many => bail!(
+            "{file:?} names several files the catalog lists for {} ({}); give its path",
+            args.id,
+            many.iter()
+                .map(|e| format!("{} in {}", e.file, e.hf_repo))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    if let Some(e) = listed.filter(|e| !CatalogRegistry::backend_ok(e)) {
+        bail!(
+            "{} is the {} bundle of {}; this client runs {}",
+            e.file,
+            e.backend.as_deref().unwrap_or_default(),
+            e.id,
+            CatalogRegistry::client_backend()
+        );
+    }
+    // Where to look: the listing row's repo; else every repo the id's rows
+    // keep files in (a name found in more than one must be given its row);
+    // else the id itself as a Hub repo.
+    let id = listed
+        .or_else(|| reg.catalog.entry(&args.id))
+        .map_or_else(|| args.id.clone(), |e| e.id.clone());
+    let mut sources: Vec<(String, String)> = Vec::new();
+    let rows = listed
+        .into_iter()
+        .chain(reg.catalog.rows(&args.id).filter(|_| listed.is_none()));
+    for e in rows {
+        let at = (e.hf_repo.clone(), e.revision.clone());
+        if !sources.contains(&at) {
+            sources.push(at);
+        }
+    }
+    if sources.is_empty() {
+        if args.id.split('/').filter(|s| !s.is_empty()).count() < 2 {
+            bail!(
+                "unknown model id {:?}: not in the catalog and not an `org/model` HF repo",
+                args.id
+            );
+        }
+        sources.push((args.id.clone(), args.revision.clone()));
+    }
+    // The name is resolved against the repo every time, cached or not, so a
+    // cache hit answers exactly what a fresh pull would take.
+    let mut found = Vec::new();
+    for (repo, revision) in &sources {
+        let base_files = list_base_files(fetcher, repo, revision)?;
+        let names = |n: &str| names_file(file, n);
+        if base_files.artifacts.iter().any(|f| names(&f.name))
+            || base_files.malformed.iter().any(|(n, _)| names(n))
+        {
+            found.push((repo.clone(), revision.clone(), base_files));
+        } else if sources.len() == 1 {
+            // one place to look: its own error lists what is there
+            select_named_base_file(&base_files, file)?;
+        }
+    }
+    let (repo, revision, base_files) = match found.len() {
+        1 => found.remove(0),
+        0 => bail!(
+            "no .base named {file:?} in {}",
+            sources
+                .iter()
+                .map(|(r, v)| format!("{r}@{v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => bail!(
+            "{file:?} is in several repos of {id} ({}); pull it from its repo's id",
+            found
+                .iter()
+                .map(|(r, v, _)| format!("{r}@{v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let artifact = select_named_base_file(&base_files, file)?;
+    if let Some(e) = listed.filter(|e| e.file != artifact.name) {
+        bail!(
+            "{file:?} names {} in the repo, but the catalog of {id} lists {}",
+            artifact.name,
+            e.file
+        );
+    }
+    let variant = listed.map_or_else(|| named_variant(&artifact.name), |e| e.quant.clone());
+
+    if let Some(path) = reg
+        .local
+        .installed_path(&id, &variant)
+        .filter(|_| !args.force)
+    {
+        // Only this file's own install answers for it: one that records it,
+        // or (for the catalog's file) a catalog pull of it from before files
+        // were recorded. Anything else there is refused, not handed back.
+        let vdir = cache::variant_dir(&reg.root, &id, &variant)?;
+        let sidecar = cache::read_sidecar(&vdir)?;
+        let held = sidecar.as_ref().and_then(|s| {
+            s.file.clone().or_else(|| {
+                // a catalog pull from before files were recorded is the row's
+                // file only if its bytes are the row's
+                listed
+                    .filter(|e| {
+                        s.source_kind == "catalog"
+                            && matches!((&s.base_sha256, &e.sha256), (Some(got), Some(want)) if got.eq_ignore_ascii_case(want))
+                    })
+                    .map(|e| e.file.clone())
+            })
+        });
+        match held {
+            Some(held) if held == artifact.name => {}
+            Some(held) => bail!(
+                "{id} [{variant}] holds {held}, not {} (--force replaces it)",
+                artifact.name
+            ),
+            None => bail!(
+                "{id} [{variant}] holds {}, not {} (--force replaces it)",
+                match sidecar.and_then(|s| s.profile) {
+                    Some(_) => "a conversion",
+                    None => "an install from another source",
+                },
+                artifact.name
+            ),
+        }
+        if args.dry_run {
+            println!(
+                "plan: {id} [{variant}] already installed at {}",
+                path.display()
+            );
+            return Ok(());
+        }
+        // a catalog pull from before files were recorded is now known as this one
+        if let Some(mut s) = cache::read_sidecar(&vdir)?.filter(|s| s.file.is_none()) {
+            s.file = Some(artifact.name.clone());
+            cache::write_sidecar(&vdir, &s)?;
+        }
+        eprintln!(
+            "{id} [{variant}] already installed: {}\n  (use --force to re-pull)",
+            path.display()
+        );
+        return Ok(());
+    }
+    if args.dry_run {
+        println!(
+            "plan: pull {} from {repo}@{revision} → {id} [{variant}] (no conversion)",
+            artifact.name
+        );
+        return Ok(());
+    }
+    pull_base_direct(
+        &reg.root,
+        args,
+        &id,
+        &repo,
+        &revision,
+        fetcher,
+        &base_files,
+        listed,
+        Some(&variant),
+    )
 }
 
 fn print_plan(r: &ModelRef, want: &str) {
     match r {
         ModelRef::Local { id, variant, path } => {
-            println!("plan: {id} [{variant}] already installed at {}", path.display())
+            println!(
+                "plan: {id} [{variant}] already installed at {}",
+                path.display()
+            )
         }
-        ModelRef::Catalog { id, hf_repo, file, revision, variant, .. } => {
+        ModelRef::Catalog {
+            id,
+            hf_repo,
+            file,
+            revision,
+            variant,
+            ..
+        } => {
             let want_bits = base_hub::registry::quant_bits(want).unwrap_or(want);
             if base_hub::registry::quant_bits(variant).unwrap_or(variant) == want_bits {
                 println!(
@@ -515,7 +1829,79 @@ fn print_plan(r: &ModelRef, want: &str) {
 }
 
 /// Fast path: download a pre-converted `.base` from the catalog.
-fn pull_catalog(root: &Path, r: &ModelRef) -> Result<()> {
+/// A pulled file whose bytes are not the catalog row's (`expected`): typed,
+/// so a caller can tell a catalog that is behind the Hub from a bad download
+/// (with_fresh_catalog_on_mismatch).
+#[derive(Debug)]
+struct ShaMismatch {
+    id: String,
+    file: String,
+    expected: String,
+    got: String,
+}
+
+impl std::fmt::Display for ShaMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sha256 mismatch for {} ({}): expected {}, got {}",
+            self.id, self.file, self.expected, self.got
+        )
+    }
+}
+
+impl std::error::Error for ShaMismatch {}
+
+/// Runs `attempt` against `reg`; when it fails because the file's bytes are
+/// not the row's sha256, fetches the live catalog past the cache (`refetch`)
+/// and runs it once more if the live row names another sha256. The cached
+/// catalog is served under its TTL without a look at the hosted one, and a
+/// bundle's row and file change together on the Hub, so between that change
+/// and the cache's expiry a fresh pull downloads the new bytes and checks
+/// them against the old row. The live catalog settles it: a Hub file that
+/// disagrees with the live row too stays an error, as does a cache that
+/// cannot be refreshed.
+fn with_fresh_catalog_on_mismatch(
+    reg: &MergedRegistry,
+    refetch: impl FnOnce() -> Option<MergedRegistry>,
+    attempt: impl Fn(&MergedRegistry) -> Result<()>,
+) -> Result<()> {
+    let err = match attempt(reg) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    let Some(m) = err.downcast_ref::<ShaMismatch>() else {
+        return Err(err);
+    };
+    let Some(fresh) = refetch() else {
+        return Err(err);
+    };
+    let changed = fresh.catalog.rows(&m.id).any(|e| {
+        e.file == m.file
+            && e.sha256
+                .as_deref()
+                .is_some_and(|s| !s.eq_ignore_ascii_case(&m.expected))
+    });
+    if !changed {
+        return Err(err);
+    }
+    eprintln!(
+        "  catalog: the cached catalog was behind the Hub ({}'s sha256 changed); pulling again from the live one",
+        m.file
+    );
+    attempt(&fresh)
+}
+
+/// Where a pull puts the downloaded `.base` until it has passed the checks
+/// that make it the installed one: beside it (`model.base.pending`), on the
+/// same filesystem, so the final move is a rename.
+fn pending_path(out: &Path) -> PathBuf {
+    let mut p = out.as_os_str().to_owned();
+    p.push(".pending");
+    PathBuf::from(p)
+}
+
+fn pull_catalog(root: &Path, r: &ModelRef, fetcher: &dyn Fetcher) -> Result<()> {
     let ModelRef::Catalog {
         id,
         hf_repo,
@@ -523,6 +1909,7 @@ fn pull_catalog(root: &Path, r: &ModelRef) -> Result<()> {
         revision,
         variant,
         sha256,
+        parts_sha256,
         ..
     } = r
     else {
@@ -531,27 +1918,47 @@ fn pull_catalog(root: &Path, r: &ModelRef) -> Result<()> {
     eprintln!("basert pull v{}", env!("CARGO_PKG_VERSION"));
     eprintln!("  catalog: {hf_repo}/{file}@{revision} (pre-converted)");
 
-    let fetcher = HfFetcher::new(cache::hf_staging_dir(root))?;
-    let src = fetcher.get_file(hf_repo, revision, file)?;
+    // The catalog names the logical `.base`; the repo may hold it as parts.
+    let artifact = parts::find(fetcher, hf_repo, revision, file)?;
 
     let vdir = cache::variant_dir(root, id, variant)?;
     std::fs::create_dir_all(&vdir)?;
     let out = cache::base_artifact_path(&vdir);
-    // Moves the staged download into place (same filesystem), so the pulled
-    // artifact exists exactly once on disk.
-    fetch::install_file(&fetcher, hf_repo, &src, &out)?;
+    announce_parts(&artifact, &out);
+    // The download lands beside the installed file (same filesystem, moved
+    // from the staging area, so it exists once on disk) and replaces it only
+    // once its sha256 is the row's: a forced pull that fails the check — a
+    // `basert serve` refreshing a file for its head, `pull --force` — leaves
+    // the file and its sidecar as they were rather than an empty slot.
+    let pending = pending_path(&out);
+    parts::install(
+        fetcher,
+        hf_repo,
+        revision,
+        &artifact,
+        &pending,
+        parts_sha256.as_deref(),
+    )?;
 
-    let got_sha = crate::compute_sha256_streaming(&out)?;
+    let got_sha = crate::compute_sha256_streaming(&pending)?;
     if let Some(expected) = sha256 {
         if !got_sha.eq_ignore_ascii_case(expected) {
-            std::fs::remove_file(&out).ok();
+            std::fs::remove_file(&pending).ok();
             // The staged bytes are equally bad — no resume value in them, so
             // clear them and let a retry start from scratch.
-            fetch::cleanup_staging(&fetcher, hf_repo);
-            bail!("sha256 mismatch for {id}: expected {expected}, got {got_sha}");
+            fetch::cleanup_staging(fetcher, hf_repo);
+            return Err(ShaMismatch {
+                id: id.clone(),
+                file: file.clone(),
+                expected: expected.clone(),
+                got: got_sha,
+            }
+            .into());
         }
         eprintln!("  sha256:  verified");
     }
+    std::fs::rename(&pending, &out)
+        .with_context(|| format!("moving {} into place", pending.display()))?;
 
     write_sidecar_for(
         &vdir,
@@ -563,8 +1970,10 @@ fn pull_catalog(root: &Path, r: &ModelRef) -> Result<()> {
         variant,
         None,
         Some(got_sha),
+        Some(file.as_str()),
     )?;
-    fetch::cleanup_staging(&fetcher, hf_repo);
+    count_download(fetcher, hf_repo, revision);
+    fetch::cleanup_staging(fetcher, hf_repo);
     eprintln!("installed {id} [{variant}] → {}", out.display());
     Ok(())
 }
@@ -582,36 +1991,112 @@ fn pull_base_direct(
     repo: &str,
     revision: &str,
     fetcher: &dyn Fetcher,
-    base_files: &[String],
+    base_files: &Grouped,
+    listed: Option<&CatalogEntry>,
+    variant: Option<&str>,
 ) -> Result<()> {
     eprintln!("basert pull v{}", env!("CARGO_PKG_VERSION"));
     eprintln!("  source:  {repo}@{revision} (HuggingFace, pre-converted .base)");
 
     let want = quant_token(args);
-    let file = select_base_file(base_files, &want)?;
-    // Label the on-disk variant by the artifact's own quant when it carries
-    // one (so a `-Q8.base` never lands in a `default-q4` dir); otherwise fall
-    // back to what was requested.
-    let file_tag = quant_tag(&base_file_stem(file));
-    let variant_tag = if is_quant_tag(&file_tag) { file_tag } else { want };
-    let variant = format!("default-{variant_tag}");
+    let artifact = match &args.file {
+        Some(name) => select_named_base_file(base_files, name)?,
+        None => select_base_file(base_files, &want)?,
+    };
+    let file = &artifact.name;
+    // The catalog's own file keeps the catalog's variant and checksums,
+    // however it was asked for.
+    let listed = listed.filter(|e| e.file == *file);
+    let variant = match variant {
+        Some(v) => v.to_string(),
+        None => listed.map_or_else(|| base_variant(file, &want), |e| e.quant.clone()),
+    };
     eprintln!("  variant: {variant}");
     eprintln!("  file:    {file}");
 
     let vdir = cache::variant_dir(root, id, &variant)?;
     std::fs::create_dir_all(&vdir)?;
     let out = cache::base_artifact_path(&vdir);
+    announce_parts(artifact, &out);
 
-    let src = fetcher.get_file(repo, revision, file)?;
-    // Moves the staged download into place (same filesystem), so the pulled
-    // artifact exists exactly once on disk.
-    fetch::install_file(fetcher, repo, &src, &out)?;
+    // As pull_catalog: the download lands beside the installed file (moved
+    // from the staging area; a part set is reassembled there first) and
+    // replaces it only once it passes the catalog's sha256, so a failed
+    // forced pull leaves the installed file and its sidecar as they were.
+    let parts_sha256 = listed.and_then(|e| e.parts_sha256.as_deref());
+    let pending = pending_path(&out);
+    parts::install(fetcher, repo, revision, artifact, &pending, parts_sha256)?;
 
-    let sha = crate::compute_sha256_streaming(&out).ok();
-    write_sidecar_for(&vdir, id, "huggingface", repo, None, revision, &variant, None, sha)?;
+    let sha = crate::compute_sha256_streaming(&pending).ok();
+    if let Some(expected) = listed.and_then(|e| e.sha256.as_deref()) {
+        let got = sha.as_deref().unwrap_or("nothing readable");
+        if !got.eq_ignore_ascii_case(expected) {
+            std::fs::remove_file(&pending).ok();
+            fetch::cleanup_staging(fetcher, repo);
+            return Err(ShaMismatch {
+                id: id.to_string(),
+                file: file.clone(),
+                expected: expected.to_string(),
+                got: got.to_string(),
+            }
+            .into());
+        }
+        eprintln!("  sha256:  verified");
+    }
+    std::fs::rename(&pending, &out)
+        .with_context(|| format!("moving {} into place", pending.display()))?;
+    write_sidecar_for(
+        &vdir,
+        id,
+        if listed.is_some() {
+            "catalog"
+        } else {
+            "huggingface"
+        },
+        repo,
+        None,
+        revision,
+        &variant,
+        None,
+        sha,
+        Some(file.as_str()),
+    )?;
+    count_download(fetcher, repo, revision);
     fetch::cleanup_staging(fetcher, repo);
     eprintln!("installed {id} [{variant}] → {}", out.display());
     Ok(())
+}
+
+/// Hugging Face counts a repo's downloads by requests for its `config.json`.
+/// Fetched for basecompute's own repos when one is published; a failure does
+/// not fail the pull.
+fn count_download(fetcher: &dyn Fetcher, repo: &str, revision: &str) {
+    if repo.starts_with("basecompute/")
+        && fetcher
+            .list_files(repo, revision)
+            .is_ok_and(|files| files.iter().any(|f| f == "config.json"))
+    {
+        let _ = fetcher.get_file(repo, revision, "config.json");
+    }
+}
+
+/// One line about a split bundle, so the user knows why the install step
+/// runs on after the download bar finishes and what the disk needs.
+fn announce_parts(artifact: &Artifact, out: &Path) {
+    if !artifact.is_split() {
+        return;
+    }
+    // A re-pull keeps the installed bundle until the new one is complete,
+    // so the honest figure for that path is one bundle more.
+    let replacing = if out.exists() {
+        " plus the installed bundle it replaces, kept until the new one is complete"
+    } else {
+        ""
+    };
+    eprintln!(
+        "  parts:   {} (Hub-split; reassembled on install, needs bundle + one part of free disk{replacing})",
+        artifact.parts.len()
+    );
 }
 
 /// Convert-on-pull: download an HF repo's source safetensors and run the
@@ -637,25 +2122,49 @@ fn pull_and_convert(
     let fetcher = HfFetcher::new(cache::hf_staging_dir(root))?;
     let snapshot = download_source(repo, revision, &fetcher)?;
 
+    let (quantize_drafter, keep_drafter_fc_f16) =
+        pull_drafter_flags(drafter_sidecar_arch(&snapshot));
     let conv = ConvertArgs {
         input: snapshot,
         output: Some(out.clone()),
-        target: args.target,
+        mtp_head: None,
+        mtp_head_version: None,
+        target: args.target_scheme(),
         calib: None,
         calib_tokens: 512,
         awq_mode: AwqMode::Full,
         synthetic: false,
         profile: profile_path,
         awq_profile: None,
+        awq_search_rows: 0,
         allow_quant_from_quant: false,
+        no_mlx_passthrough: false,
+        // Drafter sidecars (DFlash / DSpark / EAGLE-3) are pulled at the
+        // target scheme, as the catalog's default-q4 drafters are; which taps
+        // follow is pull_drafter_flags' call. A target bundle keeps the
+        // previous behaviour — the flag would also quantize an in-bundle MTP
+        // head, which has no acceptance measurement.
+        quantize_drafter,
+        keep_drafter_fc_f16,
+        speculator_lm_head: false,
+        mtp_draft_ranking: None,
+        mtp_draft_vocab: None,
         // Convert-on-pull always produces a canonical-quant bundle;
         // k-quant passthrough stays an explicit `convert` opt-in.
         kquant_passthrough: false,
+        // Convert-on-pull follows the converter default: a tied model gets
+        // its head materialized so the profile head rule sets logit
+        // precision (`plan_tied_lm_head`); the opt-out is a `convert` flag.
+        no_synth_tied_head: false,
         // Convert-on-pull sources HF checkpoints, where the perception
         // tower already lives in the same snapshot — the mmproj flags only
         // apply to GGUF sources, which ship the tower separately.
         mmproj: None,
         mmproj_config: None,
+        mlx_passthrough: false,
+        validate: false,
+        direct_write: false,
+        imatrix: false,
     };
     crate::cmd_convert(conv).with_context(|| format!("converting {repo}"))?;
 
@@ -670,6 +2179,7 @@ fn pull_and_convert(
         &variant,
         Some(&variant),
         sha,
+        None,
     )?;
     // The staged source snapshot is now a redundant multi-GB copy of a model
     // we keep in converted form (provenance lives in hub.json; a re-convert
@@ -715,7 +2225,7 @@ fn choose_profile(
             .to_string();
         return Ok((variant, Some(p.clone()), None));
     }
-    if let Some((name, json)) = bundled_profile_for_target(args.target) {
+    if let Some((name, json)) = bundled_profile_for_target(args.target_scheme()) {
         let mut tf = tempfile::Builder::new()
             .prefix("base-profile-")
             .suffix(".json")
@@ -725,7 +2235,35 @@ fn choose_profile(
         return Ok((name.to_string(), Some(path), Some(tf)));
     }
     // No generic profile for this scheme → flat --target, variant = scheme.
-    Ok((target_str(args.target).to_string(), None, None))
+    Ok((target_str(args.target_scheme()).to_string(), None, None))
+}
+
+/// The drafter sidecar architecture the snapshot's `config.json` names
+/// (`dflash`, `dspark` or `eagle3`): the same detection `convert_hf` routes
+/// on. None for an ordinary LM, and when the config cannot be read, so an odd
+/// snapshot converts exactly as before.
+fn drafter_sidecar_arch(snapshot: &Path) -> Option<&'static str> {
+    let bytes = std::fs::read(snapshot.join("config.json")).ok()?;
+    let cfg: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    base_arch::dflash::hf_mapper_for_architectures(&cfg)
+        .or_else(|| base_arch::dflash::hf_mapper_for_eagle3(&cfg))
+        .map(base_arch::HfMapper::canonical_arch)
+}
+
+/// `(quantize_drafter, keep_drafter_fc_f16)` for a convert-on-pull of a
+/// snapshot whose sidecar arch is `sidecar` (None: a target model). A
+/// sidecar's transformer layers follow the target scheme, as the catalog's
+/// default-q4 drafters do. Its `fc.{i}` taps follow it for the DFlash family
+/// only, where 4-bit taps were measured (acceptance unchanged on
+/// Qwen3.8-27B-DFlash2 and Qwen3.6-35B-A3B-DFlash2, 2026-10-19); DSpark and
+/// EAGLE-3 taps stay f16 until measured. `base-convert --quantize-drafter`
+/// quantizes them regardless.
+fn pull_drafter_flags(sidecar: Option<&str>) -> (bool, bool) {
+    match sidecar {
+        None => (false, false),
+        Some("dflash") => (true, false),
+        Some(_) => (true, true),
+    }
 }
 
 /// Read `model_type` from a fetched `config.json` and fail early when no
@@ -733,18 +2271,19 @@ fn choose_profile(
 /// are downloaded. `text_config.model_type` is consulted as a fallback for
 /// multimodal configs that nest the language-model arch there.
 fn check_supported_arch(config_path: &Path, repo: &str, revision: &str) -> Result<()> {
-    let bytes = std::fs::read(config_path)
-        .with_context(|| format!("reading {}", config_path.display()))?;
+    let bytes =
+        std::fs::read(config_path).with_context(|| format!("reading {}", config_path.display()))?;
     let cfg: serde_json::Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing {} as JSON", config_path.display()))?;
 
     let model_type = cfg
         .get("model_type")
         .and_then(|v| v.as_str())
-        .or_else(|| cfg.pointer("/text_config/model_type").and_then(|v| v.as_str()))
-        .ok_or_else(|| {
-            anyhow::anyhow!("{repo}@{revision}: config.json has no model_type field")
-        })?;
+        .or_else(|| {
+            cfg.pointer("/text_config/model_type")
+                .and_then(|v| v.as_str())
+        })
+        .ok_or_else(|| anyhow::anyhow!("{repo}@{revision}: config.json has no model_type field"))?;
 
     if base_arch::hf_mapper_for_model_type(model_type).is_some() {
         return Ok(());
@@ -785,9 +2324,63 @@ fn download_source(repo: &str, revision: &str, fetcher: &dyn Fetcher) -> Result<
         if f.as_str() == "config.json" {
             continue;
         }
-        fetcher.get_file(repo, revision, f)?;
+        let src = fetcher.get_file(repo, revision, f)?;
+        link_into_snapshot(&snapshot, f, &src)?;
     }
     Ok(snapshot)
+}
+
+/// Make `filename` resolvable under `snapshot`, the dir the converter reads.
+///
+/// hf-hub's own download path writes a `snapshots/<rev>/<file>` pointer into
+/// `blobs/`, but the resumable range path (every file of 32MB or more, i.e.
+/// every safetensors shard) parks its result at `blobs/<etag>` and returns
+/// that path with no pointer. Without this link the snapshot holds config
+/// and tokenizer but no weights, and conversion fails with "no .safetensors
+/// shards" on a pull that downloaded everything.
+fn link_into_snapshot(snapshot: &Path, filename: &str, src: &Path) -> Result<()> {
+    // `filename` comes from the remote repo's file listing. Reuse the cache's
+    // rule so a hostile or malformed entry (`..`, an absolute path, a Windows
+    // prefix) cannot place a symlink outside the snapshot — `Path::join`
+    // would otherwise honour a leading `/` and discard the snapshot prefix.
+    let rel = cache::id_to_relpath(filename)
+        .with_context(|| format!("refusing to link unsafe source path {filename}"))?;
+    let pointer = snapshot.join(rel);
+    // A symlink target is stored verbatim and resolved RELATIVE TO THE LINK's
+    // directory, not the process CWD. `BASERT_MODELS_DIR` is used exactly as
+    // given (it is not canonicalised), so a relative models root would other-
+    // wise write a target that dangles the moment it is read from inside the
+    // snapshot directory. Absolutise before linking.
+    let src = std::path::absolute(src)
+        .with_context(|| format!("resolving fetched path {}", src.display()))?;
+    let src = src.as_path();
+    if pointer == src {
+        return Ok(());
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(&pointer) {
+        let same = match (std::fs::canonicalize(&pointer), std::fs::canonicalize(src)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if same {
+            return Ok(());
+        }
+        if !meta.file_type().is_symlink() {
+            bail!(
+                "{} exists and is not the fetched {}",
+                pointer.display(),
+                src.display()
+            );
+        }
+        // A stale or dangling pointer from an earlier pull: replace it.
+        std::fs::remove_file(&pointer)
+            .with_context(|| format!("replacing stale {}", pointer.display()))?;
+    }
+    if let Some(parent) = pointer.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(src, &pointer)
+        .with_context(|| format!("linking {} -> {}", pointer.display(), src.display()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -801,6 +2394,7 @@ fn write_sidecar_for(
     variant: &str,
     profile: Option<&str>,
     base_sha256: Option<String>,
+    file: Option<&str>,
 ) -> Result<()> {
     cache::write_sidecar(
         vdir,
@@ -814,6 +2408,7 @@ fn write_sidecar_for(
             profile: profile.map(|s| s.to_string()),
             pulled_at: crate::chrono_now(),
             base_sha256,
+            file: file.map(|s| s.to_string()),
         },
     )
 }
@@ -946,9 +2541,9 @@ pub fn cmd_catalog_scan(org: String, out: Option<PathBuf>, dry_run: bool) -> Res
     }
 
     let path = out.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .map(|p| p.join("base-hub/catalog.json"))
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| workspace_catalog(&exe))
             .unwrap_or_else(|| PathBuf::from("catalog.json"))
     });
     if dry_run {
@@ -967,10 +2562,172 @@ pub fn cmd_catalog_scan(org: String, out: Option<PathBuf>, dry_run: bool) -> Res
     Ok(())
 }
 
+/// The bundled catalog's source in the workspace a source-built launcher sits
+/// in (`<workspace>/target/<profile>/basert`): `catalog-scan`'s in-place
+/// default. Found at run time because `env!("CARGO_MANIFEST_DIR")` compiled
+/// the build machine's checkout path into every release binary.
+fn workspace_catalog(exe: &Path) -> Option<PathBuf> {
+    exe.ancestors()
+        .map(|dir| dir.join("crates/base-hub/catalog.json"))
+        .find(|catalog| catalog.is_file())
+}
+
+/// Write the manifest a split bundle needs beside its parts.
+///
+/// `bundle` is the logical `.base` path the parts are named after
+/// (`parts/GLM-5.2-Q4.base`, which need not exist); its `.part-NNN` siblings
+/// are hashed in order, each and as one whole, and the result lands at
+/// `<bundle>.manifest.json` ready to upload with the parts.
+pub fn cmd_catalog_manifest(bundle: PathBuf) -> Result<()> {
+    let dir = bundle
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = bundle
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("bundle path has no file name")?
+        .to_string();
+    // Every entry is read or the command fails: an entry lost to an I/O
+    // error could be the terminal part, and a manifest written without it
+    // would describe a truncated bundle as complete.
+    let mut parts: Vec<(u32, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("listing {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("reading an entry of {}", dir.display()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if let Some((logical, idx)) = base_hub::parts::split_part_name(&name) {
+            if logical == stem {
+                parts.push((idx, entry.path()));
+            }
+        }
+    }
+    parts.sort();
+    if parts.is_empty() {
+        bail!("no {stem}.part-NNN files in {}", dir.display());
+    }
+    for (want, (have, path)) in (0u32..).zip(&parts) {
+        if *have != want {
+            bail!(
+                "part set is missing part {want:03} (next is {})",
+                path.display()
+            );
+        }
+    }
+    let paths: Vec<PathBuf> = parts.into_iter().map(|(_, p)| p).collect();
+    eprintln!("hashing {} parts of {stem} …", paths.len());
+    let manifest = base_hub::parts::build_manifest(&paths)?;
+    let out = dir.join(base_hub::parts::manifest_name(&stem));
+    std::fs::write(&out, serde_json::to_string_pretty(&manifest)? + "\n")
+        .with_context(|| format!("writing {}", out.display()))?;
+    eprintln!(
+        "  size:   {} bytes\n  sha256: {}\nwrote {}",
+        manifest.size,
+        manifest.sha256,
+        out.display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use base_hub::fetch::MockFetcher;
+
+    #[test]
+    fn a_pulled_snapshot_is_a_drafter_sidecar_by_what_its_config_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(drafter_sidecar_arch(tmp.path()), None, "no config.json");
+        let config = tmp.path().join("config.json");
+        for (text, arch) in [
+            (
+                r#"{"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}"#,
+                None,
+            ),
+            (
+                r#"{"architectures": ["DFlashDraftModel"], "model_type": "qwen3"}"#,
+                Some("dflash"),
+            ),
+            (
+                r#"{"architectures": ["DFlash2DraftModel"]}"#,
+                Some("dflash"),
+            ),
+            (r#"{"architectures": ["Qwen3DSparkModel"]}"#, Some("dspark")),
+            (
+                r#"{"architectures": ["LlamaForCausalLMEagle3"]}"#,
+                Some("eagle3"),
+            ),
+            // nebius' EAGLE-3 heads say LlamaForCausalLM: one layer with a
+            // draft vocabulary.
+            (
+                r#"{"architectures": ["LlamaForCausalLM"], "num_hidden_layers": 1, "draft_vocab_size": 32000}"#,
+                Some("eagle3"),
+            ),
+            ("not json", None),
+        ] {
+            std::fs::write(&config, text).unwrap();
+            assert_eq!(drafter_sidecar_arch(tmp.path()), arch, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_pull_quantizes_a_sidecars_layers_and_only_the_measured_fc_taps() {
+        assert_eq!(pull_drafter_flags(None), (false, false));
+        assert_eq!(pull_drafter_flags(Some("dflash")), (true, false));
+        assert_eq!(pull_drafter_flags(Some("dspark")), (true, true));
+        assert_eq!(pull_drafter_flags(Some("eagle3")), (true, true));
+    }
+
+    #[test]
+    fn bundled_computearena_harness_requires_a_sibling_and_respects_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(bundled_computearena_harness(Some(tmp.path()), false), None);
+
+        let harness = tmp.path().join(BENCHMARK_HARNESS_BINARY);
+        std::fs::write(&harness, b"fixture").unwrap();
+        assert_eq!(
+            bundled_computearena_harness(Some(tmp.path()), false),
+            Some(harness)
+        );
+        assert_eq!(bundled_computearena_harness(Some(tmp.path()), true), None);
+        assert_eq!(bundled_computearena_harness(None, false), None);
+    }
+
+    #[test]
+    fn catalog_scan_writes_the_bundled_catalog_of_a_source_built_launcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("baseRT/tools/base-convert");
+        let catalog = workspace.join("crates/base-hub/catalog.json");
+        std::fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(workspace.join("target/release")).unwrap();
+        std::fs::write(&catalog, b"{}").unwrap();
+        assert_eq!(
+            workspace_catalog(&workspace.join("target/release/basert")),
+            Some(catalog)
+        );
+        // An installed launcher has no workspace around it.
+        assert_eq!(workspace_catalog(&tmp.path().join("bin/basert")), None);
+    }
+
+    #[test]
+    fn bundled_computearena_harness_supports_the_source_build_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("baseRT");
+        let exe_dir = repo.join("tools/base-convert/target/release");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(repo.join("tools/base-convert/Cargo.toml"), b"[workspace]\n").unwrap();
+
+        let harness = repo.join("build").join(BENCHMARK_HARNESS_BINARY);
+        std::fs::create_dir_all(harness.parent().unwrap()).unwrap();
+        std::fs::write(&harness, b"fixture").unwrap();
+
+        assert_eq!(
+            bundled_computearena_harness(Some(&exe_dir), false),
+            Some(harness)
+        );
+    }
 
     #[test]
     fn quant_tag_extracts_last_segment() {
@@ -991,17 +2748,48 @@ mod tests {
     #[test]
     fn select_base_file_matches_quant_then_falls_back() {
         let files = vec![
-            "Llama-3.2-1B-Instruct-Q4.base".to_string(),
-            "Llama-3.2-1B-Instruct-Q8.base".to_string(),
+            Artifact::whole("Llama-3.2-1B-Instruct-Q4.base"),
+            Artifact::whole("Llama-3.2-1B-Instruct-Q8.base"),
         ];
-        assert_eq!(select_base_file(&files, "q4").unwrap(), &files[0]);
-        assert_eq!(select_base_file(&files, "q8").unwrap(), &files[1]);
+        let files = Grouped {
+            artifacts: files,
+            malformed: vec![],
+        };
+        assert_eq!(select_base_file(&files, "q4").unwrap(), &files.artifacts[0]);
+        assert_eq!(select_base_file(&files, "q8").unwrap(), &files.artifacts[1]);
         // No match among several → error that lists what's available.
         let err = select_base_file(&files, "q2").unwrap_err().to_string();
         assert!(err.contains("q4") && err.contains("q8"), "{err}");
         // Sole artifact → used regardless of requested quant.
-        let one = vec!["model.base".to_string()];
-        assert_eq!(select_base_file(&one, "q4").unwrap(), &one[0]);
+        let one = Grouped {
+            artifacts: vec![Artifact::whole("model.base")],
+            malformed: vec![],
+        };
+        assert_eq!(select_base_file(&one, "q4").unwrap(), &one.artifacts[0]);
+    }
+
+    #[test]
+    fn select_base_file_reports_an_incomplete_requested_quant() {
+        // A gapped Q4 upload beside a complete Q8: asking for Q4 is told
+        // the Q4 publication is incomplete, not quietly handed Q8.
+        let files = Grouped {
+            artifacts: vec![Artifact::whole("m-Q8.base")],
+            malformed: vec![(
+                "m-Q4.base".to_string(),
+                "part set is missing part 001 (found 2 parts)".to_string(),
+            )],
+        };
+        let err = select_base_file(&files, "q4").unwrap_err().to_string();
+        assert!(err.contains("incomplete"), "{err}");
+        assert!(err.contains("missing part 001"), "{err}");
+        // Q8 is still there for whoever asks for it.
+        assert_eq!(select_base_file(&files, "q8").unwrap().name, "m-Q8.base");
+        // And a third quant sees both, the broken one marked.
+        let err = select_base_file(&files, "q2").unwrap_err().to_string();
+        assert!(
+            err.contains("q4 (incomplete)") && err.contains("q8"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1013,9 +2801,108 @@ mod tests {
             std::fs::write(repo_dir.join(f), b"x").unwrap();
         }
         let fetcher = MockFetcher::new(tmp.path());
-        let mut got = list_base_files(&fetcher, "basecompute/m", "main").unwrap();
+        let mut got: Vec<String> = list_base_files(&fetcher, "basecompute/m", "main")
+            .unwrap()
+            .artifacts
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
         got.sort();
         assert_eq!(got, vec!["m-Q4.base".to_string(), "m-Q8.base".to_string()]);
+    }
+
+    #[test]
+    fn list_base_files_groups_a_part_set_under_its_logical_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("basecompute").join("m");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        for f in ["m-Q4.base.part-000", "m-Q4.base.part-001", "README.md"] {
+            std::fs::write(repo_dir.join(f), b"x").unwrap();
+        }
+        let fetcher = MockFetcher::new(tmp.path());
+        let got = list_base_files(&fetcher, "basecompute/m", "main").unwrap();
+        assert_eq!(got.artifacts.len(), 1);
+        assert_eq!(got.artifacts[0].name, "m-Q4.base");
+        assert_eq!(got.artifacts[0].parts.len(), 2);
+        // The logical name carries the quant tag the selector matches on.
+        assert_eq!(select_base_file(&got, "q4").unwrap().name, "m-Q4.base");
+    }
+
+    #[test]
+    fn pull_base_direct_reassembles_a_split_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("basecompute").join("m");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        // A real tiny bundle, cut in two: the install checks the stitched
+        // file against its own header, so arbitrary bytes will not do.
+        let whole = base_hub::parts::synthetic_bundle(1000);
+        let (head, tail) = whole.split_at(whole.len() / 2);
+        std::fs::write(repo_dir.join("m-Q4.base.part-000"), head).unwrap();
+        std::fs::write(repo_dir.join("m-Q4.base.part-001"), tail).unwrap();
+        // The manifest the publisher ships beside the parts, made the way
+        // they would make it.
+        cmd_catalog_manifest(repo_dir.join("m-Q4.base")).unwrap();
+        assert!(repo_dir.join("m-Q4.base.manifest.json").exists());
+        let fetcher = MockFetcher::new(tmp.path());
+        let base_files = list_base_files(&fetcher, "basecompute/m", "main").unwrap();
+
+        let root = tmp.path().join("cache");
+        let args = PullArgs {
+            id: "basecompute/m".into(),
+            profile: None,
+            target: None,
+            revision: "main".into(),
+            file: None,
+            force: false,
+            dry_run: false,
+        };
+        pull_base_direct(
+            &root,
+            &args,
+            "basecompute/m",
+            "basecompute/m",
+            "main",
+            &fetcher,
+            &base_files,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let vdir = root.join("basecompute/m/default-q4");
+        assert_eq!(std::fs::read(vdir.join("model.base")).unwrap(), whole);
+        assert!(vdir.join("hub.json").exists());
+        // No reassembly leftovers beside the installed artifact.
+        let stray: Vec<_> = std::fs::read_dir(&vdir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("partial"))
+            .collect();
+        assert!(stray.is_empty(), "leftovers: {stray:?}");
+    }
+
+    #[test]
+    fn config_json_is_requested_only_from_a_basecompute_repo_that_has_one() {
+        struct Recording(std::cell::RefCell<Vec<String>>, Vec<&'static str>);
+        impl Fetcher for Recording {
+            fn get_file(&self, _repo: &str, _revision: &str, filename: &str) -> Result<PathBuf> {
+                self.0.borrow_mut().push(filename.to_string());
+                Ok(PathBuf::from(filename))
+            }
+            fn list_files(&self, _repo: &str, _revision: &str) -> Result<Vec<String>> {
+                Ok(self.1.iter().map(|f| f.to_string()).collect())
+            }
+        }
+        let with = Recording(Default::default(), vec!["m-Q4.base", "config.json"]);
+        count_download(&with, "basecompute/m", "main");
+        assert_eq!(*with.0.borrow(), ["config.json"]);
+        let without = Recording(Default::default(), vec!["m-Q4.base"]);
+        count_download(&without, "basecompute/m", "main");
+        assert!(without.0.borrow().is_empty());
+        let elsewhere = Recording(Default::default(), vec!["m-Q4.base", "config.json"]);
+        count_download(&elsewhere, "someone/m", "main");
+        assert!(elsewhere.0.borrow().is_empty());
     }
 
     #[test]
@@ -1033,13 +2920,24 @@ mod tests {
         let args = PullArgs {
             id: "basecompute/m".into(),
             profile: None,
-            target: TargetScheme::BaseQ8,
+            target: Some(TargetScheme::BaseQ8),
             revision: "main".into(),
+            file: None,
             force: false,
             dry_run: false,
         };
-        pull_base_direct(&root, &args, "basecompute/m", "basecompute/m", "main", &fetcher, &base_files)
-            .unwrap();
+        pull_base_direct(
+            &root,
+            &args,
+            "basecompute/m",
+            "basecompute/m",
+            "main",
+            &fetcher,
+            &base_files,
+            None,
+            None,
+        )
+        .unwrap();
 
         // The Q8 artifact landed under the default-q8 variant dir.
         let out = root.join("basecompute/m/default-q8/model.base");
@@ -1051,6 +2949,1297 @@ mod tests {
         assert!(repo_dir.join("m-Q8.base").exists(), "fixture must survive");
     }
 
+    #[test]
+    fn select_named_base_file_matches_by_name_and_lists_the_rest() {
+        let files = Grouped {
+            artifacts: vec![
+                Artifact::whole("m-Small.base"),
+                Artifact::whole("sub/m-Large.base"),
+            ],
+            malformed: vec![(
+                "m-Medium.base".into(),
+                "part set is missing part 001".into(),
+            )],
+        };
+        assert_eq!(
+            select_named_base_file(&files, "m-Small.base").unwrap().name,
+            "m-Small.base"
+        );
+        assert_eq!(
+            select_named_base_file(&files, "m-Large").unwrap().name,
+            "sub/m-Large.base"
+        );
+        let err = select_named_base_file(&files, "m-Medium.base")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("incomplete") && err.contains("missing part 001"),
+            "{err}"
+        );
+        let err = select_named_base_file(&files, "m-Huge.base")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("m-Small.base") && err.contains("sub/m-Large.base"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn variants_of_quant_picked_and_named_files() {
+        assert_eq!(base_variant("m-Q8.base", "q4"), "default-q8");
+        assert_eq!(base_variant("model.base", "q4"), "default-q4");
+        let medium = named_variant("m-Medium.base");
+        assert!(
+            medium.starts_with("file-m-medium-") && medium.len() == "file-m-medium-".len() + 8,
+            "{medium}"
+        );
+        // paths the readable part folds together keep variants of their own
+        let folded = ["a/model.base", "a-model.base", "A-Model.base"].map(named_variant);
+        assert!(
+            folded.iter().all(|v| v.starts_with("file-a-model-")),
+            "{folded:?}"
+        );
+        for wide in ["é", "𝔸"] {
+            let long = format!("{}/model.base", wide.repeat(200));
+            let v = named_variant(&long);
+            assert!(v.len() <= "file-".len() + 64 + 9, "{} bytes", v.len());
+            assert_ne!(
+                v,
+                named_variant(&format!("{}/other.base", wide.repeat(200)))
+            );
+        }
+        assert!(
+            folded[0] != folded[1] && folded[1] != folded[2] && folded[0] != folded[2],
+            "{folded:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_picks_among_files_that_share_a_name() {
+        let files = Grouped {
+            artifacts: vec![
+                Artifact::whole("a/model.base"),
+                Artifact::whole("b/model.base"),
+            ],
+            malformed: vec![],
+        };
+        assert_eq!(
+            select_named_base_file(&files, "b/model.base").unwrap().name,
+            "b/model.base"
+        );
+        assert_eq!(
+            select_named_base_file(&files, "a/model").unwrap().name,
+            "a/model.base"
+        );
+        let err = select_named_base_file(&files, "model.base")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("names several files") && err.contains("b/model.base"),
+            "{err}"
+        );
+        assert!(select_named_base_file(&files, "c/model.base").is_err());
+
+        // An incomplete upload by that name counts toward the ambiguity.
+        let files = Grouped {
+            artifacts: vec![Artifact::whole("a/model.base")],
+            malformed: vec![("b/model.base".into(), "part set is missing part 001".into())],
+        };
+        let err = select_named_base_file(&files, "model.base")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("names several files") && err.contains("b/model.base (incomplete)"),
+            "{err}"
+        );
+        let err = select_named_base_file(&files, "b/model.base")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("incomplete") && err.contains("missing part 001"),
+            "{err}"
+        );
+        assert_eq!(
+            select_named_base_file(&files, "a/model.base").unwrap().name,
+            "a/model.base"
+        );
+    }
+
+    fn named(file: &str, dry_run: bool, id: &str) -> PullArgs {
+        PullArgs {
+            id: id.into(),
+            profile: None,
+            target: None,
+            revision: "main".into(),
+            file: Some(file.into()),
+            force: false,
+            dry_run,
+        }
+    }
+
+    fn pull_named(reg: &MergedRegistry, fetcher: &dyn Fetcher, args: &PullArgs) -> Result<()> {
+        pull_named_file(reg, args, args.file.as_deref().unwrap(), fetcher)
+    }
+
+    fn catalog(json_models: &str) -> base_hub::registry::CatalogRegistry {
+        base_hub::registry::CatalogRegistry::from_catalog(
+            base_hub::catalog::Catalog::from_json(&format!(
+                r#"{{"schema":1,"models":[{json_models}]}}"#
+            ))
+            .unwrap(),
+        )
+    }
+
+    /// A flat fixture repo `MockFetcher` serves from `root`.
+    fn fixture_repo(root: &Path, repo: &str, files: &[(&str, &[u8])]) {
+        let dir = root.join(repo);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (f, bytes) in files {
+            std::fs::write(dir.join(f), bytes).unwrap();
+        }
+    }
+
+    /// A repo listing and nothing to download: what the cache checks see.
+    struct Listing(Vec<&'static str>);
+
+    impl Fetcher for Listing {
+        fn get_file(&self, _: &str, _: &str, f: &str) -> Result<PathBuf> {
+            bail!("no download expected ({f})")
+        }
+        fn list_files(&self, _: &str, _: &str) -> Result<Vec<String>> {
+            Ok(self.0.iter().map(|f| f.to_string()).collect())
+        }
+    }
+
+    /// An installed variant as an earlier pull (of any kind) would leave it.
+    fn install(
+        reg: &MergedRegistry,
+        id: &str,
+        variant: &str,
+        file: Option<&str>,
+        kind: &str,
+        profile: Option<&str>,
+    ) {
+        let vdir = cache::variant_dir(&reg.root, id, variant).unwrap();
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(cache::base_artifact_path(&vdir), b"x").unwrap();
+        write_sidecar_for(
+            &vdir, id, kind, id, None, "main", variant, profile, None, file,
+        )
+        .unwrap();
+    }
+
+    fn held(reg: &MergedRegistry, id: &str, variant: &str) -> Option<String> {
+        let vdir = cache::variant_dir(&reg.root, id, variant).unwrap();
+        cache::read_sidecar(&vdir).unwrap().unwrap().file
+    }
+
+    /// A repo whose `.base` files are named by size, not quant (the BaseQuant
+    /// releases): no quant picks one, `--file` does, each into a variant of
+    /// its own that records the file, which `basert list` reports.
+    #[test]
+    fn a_size_named_repo_installs_each_file_under_its_own_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_repo(
+            tmp.path(),
+            "basecompute/m",
+            &[
+                ("m-Small.base", b"small"),
+                ("m-Medium.base", b"medium"),
+                ("m-Medium.gguf", b"gguf"),
+            ],
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let base_files = list_base_files(&fetcher, "basecompute/m", "main").unwrap();
+        let err = select_base_file(&base_files, "q4").unwrap_err().to_string();
+        assert!(
+            err.contains("named by size (small, medium)")
+                && err.contains("`<id>:<size>`")
+                && err.contains("--file")
+                && err.contains("m-Medium.base"),
+            "{err}"
+        );
+
+        let reg = MergedRegistry::new(tmp.path().join("cache"), catalog(""));
+        pull_named(
+            &reg,
+            &fetcher,
+            &named("m-Medium.base", false, "basecompute/m"),
+        )
+        .unwrap();
+        pull_named(&reg, &fetcher, &named("m-Small", false, "basecompute/m")).unwrap();
+        let m = reg.root.join("basecompute/m");
+        assert_eq!(
+            std::fs::read(m.join(named_variant("m-Medium.base")).join("model.base")).unwrap(),
+            b"medium"
+        );
+        assert_eq!(
+            std::fs::read(m.join(named_variant("m-Small.base")).join("model.base")).unwrap(),
+            b"small"
+        );
+        assert_eq!(
+            held(&reg, "basecompute/m", &named_variant("m-Medium.base")).as_deref(),
+            Some("m-Medium.base")
+        );
+        let rows = reg.local.list().unwrap();
+        let files: Vec<_> = rows.iter().filter_map(|r| r.file.as_deref()).collect();
+        assert_eq!(files, ["m-Medium.base", "m-Small.base"]);
+        // and a quant never reaches one by its bits
+        assert!(installed_best_variant(&reg, "basecompute/m", "default-q4").is_none());
+    }
+
+    fn plain(id: &str) -> PullArgs {
+        with_variant(id, false)
+    }
+
+    fn pull_repo(reg: &MergedRegistry, fetcher: &dyn Fetcher, args: &PullArgs) -> Result<()> {
+        pull_hf_repo(reg, args, &args.id, &args.id, "main", fetcher)
+    }
+
+    /// A release in sizes (the BaseQuant repos): a plain pull takes its
+    /// medium, under the variant `--file` would install it in, so the two
+    /// share one install; a quant named instead is refused naming the sizes.
+    #[test]
+    fn a_release_in_sizes_pulls_its_medium_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "basecompute/m";
+        fixture_repo(
+            tmp.path(),
+            id,
+            &[
+                ("m-XS.base", b"xs"),
+                ("m-Small.base", b"small"),
+                ("m-Medium.base", b"medium"),
+                ("m-Large.base", b"large"),
+                ("m-XL.base", b"xl"),
+                ("m-Medium.gguf", b"gguf"),
+            ],
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let reg = MergedRegistry::new(tmp.path().join("cache"), catalog(""));
+        let medium = named_variant("m-Medium.base");
+
+        pull_repo(&reg, &fetcher, &plain(id)).unwrap();
+        let path = reg.local.installed_path(id, &medium).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"medium");
+        assert_eq!(held(&reg, id, &medium).as_deref(), Some("m-Medium.base"));
+        assert_eq!(reg.local.list().unwrap().len(), 1);
+
+        // installed: a second plain pull, a `--file` pull and a `:medium`
+        // pull all find it without a download
+        let listing = Listing(vec!["m-Small.base", "m-Medium.base", "m-Large.base"]);
+        pull_repo(&reg, &listing, &plain(id)).unwrap();
+        pull_repo(&reg, &listing, &with_variant(id, true)).unwrap();
+        pull_named(&reg, &listing, &named("m-Medium.base", false, id)).unwrap();
+        pull_with_variant(&reg, &listing, &with_variant("basecompute/m:medium", false)).unwrap();
+        pull_with_variant(&reg, &listing, &with_variant("basecompute/m:Medium", false)).unwrap();
+        assert_eq!(reg.local.list().unwrap().len(), 1);
+
+        // and `serve <id>` / `serve <id>:medium` resolve to it
+        assert_eq!(
+            installed_single_path(&reg, id).unwrap().as_deref(),
+            Some(path.as_path())
+        );
+        assert_eq!(
+            installed_best_variant(&reg, id, "medium").as_deref(),
+            Some(path.as_path())
+        );
+        assert_eq!(
+            installed_best_variant(&reg, id, "Medium").as_deref(),
+            Some(path.as_path())
+        );
+        assert!(installed_best_variant(&reg, id, "small").is_none());
+        assert!(installed_best_variant(&reg, id, "default-q4").is_none());
+
+        // a size names its file; one the release lacks names the sizes it has
+        assert_eq!(
+            variant_source(&reg, id, "small", "main", &fetcher).unwrap(),
+            VariantSource::File("m-Small.base".into())
+        );
+        pull_with_variant(&reg, &fetcher, &with_variant("basecompute/m:small", false)).unwrap();
+        let small = named_variant("m-Small.base");
+        assert_eq!(
+            std::fs::read(reg.local.installed_path(id, &small).unwrap()).unwrap(),
+            b"small"
+        );
+        assert_eq!(
+            installed_best_variant(&reg, id, "small").unwrap(),
+            reg.local.installed_path(id, &small).unwrap()
+        );
+        // with several sizes installed, the bare id is still the medium
+        assert_eq!(
+            installed_single_path(&reg, id).unwrap().as_deref(),
+            Some(path.as_path())
+        );
+
+        // a quant named instead of a size is refused, naming the sizes
+        let mut q8 = plain(id);
+        q8.target = Some(TargetScheme::BaseQ8);
+        let err = pull_repo(&reg, &fetcher, &q8).unwrap_err().to_string();
+        assert!(
+            err.contains("named by size (xs, small, medium, large, xl)")
+                && err.contains("`<id>:<size>`"),
+            "{err}"
+        );
+        q8.dry_run = true;
+        let err = pull_repo(&reg, &listing, &q8).unwrap_err().to_string();
+        assert!(err.contains("named by size"), "{err}");
+    }
+
+    /// A dry run of a raw repo reads its plan off the listing: the file a
+    /// pull would take and the variant it would land in, nothing fetched.
+    #[test]
+    fn a_dry_run_of_a_raw_repo_names_its_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = MergedRegistry::new(tmp.path().join("cache"), catalog(""));
+        let listing = Listing(vec!["m-Q4.base", "m-Q8.base"]);
+        let mut args = plain("org/m");
+        args.dry_run = true;
+        pull_repo(&reg, &listing, &args).unwrap();
+        args.target = Some(TargetScheme::BaseQ8);
+        pull_repo(&reg, &listing, &args).unwrap();
+        args.target = Some(TargetScheme::BaseQ6);
+        let err = pull_repo(&reg, &listing, &args).unwrap_err().to_string();
+        assert!(err.contains("it offers: q4, q8"), "{err}");
+        // a source repo's plan is the conversion it would run, nothing fetched
+        let sources = Listing(vec!["config.json", "model.safetensors"]);
+        pull_repo(&reg, &sources, &args).unwrap();
+        assert!(reg.local.list().unwrap().is_empty());
+    }
+
+    /// The sizes rule holds only for a release named by size and nothing
+    /// else: one file is taken whatever its size, no medium among several
+    /// is an error, a quant-named file beside a size keeps the quant rule,
+    /// and a half-uploaded medium is reported, never another size.
+    #[test]
+    fn a_release_in_sizes_without_a_medium_or_beside_quants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fetcher = MockFetcher::new(tmp.path());
+        let reg = MergedRegistry::new(tmp.path().join("cache"), catalog(""));
+
+        fixture_repo(tmp.path(), "org/one", &[("one-Small.base", b"small")]);
+        pull_repo(&reg, &fetcher, &plain("org/one")).unwrap();
+        let small = named_variant("one-Small.base");
+        assert_eq!(
+            std::fs::read(reg.local.installed_path("org/one", &small).unwrap()).unwrap(),
+            b"small"
+        );
+        assert!(installed_best_variant(&reg, "org/one", "small").is_some());
+
+        fixture_repo(
+            tmp.path(),
+            "org/two",
+            &[("two-Small.base", b"small"), ("two-Large.base", b"large")],
+        );
+        let err = pull_repo(&reg, &fetcher, &plain("org/two"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("named by size (small, large)"), "{err}");
+        let err = variant_source(&reg, "org/two", "medium", "main", &fetcher)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("it comes in: small, large"), "{err}");
+
+        fixture_repo(
+            tmp.path(),
+            "org/mixed",
+            &[("mixed-Q4.base", b"q4"), ("mixed-Medium.base", b"medium")],
+        );
+        pull_repo(&reg, &fetcher, &plain("org/mixed")).unwrap();
+        assert_eq!(
+            std::fs::read(reg.local.installed_path("org/mixed", "default-q4").unwrap()).unwrap(),
+            b"q4"
+        );
+        // its medium is still reachable by size
+        assert_eq!(
+            variant_source(&reg, "org/mixed", "medium", "main", &fetcher).unwrap(),
+            VariantSource::File("mixed-Medium.base".into())
+        );
+
+        let files = Grouped {
+            artifacts: vec![Artifact::whole("m-Small.base")],
+            malformed: vec![("m-Medium.base".into(), "index 1 is missing".into())],
+        };
+        let err = default_size_file(&files).unwrap_err().to_string();
+        assert!(
+            err.contains("the medium publication is incomplete"),
+            "{err}"
+        );
+        let files = Grouped {
+            artifacts: vec![Artifact::whole("m-Q4.base"), Artifact::whole("m-Q8.base")],
+            malformed: vec![],
+        };
+        assert_eq!(default_size_file(&files).unwrap(), None);
+        let files = Grouped {
+            artifacts: vec![Artifact::whole("Foo.base")],
+            malformed: vec![],
+        };
+        assert_eq!(default_size_file(&files).unwrap(), None);
+    }
+
+    /// A quant named is a quant, the default one included: `--target base-q4`
+    /// and `:q4` ask for a q4, which a release in sizes has none of, and are
+    /// refused as any quant is; only a pull naming no quant takes the Medium.
+    #[test]
+    fn an_explicit_q4_is_a_quant_asked_for_not_the_default_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "basecompute/m";
+        fixture_repo(
+            tmp.path(),
+            id,
+            &[
+                ("m-Small.base", b"small"),
+                ("m-Medium.base", b"medium"),
+                ("m-Large.base", b"large"),
+            ],
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let reg = MergedRegistry::new(tmp.path().join("cache"), catalog(""));
+        // as the command line gives them: no --target is no quant named
+        let parse = |argv: &[&str]| <PullArgs as clap::Parser>::try_parse_from(argv).unwrap();
+        assert_eq!(parse(&["pull", id]).target, None);
+        let q4 = parse(&["pull", id, "--target", "base-q4"]);
+        assert_eq!(q4.target, Some(TargetScheme::BaseQ4));
+        let err = pull_repo(&reg, &fetcher, &q4).unwrap_err().to_string();
+        assert!(
+            err.contains("named by size (small, medium, large)"),
+            "{err}"
+        );
+        let err = pull_with_variant(&reg, &fetcher, &with_variant("basecompute/m:q4", false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("named by size"), "{err}");
+        assert!(reg.local.list().unwrap().is_empty());
+        pull_repo(&reg, &fetcher, &parse(&["pull", id])).unwrap();
+        assert_eq!(reg.local.list().unwrap().len(), 1);
+    }
+
+    /// Two models of one size in a repo are two: the default pick refuses to
+    /// choose between them, as `:medium` does, and asks for a file.
+    #[test]
+    fn two_mediums_are_refused_by_the_default_as_by_the_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "org/two";
+        fixture_repo(
+            tmp.path(),
+            id,
+            &[
+                ("model-A-Medium.base", b"a"),
+                ("model-B-Medium.base", b"b"),
+                ("model-A-Small.base", b"s"),
+            ],
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let reg = MergedRegistry::new(tmp.path().join("cache"), catalog(""));
+        let err = pull_repo(&reg, &fetcher, &plain(id))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("medium names several files")
+                && err.contains("model-A-Medium.base")
+                && err.contains("model-B-Medium.base")
+                && err.contains("--file"),
+            "{err}"
+        );
+        let err = variant_source(&reg, id, "medium", "main", &fetcher)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("medium names several files"), "{err}");
+        assert!(reg.local.list().unwrap().is_empty());
+        // the one Small is still its size's
+        assert_eq!(
+            variant_source(&reg, id, "small", "main", &fetcher).unwrap(),
+            VariantSource::File("model-A-Small.base".into())
+        );
+    }
+
+    /// A cached file answers only for itself: the name is resolved against
+    /// the repo first, and whatever else is in the variant is refused.
+    #[test]
+    fn a_cached_file_answers_only_for_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_repo(tmp.path(), "basecompute/m", &[("m-Medium.base", b"medium")]);
+        let fetcher = MockFetcher::new(tmp.path());
+        let reg = MergedRegistry::new(tmp.path().join("cache"), catalog(""));
+        let medium = reg
+            .root
+            .join("basecompute/m")
+            .join(named_variant("m-Medium.base"))
+            .join("model.base");
+
+        pull_named(
+            &reg,
+            &fetcher,
+            &named("m-Medium.base", true, "basecompute/m"),
+        )
+        .unwrap();
+        assert!(!medium.exists(), "a dry run installs nothing");
+        pull_named(
+            &reg,
+            &fetcher,
+            &named("m-Medium.base", false, "basecompute/m"),
+        )
+        .unwrap();
+        std::fs::write(&medium, b"cached").unwrap();
+        for dry in [false, true] {
+            pull_named(&reg, &fetcher, &named("m-Medium", dry, "basecompute/m")).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&medium).unwrap(),
+            b"cached",
+            "a cache hit downloads nothing"
+        );
+        let err = pull_named(
+            &reg,
+            &fetcher,
+            &named("Typo-Medium.base", true, "basecompute/m"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no .base named"), "{err}");
+
+        for (file, profile, says) in [
+            (Some("other.base"), None, "holds other.base"),
+            (None, Some("default-q4"), "holds a conversion"),
+            (None, None, "an install from another source"),
+        ] {
+            install(
+                &reg,
+                "basecompute/m",
+                &named_variant("m-Medium.base"),
+                file,
+                "huggingface",
+                profile,
+            );
+            for dry in [false, true] {
+                let err = pull_named(
+                    &reg,
+                    &fetcher,
+                    &named("m-Medium.base", dry, "basecompute/m"),
+                )
+                .unwrap_err();
+                assert!(
+                    err.to_string().contains(says) && err.to_string().contains("--force"),
+                    "{err}"
+                );
+            }
+        }
+        let mut force = named("m-Medium.base", false, "basecompute/m");
+        force.force = true;
+        pull_named(&reg, &fetcher, &force).unwrap();
+        assert_eq!(std::fs::read(&medium).unwrap(), b"medium");
+    }
+
+    /// A bare name is resolved against the repo listing whether or not its
+    /// file is cached, so it is ambiguous exactly when a fresh pull says so;
+    /// a path picks among same-named files, which get variants of their own.
+    #[test]
+    fn a_bare_name_is_resolved_against_the_repo_even_when_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = MergedRegistry::new(tmp.path(), catalog(""));
+        install(
+            &reg,
+            "basecompute/m",
+            &named_variant("model.base"),
+            Some("model.base"),
+            "huggingface",
+            None,
+        );
+        install(
+            &reg,
+            "basecompute/m",
+            &named_variant("a/model.base"),
+            Some("a/model.base"),
+            "huggingface",
+            None,
+        );
+        pull_named(
+            &reg,
+            &Listing(vec!["model.base"]),
+            &named("model.base", false, "basecompute/m"),
+        )
+        .unwrap();
+        let grown = Listing(vec!["model.base", "a/model.base", "b/model.base"]);
+        for bare in ["model.base", "model"] {
+            let err = pull_named(&reg, &grown, &named(bare, false, "basecompute/m")).unwrap_err();
+            assert!(err.to_string().contains("names several files"), "{err}");
+        }
+        pull_named(&reg, &grown, &named("a/model.base", true, "basecompute/m")).unwrap();
+        let err =
+            pull_named(&reg, &grown, &named("b/model.base", false, "basecompute/m")).unwrap_err();
+        assert!(
+            err.to_string().contains("no download expected"),
+            "b/model is not cached: {err}"
+        );
+        // an incomplete upload by that name counts toward the ambiguity too
+        let files = Grouped {
+            artifacts: vec![Artifact::whole("a/model.base")],
+            malformed: vec![("b/model.base".into(), "part set is missing part 001".into())],
+        };
+        let err = select_named_base_file(&files, "model.base")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("names several files") && err.contains("b/model.base (incomplete)"),
+            "{err}"
+        );
+    }
+
+    /// A file a catalog row publishes is that row's: from its repo, under its
+    /// variant, refused for another backend, answered by an older catalog
+    /// pull of it; a bare name two rows publish must be given with its path.
+    #[test]
+    fn a_catalog_file_is_its_rows() {
+        let here = CatalogRegistry::client_backend();
+        let there = if here == "cuda" { "metal" } else { "cuda" };
+        let tmp = tempfile::tempdir().unwrap();
+        let mine = format!("cat-{here}-q4mix.base");
+        let theirs = format!("cat-{there}-q4mix.base");
+        fixture_repo(
+            tmp.path(),
+            "basecompute/cat-a",
+            &[
+                ("cat-Q4.base", b"q4"),
+                (&mine, b"mine"),
+                (&theirs, b"theirs"),
+                ("Experimental-Q4.base", b"exp"),
+                ("Both.base", b"a"),
+            ],
+        );
+        fixture_repo(
+            tmp.path(),
+            "basecompute/cat-b",
+            &[
+                ("cat-Q8.base", b"q8"),
+                ("Only-B.base", b"b"),
+                ("Both.base", b"b"),
+            ],
+        );
+        let row = |repo: &str, quant: &str, file: &str, backend: &str| {
+            format!(
+                r#"{{"id":"basecompute/cat","hf_repo":"basecompute/{repo}","quant":"{quant}","file":"{file}"{backend}}}"#
+            )
+        };
+        let reg = MergedRegistry::new(
+            tmp.path().join("cache"),
+            catalog(
+                &[
+                    row("cat-a", "default-q4", "cat-Q4.base", r#","sha256":"112f2dfa31205df3f5f9db109460c8b85067d7dc27f70781c2e4ef903ee9f26a""#),
+                    row("cat-b", "default-q8", "cat-Q8.base", ""),
+                    row(
+                        "cat-a",
+                        &format!("{here}-q4mix"),
+                        &mine,
+                        &format!(r#","backend":"{here}""#),
+                    ),
+                    row(
+                        "cat-a",
+                        &format!("{there}-q4mix"),
+                        &theirs,
+                        &format!(r#","backend":"{there}""#),
+                    ),
+                ]
+                .join(","),
+            ),
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let cat = reg.root.join("basecompute/cat");
+
+        pull_named(
+            &reg,
+            &fetcher,
+            &named("cat-Q8.base", false, "basecompute/cat"),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(cat.join("default-q8/model.base")).unwrap(),
+            b"q8",
+            "from its own row's repo"
+        );
+        pull_named(&reg, &fetcher, &named(&mine, false, "basecompute/cat")).unwrap();
+        assert_eq!(
+            std::fs::read(cat.join(format!("{here}-q4mix/model.base"))).unwrap(),
+            b"mine"
+        );
+        let err =
+            pull_named(&reg, &fetcher, &named(&theirs, false, "basecompute/cat")).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("the {there} bundle")),
+            "{err}"
+        );
+        assert!(!cat.join(format!("{there}-q4mix")).exists());
+
+        // an unlisted file never takes a catalog variant, now or later
+        pull_named(
+            &reg,
+            &fetcher,
+            &named("Experimental-Q4.base", false, "basecompute/cat"),
+        )
+        .unwrap();
+        assert!(
+            cat.join(named_variant("Experimental-Q4.base"))
+                .join("model.base")
+                .exists()
+                && !cat.join("default-q4").exists()
+        );
+
+        // an unlisted file is looked for in every repo the id's rows use
+        pull_named(
+            &reg,
+            &fetcher,
+            &named("Only-B.base", false, "basecompute/cat"),
+        )
+        .unwrap();
+        let only_b = cat.join(named_variant("Only-B.base")).join("model.base");
+        assert_eq!(std::fs::read(only_b).unwrap(), b"b");
+        let err =
+            pull_named(&reg, &fetcher, &named("Both.base", true, "basecompute/cat")).unwrap_err();
+        assert!(
+            err.to_string().contains("several repos") && err.to_string().contains("cat-b"),
+            "{err}"
+        );
+
+        // a catalog pull from before files were recorded is its row's file
+        // only when its bytes are the row's
+        let legacy = |sha: &str| {
+            let vdir = cache::variant_dir(&reg.root, "basecompute/cat", "default-q4").unwrap();
+            std::fs::create_dir_all(&vdir).unwrap();
+            std::fs::write(cache::base_artifact_path(&vdir), b"q4").unwrap();
+            let id = "basecompute/cat";
+            write_sidecar_for(
+                &vdir,
+                id,
+                "catalog",
+                id,
+                None,
+                "main",
+                "default-q4",
+                None,
+                Some(sha.into()),
+                None,
+            )
+            .unwrap();
+        };
+        legacy(&"0".repeat(64));
+        let err = pull_named(
+            &reg,
+            &fetcher,
+            &named("cat-Q4.base", false, "basecompute/cat"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--force"), "{err}");
+        legacy("112f2dfa31205df3f5f9db109460c8b85067d7dc27f70781c2e4ef903ee9f26a");
+        pull_named(
+            &reg,
+            &fetcher,
+            &named("cat-Q4.base", false, "basecompute/cat"),
+        )
+        .unwrap();
+        assert_eq!(
+            held(&reg, "basecompute/cat", "default-q4").as_deref(),
+            Some("cat-Q4.base")
+        );
+
+        let two = MergedRegistry::new(
+            tmp.path().join("two"),
+            catalog(
+                &[
+                    row("cat-a", "default-q4", "a/model.base", ""),
+                    row("cat-b", "default-q8", "b/model.base", ""),
+                ]
+                .join(","),
+            ),
+        );
+        let err = pull_named(
+            &two,
+            &Listing(vec!["a/model.base"]),
+            &named("model.base", true, "basecompute/cat"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("names several files the catalog lists"),
+            "{err}"
+        );
+    }
+
+    /// A cached catalog behind the Hub — the row's sha256 is the old file's,
+    /// the Hub serves the new one — fails a fresh pull's checksum; the pull
+    /// then fetches the live catalog and, when the live row names the new
+    /// sha256, pulls once more against it. A live row that agrees with the
+    /// stale one (the Hub really disagrees), or no live catalog at all, leaves
+    /// the error, after one attempt.
+    #[test]
+    fn a_stale_catalog_row_is_retried_from_the_live_catalog() {
+        use sha2::{Digest, Sha256};
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_repo(
+            tmp.path(),
+            "basecompute/cat-files",
+            &[("cat-Medium.base", b"medium")],
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let real = format!("{:x}", Sha256::digest(b"medium"));
+        let row = |sha: &str| {
+            catalog(&format!(
+                r#"{{"id":"basecompute/cat","hf_repo":"basecompute/cat-files","quant":"default-medium","file":"cat-Medium.base","sha256":"{sha}"}}"#
+            ))
+        };
+        let root = tmp.path().join("hub");
+        let stale = MergedRegistry::new(root.clone(), row(&"0".repeat(64)));
+        let out = root.join("basecompute/cat/default-medium/model.base");
+        let attempts = std::cell::Cell::new(0);
+        let attempt = |reg: &MergedRegistry| {
+            attempts.set(attempts.get() + 1);
+            let r = reg
+                .resolve("basecompute/cat", "main", Some("default-medium"), false)
+                .unwrap();
+            pull_catalog(&reg.root, &r, &fetcher)
+        };
+
+        // The live catalog knows the new file: the retry installs it.
+        with_fresh_catalog_on_mismatch(
+            &stale,
+            || Some(MergedRegistry::new(root.clone(), row(&real))),
+            attempt,
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(std::fs::read(&out).unwrap(), b"medium");
+        let s = cache::read_sidecar(out.parent().unwrap()).unwrap().unwrap();
+        assert_eq!(s.base_sha256.as_deref(), Some(real.as_str()));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // The live row agrees with the stale one: the Hub is wrong, one attempt.
+        attempts.set(0);
+        let err = with_fresh_catalog_on_mismatch(
+            &stale,
+            || Some(MergedRegistry::new(root.clone(), row(&"0".repeat(64)))),
+            attempt,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"), "{err}");
+        assert_eq!(attempts.get(), 1);
+        assert!(!out.exists());
+
+        // No live catalog to be had: the error as it was.
+        attempts.set(0);
+        let err = with_fresh_catalog_on_mismatch(&stale, || None, attempt).unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"), "{err}");
+        assert_eq!(attempts.get(), 1);
+    }
+
+    /// A pull that fails the catalog's sha256 leaves an installed file and
+    /// its sidecar as they were, on both pull paths: the download is checked
+    /// beside them and moved into place only when it is the row's file. A
+    /// forced pull is what `basert serve` runs to refresh a file for its MTP
+    /// head, so a catalog and a Hub file that disagree must not cost the
+    /// model that was being served.
+    #[test]
+    fn a_failed_checksum_leaves_the_installed_file_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_repo(
+            tmp.path(),
+            "basecompute/cat-files",
+            &[("cat-Medium.base", b"medium")],
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let reg = MergedRegistry::new(
+            tmp.path().join("hub"),
+            catalog(&format!(
+                r#"{{"id":"basecompute/cat","hf_repo":"basecompute/cat-files","quant":"default-medium","file":"cat-Medium.base","sha256":"{}"}}"#,
+                "0".repeat(64)
+            )),
+        );
+        // What an earlier pull installed, with the sidecar it recorded.
+        let vdir = cache::variant_dir(&reg.root, "basecompute/cat", "default-medium").unwrap();
+        std::fs::create_dir_all(&vdir).unwrap();
+        let out = cache::base_artifact_path(&vdir);
+        std::fs::write(&out, b"the installed one").unwrap();
+        write_sidecar_for(
+            &vdir,
+            "basecompute/cat",
+            "catalog",
+            "basecompute/cat-files",
+            None,
+            "main",
+            "default-medium",
+            None,
+            Some("installed-sha".into()),
+            Some("cat-Medium.base"),
+        )
+        .unwrap();
+        let untouched = |what: &str| {
+            assert_eq!(
+                std::fs::read(&out).unwrap(),
+                b"the installed one",
+                "{what}: the file"
+            );
+            let s = cache::read_sidecar(&vdir).unwrap().unwrap();
+            assert_eq!(
+                s.base_sha256.as_deref(),
+                Some("installed-sha"),
+                "{what}: the sidecar"
+            );
+            assert!(
+                !pending_path(&out).exists(),
+                "{what}: no download left beside it"
+            );
+        };
+
+        // The catalog path, forced (the refresh `basert serve` runs).
+        let r = reg
+            .resolve("basecompute/cat", "main", Some("default-medium"), true)
+            .unwrap();
+        assert!(matches!(r, ModelRef::Catalog { .. }));
+        let err = pull_catalog(&reg.root, &r, &fetcher).unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"), "{err}");
+        untouched("catalog path");
+
+        // The direct path, by file name, forced.
+        let args = PullArgs {
+            force: true,
+            ..named("cat-Medium.base", false, "basecompute/cat")
+        };
+        let err = pull_named(&reg, &fetcher, &args).unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"), "{err}");
+        untouched("direct path");
+    }
+
+    /// The catalog's own file is held to the catalog's sha256 when named.
+    #[test]
+    fn a_named_catalog_file_is_checked_against_the_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_repo(
+            tmp.path(),
+            "basecompute/cat-files",
+            &[("cat-Medium.base", b"medium")],
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let row = |sha: &str| {
+            catalog(&format!(
+                r#"{{"id":"basecompute/cat","hf_repo":"basecompute/cat-files","quant":"default-medium","file":"cat-Medium.base","sha256":"{sha}"}}"#
+            ))
+        };
+        let out = |reg: &MergedRegistry| reg.root.join("basecompute/cat/default-medium/model.base");
+
+        let bad = MergedRegistry::new(tmp.path().join("bad"), row(&"0".repeat(64)));
+        let err = pull_named(
+            &bad,
+            &fetcher,
+            &named("cat-Medium.base", false, "basecompute/cat"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"), "{err}");
+        assert!(
+            !out(&bad).exists(),
+            "a mismatched download is not installed"
+        );
+
+        let good = MergedRegistry::new(
+            tmp.path().join("good"),
+            row("c082456a7766e23a18db084cd34b6ff510baef506548b897cc80e9b7d3e121c8"),
+        );
+        pull_named(
+            &good,
+            &fetcher,
+            &named("cat-Medium.base", false, "basecompute/cat"),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(out(&good)).unwrap(), b"medium");
+    }
+
+    /// A Hub that must not be asked anything.
+    struct Offline;
+
+    impl Fetcher for Offline {
+        fn get_file(&self, _: &str, _: &str, f: &str) -> Result<PathBuf> {
+            bail!("no download expected ({f})")
+        }
+        fn list_files(&self, repo: &str, _: &str) -> Result<Vec<String>> {
+            bail!("no listing expected ({repo})")
+        }
+    }
+
+    fn with_variant(id: &str, dry_run: bool) -> PullArgs {
+        PullArgs {
+            id: id.into(),
+            profile: None,
+            target: None,
+            revision: "main".into(),
+            file: None,
+            force: false,
+            dry_run,
+        }
+    }
+
+    fn pull_with_variant(
+        reg: &MergedRegistry,
+        fetcher: &dyn Fetcher,
+        args: &PullArgs,
+    ) -> Result<()> {
+        let (id, variant) = args.id.split_once(':').unwrap();
+        pull_variant(reg, args, id, variant, fetcher)
+    }
+
+    /// `basert pull <id>:<variant>` takes the variant as `basert list` names
+    /// it: an installed one is left as it is without asking the Hub, a
+    /// catalog one is its row's file (refused for another backend), a
+    /// `file-…` one is the file it was named for, a quant is a `--target`,
+    /// and anything else is an error naming the catalog's variants.
+    #[test]
+    fn a_pull_names_a_variant_as_basert_list_does() {
+        let here = CatalogRegistry::client_backend();
+        let there = if here == "cuda" { "metal" } else { "cuda" };
+        let tmp = tempfile::tempdir().unwrap();
+        let theirs = format!("cat-{there}-q4mix.base");
+        fixture_repo(
+            tmp.path(),
+            "basecompute/cat",
+            &[
+                ("cat-Q4.base", b"q4"),
+                ("cat-Q8.base", b"q8"),
+                ("cat-F16.base", b"f16"),
+                (&theirs, b"theirs"),
+                ("cat-Medium.base", b"medium"),
+                ("Extra-Q4.base", b"extra"),
+            ],
+        );
+        let row = |quant: &str, file: &str, backend: &str| {
+            format!(
+                r#"{{"id":"basecompute/cat","hf_repo":"basecompute/cat","quant":"{quant}","file":"{file}"{backend}}}"#
+            )
+        };
+        let reg = MergedRegistry::new(
+            tmp.path().join("cache"),
+            catalog(
+                &[
+                    row("default-q4", "cat-Q4.base", ""),
+                    row("default-q8", "cat-Q8.base", ""),
+                    row("default-f16", "cat-F16.base", ""),
+                    row(
+                        &format!("{there}-q4mix"),
+                        &theirs,
+                        &format!(r#","backend":"{there}""#),
+                    ),
+                    row(
+                        &format!("{there}-q6"),
+                        "cat-Q6.base",
+                        &format!(r#","backend":"{there}""#),
+                    ),
+                ]
+                .join(","),
+            ),
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let cat = reg.root.join("basecompute/cat");
+        let q8 = cat.join("default-q8/model.base");
+
+        // a catalog variant: its row's file, under its name
+        let args = with_variant("basecompute/cat:default-q8", false);
+        pull_with_variant(&reg, &fetcher, &args).unwrap();
+        assert_eq!(std::fs::read(&q8).unwrap(), b"q8");
+        assert!(
+            !cat.join("default-q4").exists(),
+            "not the catalog's default"
+        );
+
+        // installed: left as it is, the Hub unasked, unless --force
+        std::fs::write(&q8, b"cached").unwrap();
+        for dry in [false, true] {
+            let args = with_variant("basecompute/cat:default-q8", dry);
+            pull_with_variant(&reg, &Offline, &args).unwrap();
+        }
+        assert_eq!(std::fs::read(&q8).unwrap(), b"cached");
+        let mut force = with_variant("basecompute/cat:default-q8", false);
+        force.force = true;
+        pull_with_variant(&reg, &fetcher, &force).unwrap();
+        assert_eq!(std::fs::read(&q8).unwrap(), b"q8");
+
+        // another backend's variant is refused, and nothing is downloaded
+        let args = with_variant(&format!("basecompute/cat:{there}-q4mix"), false);
+        let err = pull_with_variant(&reg, &fetcher, &args).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("the {there} bundle")),
+            "{err}"
+        );
+        assert!(!cat.join(format!("{there}-q4mix")).exists());
+
+        // a `file-…` variant: the file it was named for
+        let medium = named_variant("cat-Medium.base");
+        let args = with_variant(&format!("basecompute/cat:{medium}"), false);
+        pull_with_variant(&reg, &fetcher, &args).unwrap();
+        assert_eq!(
+            std::fs::read(cat.join(&medium).join("model.base")).unwrap(),
+            b"medium"
+        );
+        let args = with_variant("basecompute/cat:file-cat-large-00000000", true);
+        let err = pull_with_variant(&reg, &fetcher, &args).unwrap_err();
+        assert!(err.to_string().contains("cat-Medium.base"), "{err}");
+        // the catalog's own file is its row's variant, never a `file-…` one
+        let args = with_variant(
+            &format!("basecompute/cat:{}", named_variant("cat-Q4.base")),
+            true,
+        );
+        let err = pull_with_variant(&reg, &fetcher, &args).unwrap_err();
+        assert!(
+            err.to_string().contains("pull basecompute/cat:default-q4"),
+            "{err}"
+        );
+
+        // a `file-…` variant whose name spells a width is still its file
+        let extra = named_variant("Extra-Q4.base");
+        assert_eq!(
+            variant_source(&reg, "basecompute/cat", &extra, "main", &fetcher).unwrap(),
+            VariantSource::File("Extra-Q4.base".into())
+        );
+
+        // a width named on its own is the catalog's row of it for this
+        // client, f16 included; one published only for another backend is
+        // refused
+        let row_of =
+            |v: &str| match variant_source(&reg, "basecompute/cat", v, "main", &Offline).unwrap() {
+                VariantSource::Catalog(ModelRef::Catalog { variant, file, .. }) => (variant, file),
+                other => panic!("{v}: {other:?}"),
+            };
+        for (v, row) in [
+            ("q4", "default-q4"),
+            ("q8", "default-q8"),
+            ("f16", "default-f16"),
+        ] {
+            let file = format!("cat-{}.base", v.to_ascii_uppercase());
+            assert_eq!(row_of(v), (row.to_string(), file));
+        }
+        let err = variant_source(&reg, "basecompute/cat", "q6", "main", &Offline)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&format!("the {here} backend")), "{err}");
+
+        // a quant is a --target, as --target spells it
+        for (v, t) in [
+            ("q8", TargetScheme::BaseQ8),
+            ("default-q6", TargetScheme::BaseQ6),
+            ("base_q2", TargetScheme::BaseQ2),
+            ("base-q3", TargetScheme::BaseQ3),
+            ("bf16", TargetScheme::Bf16),
+        ] {
+            assert_eq!(
+                variant_source(&reg, "org/model", v, "main", &Offline).unwrap(),
+                VariantSource::Quant(t)
+            );
+        }
+        // a size is the file of that size in the id's repo; one the release
+        // lacks names the sizes it has
+        assert_eq!(
+            variant_source(&reg, "basecompute/cat", "medium", "main", &fetcher).unwrap(),
+            VariantSource::File("cat-Medium.base".into())
+        );
+        assert_eq!(
+            variant_source(&reg, "basecompute/cat", "Medium", "main", &fetcher).unwrap(),
+            VariantSource::File("cat-Medium.base".into())
+        );
+        let err = variant_source(&reg, "basecompute/cat", "large", "main", &fetcher)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("has no large .base; it comes in: medium"),
+            "{err}"
+        );
+
+        // anything else names the variants this client can pull, a name
+        // that merely contains or ends in a width included
+        for v in [
+            "default-q8-custom",
+            "not-a-variant-f16",
+            "typo-q8",
+            "q8-custom",
+        ] {
+            let err = variant_source(&reg, "basecompute/cat", v, "main", &Offline)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("the catalog lists default-q4, default-q8, default-f16")
+                    && !err.contains(there),
+                "{v}: {err}"
+            );
+            let err = variant_source(&reg, "org/model", v, "main", &Offline).unwrap_err();
+            assert!(err.to_string().contains("has no variant"), "{v}: {err}");
+        }
+
+        // a flag that names the variant too is refused, as is an empty one
+        let mut file = with_variant("basecompute/cat:default-q8", true);
+        file.file = Some("cat-Q8.base".into());
+        let mut target = with_variant("basecompute/cat:default-q8", true);
+        target.target = Some(TargetScheme::BaseQ8);
+        let mut profile = with_variant("basecompute/cat:default-q8", true);
+        profile.profile = Some("default-q8.json".into());
+        for (args, flag) in [
+            (file, "--file"),
+            (target, "--target"),
+            (profile, "--profile"),
+        ] {
+            let err = pull_with_variant(&reg, &Offline, &args).unwrap_err();
+            assert!(err.to_string().contains(flag), "{err}");
+        }
+        let args = with_variant("basecompute/cat:", true);
+        let err = pull_with_variant(&reg, &Offline, &args).unwrap_err();
+        assert!(err.to_string().contains("empty variant"), "{err}");
+    }
+
+    /// The row a variant names is the one pulled, from its own repo, even
+    /// when another row of the id publishes a file of the same path: by its
+    /// name, by its width, and by a re-pull.
+    #[test]
+    fn a_variant_pulls_its_row_when_rows_share_a_file_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_repo(tmp.path(), "basecompute/cat-a", &[("model.base", b"a")]);
+        fixture_repo(tmp.path(), "basecompute/cat-b", &[("model.base", b"b")]);
+        let row = |repo: &str, quant: &str| {
+            format!(
+                r#"{{"id":"basecompute/cat","hf_repo":"basecompute/{repo}","quant":"{quant}","file":"model.base"}}"#
+            )
+        };
+        let reg = MergedRegistry::new(
+            tmp.path().join("cache"),
+            catalog(&[row("cat-a", "default-q4"), row("cat-b", "default-q8")].join(",")),
+        );
+        let fetcher = MockFetcher::new(tmp.path());
+        let installed = |variant: &str| {
+            std::fs::read(
+                reg.root
+                    .join("basecompute/cat")
+                    .join(variant)
+                    .join("model.base"),
+            )
+            .unwrap()
+        };
+
+        let args = with_variant("basecompute/cat:default-q8", false);
+        pull_with_variant(&reg, &fetcher, &args).unwrap();
+        assert_eq!(installed("default-q8"), b"b");
+        let args = with_variant("basecompute/cat:q4", false);
+        pull_with_variant(&reg, &fetcher, &args).unwrap();
+        assert_eq!(installed("default-q4"), b"a");
+        assert_eq!(
+            held(&reg, "basecompute/cat", "default-q8").as_deref(),
+            Some("model.base")
+        );
+
+        let mut force = with_variant("basecompute/cat:default-q8", false);
+        force.force = true;
+        std::fs::write(
+            reg.root.join("basecompute/cat/default-q8/model.base"),
+            b"stale",
+        )
+        .unwrap();
+        pull_with_variant(&reg, &fetcher, &force).unwrap();
+        assert_eq!(installed("default-q8"), b"b");
+        for dry in [false, true] {
+            let args = with_variant("basecompute/cat:q8", dry);
+            pull_with_variant(&reg, &Offline, &args).unwrap();
+        }
+    }
+
     /// Fetcher owning an hf-hub-style staging tree (blob + snapshot symlink),
     /// mirroring what `HfFetcher` leaves on disk mid-pull.
     struct StagedFetcher {
@@ -1059,7 +4248,8 @@ mod tests {
 
     impl StagedFetcher {
         fn repo_dir(&self, repo: &str) -> PathBuf {
-            self.staging.join(format!("models--{}", repo.replace('/', "--")))
+            self.staging
+                .join(format!("models--{}", repo.replace('/', "--")))
         }
 
         fn stage(&self, repo: &str, revision: &str, filename: &str, bytes: &[u8]) {
@@ -1076,7 +4266,11 @@ mod tests {
 
     impl Fetcher for StagedFetcher {
         fn get_file(&self, repo: &str, revision: &str, filename: &str) -> anyhow::Result<PathBuf> {
-            let p = self.repo_dir(repo).join("snapshots").join(revision).join(filename);
+            let p = self
+                .repo_dir(repo)
+                .join("snapshots")
+                .join(revision)
+                .join(filename);
             anyhow::ensure!(p.exists(), "not staged: {}", p.display());
             Ok(p)
         }
@@ -1108,13 +4302,24 @@ mod tests {
         let args = PullArgs {
             id: "basecompute/m".into(),
             profile: None,
-            target: TargetScheme::BaseQ4,
+            target: None,
             revision: "main".into(),
+            file: None,
             force: false,
             dry_run: false,
         };
-        pull_base_direct(&root, &args, "basecompute/m", "basecompute/m", "main", &fetcher, &base_files)
-            .unwrap();
+        pull_base_direct(
+            &root,
+            &args,
+            "basecompute/m",
+            "basecompute/m",
+            "main",
+            &fetcher,
+            &base_files,
+            None,
+            None,
+        )
+        .unwrap();
 
         let out = root.join("basecompute/m/default-q4/model.base");
         assert_eq!(std::fs::read(&out).unwrap(), b"q4-bytes");
@@ -1217,6 +4422,122 @@ mod tests {
         assert_eq!(snapshot, repo_dir);
     }
 
+    /// Serves small files from `snapshots/main/` but large ones as bare
+    /// `blobs/` paths with no snapshot pointer — the shape `HfFetcher`'s
+    /// resumable range path returns.
+    struct BlobFetcher {
+        root: PathBuf,
+    }
+
+    impl Fetcher for BlobFetcher {
+        fn get_file(&self, _repo: &str, _revision: &str, filename: &str) -> Result<PathBuf> {
+            if filename.ends_with(".safetensors") {
+                Ok(self.root.join("blobs").join(filename.replace('/', "_")))
+            } else {
+                Ok(self.root.join("snapshots").join("main").join(filename))
+            }
+        }
+
+        fn list_files(&self, _repo: &str, _revision: &str) -> Result<Vec<String>> {
+            Ok([
+                "config.json",
+                "tokenizer.json",
+                "model.safetensors",
+                "sub/model-2.safetensors",
+            ]
+            .map(String::from)
+            .to_vec())
+        }
+    }
+
+    #[test]
+    fn download_source_links_blob_only_files_into_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = tmp.path().join("snapshots").join("main");
+        let blobs = tmp.path().join("blobs");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(snap.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
+        std::fs::write(snap.join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(blobs.join("model.safetensors"), b"w1").unwrap();
+        std::fs::write(blobs.join("sub_model-2.safetensors"), b"w2").unwrap();
+        // A dangling pointer left by an earlier, cleaned-up pull.
+        std::os::unix::fs::symlink(tmp.path().join("gone"), snap.join("model.safetensors"))
+            .unwrap();
+        let fetcher = BlobFetcher {
+            root: tmp.path().to_path_buf(),
+        };
+
+        // Twice: a re-pull over an already-linked snapshot is a no-op.
+        for _ in 0..2 {
+            let snapshot = download_source("org/model", "main", &fetcher).unwrap();
+            assert_eq!(snapshot, snap);
+            assert_eq!(
+                std::fs::read(snap.join("model.safetensors")).unwrap(),
+                b"w1"
+            );
+            assert_eq!(
+                std::fs::read(snap.join("sub/model-2.safetensors")).unwrap(),
+                b"w2"
+            );
+        }
+    }
+
+    // A symlink target is resolved relative to the LINK's directory, so a
+    // relative `src` (which a relative BASERT_MODELS_DIR produces, since the
+    // env var is used verbatim) must be absolutised before it is stored —
+    // otherwise every shard pointer dangles and conversion dies on open.
+    // The source path here is deliberately relative to the crate's CWD; no
+    // chdir, so this stays safe under the parallel test runner.
+    #[test]
+    fn link_into_snapshot_absolutises_a_relative_source() {
+        let rel_dir = Path::new("target").join("link-into-snapshot-relative-src");
+        std::fs::create_dir_all(&rel_dir).unwrap();
+        let rel_src = rel_dir.join("blob.safetensors");
+        std::fs::write(&rel_src, b"w1").unwrap();
+        assert!(rel_src.is_relative());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join("snapshots").join("main");
+        std::fs::create_dir_all(&snapshot).unwrap();
+
+        link_into_snapshot(&snapshot, "model.safetensors", &rel_src).unwrap();
+
+        let pointer = snapshot.join("model.safetensors");
+        assert!(
+            std::fs::read_link(&pointer).unwrap().is_absolute(),
+            "symlink target must be absolute or it dangles from inside the snapshot"
+        );
+        // The real symptom: reading THROUGH the link from the snapshot.
+        assert_eq!(std::fs::read(&pointer).unwrap(), b"w1");
+
+        std::fs::remove_dir_all(&rel_dir).ok();
+    }
+
+    // The file list comes from the remote repo, so a traversing entry must be
+    // refused rather than placing a symlink outside the snapshot.
+    #[test]
+    fn link_into_snapshot_rejects_traversing_filenames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join("snapshots").join("main");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let src = tmp.path().join("blob.safetensors");
+        std::fs::write(&src, b"w").unwrap();
+
+        for bad in [
+            "../escaped.safetensors",
+            "/etc/escaped.safetensors",
+            "a/../../b.safetensors",
+        ] {
+            let err = link_into_snapshot(&snapshot, bad, &src).unwrap_err();
+            assert!(
+                err.to_string().contains("unsafe source path"),
+                "{bad}: {err}"
+            );
+        }
+        assert!(!tmp.path().join("escaped.safetensors").exists());
+    }
+
     #[test]
     fn download_source_rejects_unsupported_arch_before_weights() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1273,6 +4594,27 @@ mod tests {
     }
 
     #[test]
+    fn speculate_drafter_id_splits_ids_but_not_paths() {
+        assert_eq!(
+            speculate_drafter_id("dflash:basecompute/Qwen3-4B-DFlash"),
+            Some(("dflash", "basecompute/Qwen3-4B-DFlash"))
+        );
+        // An inline variant rides along: resolve_hub_model parses it.
+        assert_eq!(
+            speculate_drafter_id("eagle3:org/head:default-q4"),
+            Some(("eagle3", "org/head:default-q4"))
+        );
+        // Paths keep working: the artifact may be a local build.
+        assert_eq!(speculate_drafter_id("dflash:./drafters/x.base"), None);
+        assert_eq!(speculate_drafter_id("dspark:/abs/x.base"), None);
+        assert_eq!(speculate_drafter_id("dflash:x.base"), None);
+        // Strategies without an artifact, and unknown prefixes.
+        assert_eq!(speculate_drafter_id("prompt-lookup"), None);
+        assert_eq!(speculate_drafter_id("mtp-head"), None);
+        assert_eq!(speculate_drafter_id("nope:org/model"), None);
+    }
+
+    #[test]
     fn resolve_model_args_passes_through_non_ids() {
         // Flags and plain paths are untouched (and never hit the registry).
         let args = vec![
@@ -1288,7 +4630,7 @@ mod tests {
     fn resolve_hub_model_rejects_empty_variant() {
         // A trailing `:` (empty variant) is a typo — error before any pull,
         // rather than silently resolving to the q4 default.
-        let err = resolve_hub_model("basecompute/Gemma-4-E2B-it:", None)
+        let err = resolve_hub_model("basecompute/Gemma-4-E2B-it:", None, None, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("empty variant"), "{err}");
@@ -1329,8 +4671,9 @@ mod tests {
         let mk = |t| PullArgs {
             id: "x/y".into(),
             profile: None,
-            target: t,
+            target: Some(t),
             revision: "main".into(),
+            file: None,
             force: false,
             dry_run: false,
         };
@@ -1349,5 +4692,483 @@ mod tests {
         let (variant, path, guard) = choose_profile(&mk(TargetScheme::Bf16)).unwrap();
         assert_eq!(variant, "bf16");
         assert!(path.is_none() && guard.is_none());
+    }
+
+    #[test]
+    fn mtp_speculation_is_asked_by_mtp_head_or_auto() {
+        let asked = |v: &[&str]| {
+            mtp_speculation_asked(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            asked(&["m.base", "--speculate", "mtp-head"]).as_deref(),
+            Some("mtp-head")
+        );
+        assert_eq!(
+            asked(&["--speculate=auto", "m.base"]).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(asked(&["m.base", "--speculate", "dflash:org/d"]), None);
+        assert_eq!(asked(&["m.base", "--speculate", "off"]), None);
+        assert_eq!(asked(&["m.base", "--speculate", "prompt-lookup"]), None);
+        assert_eq!(asked(&["m.base", "--speculate"]), None);
+        assert_eq!(asked(&["m.base"]), None);
+    }
+
+    /// A catalog file without the head its row now promises is pulled again
+    /// for speculation; one with a head, one the catalog promises no head
+    /// for, the catalog's own file, or an install from elsewhere are not.
+    #[test]
+    fn a_catalog_file_without_the_head_its_row_promises_is_stale() {
+        use base_format::{SpeculatorBundle, FORMAT_VERSION, MAGIC};
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let id = "basecompute/gemma-4-E4B-it";
+        let (old, new) = ("b".repeat(64), "a".repeat(64));
+        // A header-only bundle (read_header never reaches the blob) and the
+        // sidecar a pull records beside it.
+        // `head`: None for no head, Some(version) for one (None = unversioned).
+        let install = |variant: &str, head: Option<Option<&str>>, source_kind: &str| -> PathBuf {
+            let vdir = cache::variant_dir(&root, id, variant).unwrap();
+            std::fs::create_dir_all(&vdir).unwrap();
+            let path = cache::base_artifact_path(&vdir);
+            let mut h =
+                crate::embed::fixtures::header("gemma4", serde_json::json!({"hidden_size": 8}));
+            if let Some(version) = head {
+                let mut config: std::collections::BTreeMap<String, serde_json::Value> =
+                    [("kind".to_string(), serde_json::json!("gemma4-mtp"))]
+                        .into_iter()
+                        .collect();
+                if let Some(v) = version {
+                    config.insert("head_version".to_string(), serde_json::json!(v));
+                }
+                h.speculator = Some(SpeculatorBundle {
+                    arch: "gemma4-mtp".into(),
+                    config,
+                    tensors: vec![],
+                });
+            }
+            let json = h.to_canonical_json().unwrap();
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&MAGIC).unwrap();
+            f.write_all(&FORMAT_VERSION.to_le_bytes()).unwrap();
+            f.write_all(&(json.len() as u64).to_le_bytes()).unwrap();
+            f.write_all(&json).unwrap();
+            cache::write_sidecar(
+                &vdir,
+                &HubSidecar {
+                    id: id.into(),
+                    source_kind: source_kind.into(),
+                    hf_repo: id.into(),
+                    source_repo: None,
+                    revision: "main".into(),
+                    variant: variant.into(),
+                    profile: None,
+                    pulled_at: "0".into(),
+                    base_sha256: Some(old.clone()),
+                    file: Some(format!("{variant}.base")),
+                },
+            )
+            .unwrap();
+            path
+        };
+        let reg = |variant: &str, speculator: &str, sha: &str| {
+            MergedRegistry::new(
+                root.clone(),
+                catalog(&format!(
+                    r#"{{"id":"{id}","hf_repo":"{id}","file":"{variant}.base","quant":"{variant}","sha256":"{sha}"{speculator}}}"#
+                )),
+            )
+        };
+        let promised = r#","speculator":"gemma4-mtp""#;
+
+        let headless = install("default-q8", None, "catalog");
+        assert_eq!(
+            stale_head_variant(&reg("default-q8", promised, &new), id, &headless).as_deref(),
+            Some("default-q8")
+        );
+        assert_eq!(
+            stale_head_variant(
+                &reg("default-q8", r#","speculator":"mtp""#, &new),
+                id,
+                &headless
+            )
+            .as_deref(),
+            Some("default-q8")
+        );
+        assert_eq!(
+            stale_head_variant(&reg("default-q8", "", &new), id, &headless),
+            None,
+            "the catalog promises no head"
+        );
+        assert_eq!(
+            stale_head_variant(&reg("default-q8", promised, &old), id, &headless),
+            None,
+            "the catalog's file is this one"
+        );
+        assert_eq!(
+            stale_head_variant(&reg("default-q4", promised, &new), id, &headless),
+            None,
+            "another variant's row"
+        );
+
+        let with_head = install("default-q4", Some(None), "catalog");
+        assert_eq!(
+            stale_head_variant(&reg("default-q4", promised, &new), id, &with_head),
+            None,
+            "it has its head"
+        );
+
+        // A versioned head: stale only when the catalog names another version.
+        let v1 = install("cuda-q8", Some(Some("1")), "catalog");
+        let versioned =
+            |v: &str| format!(r#","speculator":"gemma4-mtp","speculator_version":"{v}""#);
+        assert_eq!(
+            stale_head_variant(&reg("cuda-q8", &versioned("1"), &new), id, &v1),
+            None,
+            "the catalog's head is this version"
+        );
+        assert_eq!(
+            stale_head_variant(&reg("cuda-q8", &versioned("2"), &new), id, &v1).as_deref(),
+            Some("cuda-q8"),
+            "the catalog's head is a newer version"
+        );
+        assert_eq!(
+            stale_head_variant(&reg("cuda-q8", promised, &new), id, &v1),
+            None,
+            "the catalog names no version to hold it to"
+        );
+        assert_eq!(
+            stale_head_variant(&reg("default-q4", &versioned("1"), &new), id, &with_head)
+                .as_deref(),
+            Some("default-q4"),
+            "an unversioned head against a versioned row"
+        );
+
+        let converted = install("default-f16", None, "huggingface");
+        assert_eq!(
+            stale_head_variant(&reg("default-f16", promised, &new), id, &converted),
+            None,
+            "not the catalog's install"
+        );
+
+        // Without a speculation request the file is served as it is.
+        let r = reg("default-q8", promised, &new);
+        assert_eq!(
+            serve_ready(&r, id, headless.clone(), None).unwrap(),
+            headless
+        );
+    }
+
+    #[test]
+    fn speculate_auto_is_found_in_both_forms() {
+        let asked =
+            |v: &[&str]| speculate_auto_asked(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(asked(&["m.base", "--speculate", "auto"]));
+        assert!(asked(&["--speculate=auto", "m.base"]));
+        assert!(!asked(&["m.base", "--speculate", "mtp-head"]));
+        assert!(!asked(&["m.base", "--speculate=dflash:org/d"]));
+        assert!(!asked(&["m.base", "--speculate"]));
+        assert!(!asked(&["m.base", "--max-context", "auto"]));
+    }
+
+    /// `--speculate auto` becomes the drafter the catalog marks for the
+    /// model (`speculator_auto`), whether the model is the catalog's install
+    /// or a file of the catalog's name served by path; a Gemma 4 bundle with
+    /// its own head, a target with nothing marked and a conversion of the
+    /// user's own keep superfluid's choice.
+    #[test]
+    fn auto_takes_the_drafter_the_catalog_marks_for_the_model() {
+        use base_format::{SpeculatorBundle, FORMAT_VERSION, MAGIC};
+        use std::io::Write;
+        let metal = base_hub::registry::CatalogRegistry::client_backend() == "metal";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let reg = MergedRegistry::new(
+            root.clone(),
+            base_hub::registry::CatalogRegistry::bundled().unwrap(),
+        );
+        // A header-only bundle, with Google's Gemma 4 head or none.
+        let bundle = |path: &Path, gemma_head: bool| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut h =
+                crate::embed::fixtures::header("qwen35", serde_json::json!({"hidden_size": 8}));
+            if gemma_head {
+                h.speculator = Some(SpeculatorBundle {
+                    arch: "gemma4-mtp".into(),
+                    config: [("kind".to_string(), serde_json::json!("gemma4-mtp"))]
+                        .into_iter()
+                        .collect(),
+                    tensors: vec![],
+                });
+            }
+            let json = h.to_canonical_json().unwrap();
+            let mut f = std::fs::File::create(path).unwrap();
+            f.write_all(&MAGIC).unwrap();
+            f.write_all(&FORMAT_VERSION.to_le_bytes()).unwrap();
+            f.write_all(&(json.len() as u64).to_le_bytes()).unwrap();
+            f.write_all(&json).unwrap();
+        };
+        let directive = |path: &Path| speculate_auto_directive(&reg, path).map(|(d, _)| d);
+        let want = |drafter: &str| metal.then(|| format!("dflash:{drafter}:default-q4"));
+
+        // Served by path, outside the cache: matched by the catalog's file name.
+        let by_path = |name: &str, gemma_head: bool| {
+            let path = tmp.path().join("models").join(name);
+            bundle(&path, gemma_head);
+            path
+        };
+        assert_eq!(
+            directive(&by_path("Qwen3.8-27B-Q4.base", false)),
+            want("basecompute/Qwen3.8-27B-DFlash2")
+        );
+        assert_eq!(
+            directive(&by_path("Qwen3.6-35B-A3B-Q8.base", false)),
+            want("basecompute/Qwen3.6-35B-A3B-DFlash2")
+        );
+        assert_eq!(
+            directive(&by_path("Qwen3.6-27B-Q4.base", false)),
+            None,
+            "nothing marked for this target"
+        );
+        assert_eq!(
+            directive(&by_path("gemma-4-26B-A4B-it-Q4.base", true)),
+            None,
+            "Gemma 4 keeps its own head"
+        );
+        assert_eq!(directive(&by_path("my-own.base", false)), None);
+        assert_eq!(
+            directive(&by_path("Qwen3.8-27B-DFlash2-Q4.base", false)),
+            None,
+            "a drafter's file names no target"
+        );
+
+        // Installed by a pull: the sidecar names the catalog id.
+        let installed = |id: &str, variant: &str, source_kind: &str| {
+            let vdir = cache::variant_dir(&root, id, variant).unwrap();
+            let path = cache::base_artifact_path(&vdir);
+            bundle(&path, false);
+            cache::write_sidecar(
+                &vdir,
+                &HubSidecar {
+                    id: id.into(),
+                    source_kind: source_kind.into(),
+                    hf_repo: id.into(),
+                    source_repo: None,
+                    revision: "main".into(),
+                    variant: variant.into(),
+                    profile: None,
+                    pulled_at: "0".into(),
+                    base_sha256: None,
+                    file: None,
+                },
+            )
+            .unwrap();
+            path
+        };
+        assert_eq!(
+            directive(&installed(
+                "basecompute/Qwen3.8-27B",
+                "default-q8",
+                "catalog"
+            )),
+            want("basecompute/Qwen3.8-27B-DFlash2")
+        );
+        assert_eq!(
+            directive(&installed(
+                "basecompute/Qwen3.8-27B",
+                "default-f16",
+                "huggingface"
+            )),
+            None,
+            "a conversion of the user's own"
+        );
+
+        // The directive is one `--speculate dflash:<id>` resolves.
+        if let Some(d) = want("basecompute/Qwen3.8-27B-DFlash2") {
+            assert_eq!(
+                speculate_drafter_id(&d),
+                Some(("dflash", "basecompute/Qwen3.8-27B-DFlash2:default-q4"))
+            );
+        }
+
+        // Under `auto` such a target is not pulled again for an MTP head it
+        // will not use (a pull here would reach for the network and fail).
+        if metal {
+            let id = "basecompute/Qwen3.8-27B";
+            let headless = installed(id, "default-q4", "catalog");
+            assert!(stale_head_variant(&reg, id, &headless).is_some());
+            assert_eq!(
+                serve_ready(&reg, id, headless.clone(), Some("auto")).unwrap(),
+                headless
+            );
+        }
+    }
+
+    /// `--speculate auto` reaches superfluid as `auto` when the launcher has
+    /// prepared the drafter the catalog marks for the model: superfluid's
+    /// `auto` takes that drafter first and keeps its fallbacks, so a copy it
+    /// cannot use (here a cached file of another shape) gives way to the
+    /// model's head, where `dflash:<path>` would fail the start. The marked
+    /// drafter is fetched once, also for a start that names no strategy (the
+    /// default `auto`), and only while no copy of it is installed (any variant,
+    /// in the hub cache or beside the model); nothing is fetched for several models, a
+    /// `--model-dir`, the user's `--offline` or another strategy named by
+    /// hand (`off` included), and a failed fetch leaves the args as they came
+    /// too.
+    #[test]
+    fn auto_prepares_the_marked_drafter_and_stays_auto() {
+        use base_format::{FORMAT_VERSION, MAGIC};
+        use std::io::Write;
+        let metal = base_hub::registry::CatalogRegistry::client_backend() == "metal";
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = MergedRegistry::new(
+            tmp.path().join("cache"),
+            base_hub::registry::CatalogRegistry::bundled().unwrap(),
+        );
+        let bundle = |path: &Path, arch: &str, hidden: u64| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let h =
+                crate::embed::fixtures::header(arch, serde_json::json!({"hidden_size": hidden}));
+            let json = h.to_canonical_json().unwrap();
+            let mut f = std::fs::File::create(path).unwrap();
+            f.write_all(&MAGIC).unwrap();
+            f.write_all(&FORMAT_VERSION.to_le_bytes()).unwrap();
+            f.write_all(&(json.len() as u64).to_le_bytes()).unwrap();
+            f.write_all(&json).unwrap();
+        };
+        // The target, served by path under the catalog's file name.
+        let model = tmp.path().join("models").join("Qwen3.8-27B-Q4.base");
+        bundle(&model, "qwen35", 5120);
+        let model = model.to_string_lossy().into_owned();
+        // Where a pull would install the drafter (no copy anywhere yet).
+        let stale = tmp
+            .path()
+            .join("cache/basecompute/Qwen3.8-27B-DFlash2/default-q4/model.base");
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let run = |rest: Vec<String>, ok: bool| {
+            let fetched = std::cell::RefCell::new(Vec::<String>::new());
+            let out = prepare_speculate_auto_with(rest.clone(), &reg, |token, replace| {
+                // `again`: the pull is to replace the installed file.
+                fetched.borrow_mut().push(if replace {
+                    format!("{token} again")
+                } else {
+                    token.to_string()
+                });
+                if ok {
+                    Ok(stale.clone())
+                } else {
+                    Err(anyhow::anyhow!("the Hub is unreachable"))
+                }
+            });
+            assert_eq!(out, rest, "the args reach superfluid as they came");
+            fetched.into_inner()
+        };
+        let marked: Vec<String> = if metal {
+            vec!["basecompute/Qwen3.8-27B-DFlash2:default-q4".into()]
+        } else {
+            vec![]
+        };
+        assert_eq!(run(args(&[&model, "--speculate", "auto"]), true), marked);
+        assert_eq!(run(args(&["--speculate=auto", &model]), true), marked);
+        assert_eq!(run(args(&[&model, "--speculate", "auto"]), false), marked);
+        // No `--speculate` is `auto` (with_default_speculation): the same pull.
+        let default = |v: &[&str]| crate::serve::with_default_speculation(args(v));
+        assert_eq!(run(default(&[&model]), true), marked);
+        let none = Vec::<String>::new();
+        assert_eq!(run(default(&[&model, "--speculate", "off"]), true), none);
+        assert_eq!(run(default(&[&model, "--offline"]), true), none);
+        assert_eq!(
+            run(args(&[&model, "--speculate", "auto", "--offline"]), true),
+            none
+        );
+        assert_eq!(run(args(&[&model, "--speculate", "mtp-head"]), true), none);
+        assert_eq!(
+            run(
+                args(&[&model, "--model", &model, "--speculate", "auto"]),
+                true
+            ),
+            none
+        );
+        let dir = tmp.path().join("models").to_string_lossy().into_owned();
+        assert_eq!(
+            run(
+                args(&[&model, "--model-dir", &dir, "--speculate", "auto"]),
+                true
+            ),
+            none
+        );
+
+        // A copy of the drafter already where superfluid's `auto` looks, of
+        // any variant, that is the catalog's file for its variant (its size,
+        // and its sha256 where a pull recorded one; missing_auto_drafter with
+        // digest_refusal): nothing is fetched, by default or by hand. A sparse
+        // file of the catalog's size stands in for the real bytes.
+        let sized = |path: &Path, size: u64| {
+            bundle(path, "qwen35", 5120);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        };
+        const F16_SIZE: u64 = 3_849_185_280; // the catalog's default-f16 file
+                                             // In the hub cache as `default-f16`, not the catalog's `default-q4`:
+        let f16 = tmp
+            .path()
+            .join("cache/basecompute/Qwen3.8-27B-DFlash2/default-f16/model.base");
+        sized(&f16, F16_SIZE);
+        assert_eq!(run(default(&[&model]), true), none);
+        assert_eq!(run(args(&[&model, "--speculate", "auto"]), true), none);
+        // Not the catalog's file (another size: an older release, a partial
+        // download): superfluid refuses it, so it is no copy, and the
+        // catalog's variant is fetched.
+        sized(&f16, 4096);
+        assert_eq!(run(default(&[&model]), true), marked);
+        // The catalog's size, but a pull recorded another sha256 for it.
+        sized(&f16, F16_SIZE);
+        let mut sidecar = HubSidecar {
+            id: "basecompute/Qwen3.8-27B-DFlash2".into(),
+            source_kind: "catalog".into(),
+            hf_repo: "basecompute/Qwen3.8-27B-DFlash2".into(),
+            source_repo: None,
+            revision: "main".into(),
+            variant: "default-f16".into(),
+            profile: None,
+            pulled_at: "0".into(),
+            base_sha256: Some("0".repeat(64)),
+            file: None,
+        };
+        cache::write_sidecar(f16.parent().unwrap(), &sidecar).unwrap();
+        assert_eq!(run(default(&[&model]), true), marked);
+        // ...and the catalog's sha256: a copy.
+        sidecar.base_sha256 = reg
+            .catalog
+            .rows("basecompute/Qwen3.8-27B-DFlash2")
+            .find(|r| r.quant == "default-f16")
+            .and_then(|r| r.sha256.clone());
+        assert!(sidecar.base_sha256.is_some(), "the catalog pins the file");
+        cache::write_sidecar(f16.parent().unwrap(), &sidecar).unwrap();
+        assert_eq!(run(default(&[&model]), true), none);
+        std::fs::remove_dir_all(f16.parent().unwrap()).unwrap();
+        // Beside the model, under one of the catalog's file names for it: the
+        // same rule.
+        let beside = tmp
+            .path()
+            .join("models/drafters/Qwen3.8-27B-DFlash2-F16.base");
+        sized(&beside, F16_SIZE);
+        assert_eq!(run(default(&[&model]), true), none);
+        sized(&beside, 4096);
+        assert_eq!(run(default(&[&model]), true), marked);
+        std::fs::remove_file(&beside).unwrap();
+        // The catalog's own variant (`default-q4`) holding another file:
+        // pulled again, so the catalog's file takes its place (a resolve
+        // would hand back the installed one).
+        bundle(&stale, "llama", 8);
+        let again: Vec<String> = marked.iter().map(|t| format!("{t} again")).collect();
+        assert_eq!(run(default(&[&model]), true), again);
+        assert_eq!(run(args(&[&model, "--speculate", "auto"]), true), again);
     }
 }

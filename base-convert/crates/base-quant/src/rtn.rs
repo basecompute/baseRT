@@ -64,7 +64,8 @@ pub fn pack(weights: &[f32], cfg: RtnConfig) -> Packed {
     let group_size = cfg.group_size as usize;
     let n_groups = weights.len() / group_size;
     let mut q_lanes: Vec<u32> = vec![0; weights.len()];
-    let mut scales_bytes = Vec::with_capacity(n_groups * cfg.scale_dtype.bytes_per_group() as usize);
+    let mut scales_bytes =
+        Vec::with_capacity(n_groups * cfg.scale_dtype.bytes_per_group() as usize);
     let mut biases_bytes = Vec::with_capacity(if cfg.symmetric {
         0
     } else {
@@ -118,7 +119,9 @@ pub fn pack(weights: &[f32], cfg: RtnConfig) -> Packed {
         let inv_scale = 1.0 / scale_rt;
         for (i, &val) in group.iter().enumerate() {
             let q = if cfg.symmetric {
-                (val * inv_scale).round().clamp(q_min_sym as f32, q_max_sym as f32) as i32
+                (val * inv_scale)
+                    .round()
+                    .clamp(q_min_sym as f32, q_max_sym as f32) as i32
             } else {
                 ((val - bias_rt) * inv_scale)
                     .round()
@@ -140,6 +143,111 @@ pub fn pack(weights: &[f32], cfg: RtnConfig) -> Packed {
 
     Packed {
         packed_weights,
+        scales: scales_bytes,
+        biases: biases_bytes,
+        group_size: cfg.group_size,
+        scale_dtype: Some(cfg.scale_dtype),
+    }
+}
+
+/// Importance-weighted RTN ("imatrix-lite"): per-group affine fit that
+/// minimizes Σ w·(x − (q·s + b))² instead of plain min/max range fitting,
+/// where `w` is a per-INPUT-CHANNEL importance (activation second moment
+/// from the calibration sidecar). Groups run along the input dim, so group
+/// g covers channels [(g·gs) mod in_features, +gs). The packed layout,
+/// scale dtype round-trip and value space are identical to `pack` — the
+/// runtime cannot tell the difference; only WHERE the quantization error
+/// lands changes (away from salient channels). Asymmetric only.
+///
+/// This is the runtime-free counterpart of AWQ: same intuition (spend the
+/// grid on channels the network actually feels), no folded activation
+/// scale to apply at inference.
+pub fn pack_weighted(
+    weights: &[f32],
+    cfg: RtnConfig,
+    channel_w: &[f32],
+    in_features: usize,
+) -> Packed {
+    assert!(!cfg.symmetric, "pack_weighted supports asymmetric only");
+    assert!(cfg.group_size > 0 && weights.len() % cfg.group_size as usize == 0);
+    assert!(
+        in_features > 0 && in_features % cfg.group_size as usize == 0,
+        "in_features {in_features} must be a multiple of group_size {}",
+        cfg.group_size
+    );
+    assert_eq!(
+        channel_w.len(),
+        in_features,
+        "one importance per input channel"
+    );
+
+    let group_size = cfg.group_size as usize;
+    let n_groups = weights.len() / group_size;
+    let mut q_lanes: Vec<u32> = vec![0; weights.len()];
+    let mut scales_bytes =
+        Vec::with_capacity(n_groups * cfg.scale_dtype.bytes_per_group() as usize);
+    let mut biases_bytes =
+        Vec::with_capacity(n_groups * cfg.scale_dtype.bytes_per_group() as usize);
+    let q_max: f32 = ((1u32 << cfg.bits) - 1) as f32;
+
+    for g in 0..n_groups {
+        let group = &weights[g * group_size..(g + 1) * group_size];
+        let ch0 = (g * group_size) % in_features;
+        let w = &channel_w[ch0..ch0 + group_size];
+
+        // Seed from plain min/max, then a few weighted-Lloyd rounds:
+        // assign under (s, b), refit (s, b) by weighted least squares.
+        let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &x in group {
+            mn = mn.min(x);
+            mx = mx.max(x);
+        }
+        let mut s = (mx - mn) / q_max;
+        if s == 0.0 {
+            s = 1.0;
+        }
+        let mut b = mn;
+        let wsum: f64 = w.iter().map(|&v| v.max(1e-8) as f64).sum();
+        for _ in 0..8 {
+            // Weighted moments of (q, x) under the current assignment.
+            let (mut sq, mut sx, mut sqq, mut sqx) = (0f64, 0f64, 0f64, 0f64);
+            for (i, &x) in group.iter().enumerate() {
+                let wi = w[i].max(1e-8) as f64;
+                let q = (((x - b) / s).round()).clamp(0.0, q_max) as f64;
+                sq += wi * q;
+                sx += wi * x as f64;
+                sqq += wi * q * q;
+                sqx += wi * q * x as f64;
+            }
+            let qm = sq / wsum;
+            let xm = sx / wsum;
+            let var = sqq / wsum - qm * qm;
+            if var > 1e-12 {
+                let cov = sqx / wsum - qm * xm;
+                let s_new = (cov / var) as f32;
+                if s_new.abs() > 1e-12 {
+                    s = s_new;
+                    b = (xm - qm * (s as f64)) as f32;
+                }
+            }
+        }
+
+        // Final encode: round (s, b) through the scale dtype FIRST, then
+        // assign q under the rounded pair (matches `pack`'s contract that
+        // pack-side rounding equals dequant exactly).
+        let (scale_rt, scale_enc) = round_trip_scale(s, cfg.scale_dtype);
+        scales_bytes.extend_from_slice(&scale_enc);
+        let (bias_rt, bias_enc) = round_trip_scale(b, cfg.scale_dtype);
+        biases_bytes.extend_from_slice(&bias_enc);
+        let inv = 1.0 / scale_rt;
+        for (i, &x) in group.iter().enumerate() {
+            let q = (((x - bias_rt) * inv).round()).clamp(0.0, q_max) as u32;
+            q_lanes[g * group_size + i] = q;
+        }
+    }
+
+    Packed {
+        packed_weights: pack_lanes(&q_lanes, cfg.bits),
         scales: scales_bytes,
         biases: biases_bytes,
         group_size: cfg.group_size,
@@ -179,15 +287,111 @@ pub fn unpack(packed: &Packed, total_values: usize, cfg: RtnConfig) -> Vec<f32> 
         for i in 0..group_size {
             let flat = g * group_size + i;
             let q = q_lanes[flat] as i32;
-            let q_real = if cfg.symmetric {
-                q - q_offset_sym
-            } else {
-                q
-            };
+            let q_real = if cfg.symmetric { q - q_offset_sym } else { q };
             out[flat] = q_real as f32 * scale + bias;
         }
     }
     out
+}
+
+/// Pack pre-computed quantization codes with their per-group scales and
+/// biases into the SAME on-disk layout `pack` produces.
+///
+/// This is how an externally searched grid (GPTQ, or any other method that
+/// picks codes off-line) enters a bundle: the search runs elsewhere, the
+/// codes land here, and the runtime cannot tell the tensor from an RTN one.
+///
+/// * `codes` is the flat row-major code stream, one value per weight, in
+///   the STORED value space: `[0, 2^bits)`; for `cfg.symmetric` the signed
+///   code is already offset by `2^(bits-1)`, exactly as `pack` stores it.
+///   `pack` treats the whole tensor as one lane stream (groups are
+///   consecutive runs of `cfg.group_size` codes, rows are not padded), so
+///   does this function.
+/// * `scales` / `biases` carry one f32 per group of `cfg.group_size`
+///   consecutive codes. They are encoded in `cfg.scale_dtype` with the same
+///   conversion `pack` uses (`round_trip_scale`); a caller that wants a
+///   bit-exact dequant must have computed its codes against the
+///   round-tripped values (e.g. `bf16(scale)`), as `pack` does.
+/// * `biases` is ignored when `cfg.symmetric`.
+///
+/// Byte-identity with `pack` is asserted by the `pack_codes_matches_pack`
+/// unit test: feeding `pack`'s own codes/scales/biases back through here
+/// reproduces `pack`'s output bit for bit.
+pub fn pack_codes(codes: &[u8], scales: &[f32], biases: &[f32], cfg: RtnConfig) -> Packed {
+    assert!(
+        matches!(cfg.bits, 2 | 3 | 4 | 5 | 6 | 8),
+        "unsupported bit width {} (expected 2/3/4/5/6/8)",
+        cfg.bits
+    );
+    assert!(
+        cfg.group_size > 0 && codes.len() % cfg.group_size as usize == 0,
+        "codes.len()={} must be a multiple of group_size={}",
+        codes.len(),
+        cfg.group_size
+    );
+    if cfg.scale_dtype == ScaleDtype::E4m3 && cfg.bits != 8 {
+        panic!("scale_dtype=e4m3 is only valid for bits=8 (per canonical spec)");
+    }
+    let n_groups = codes.len() / cfg.group_size as usize;
+    assert_eq!(
+        scales.len(),
+        n_groups,
+        "one scale per group of {}",
+        cfg.group_size
+    );
+    if !cfg.symmetric {
+        assert_eq!(
+            biases.len(),
+            n_groups,
+            "one bias per group of {}",
+            cfg.group_size
+        );
+    }
+    let q_max = (1u32 << cfg.bits) - 1;
+    let lanes: Vec<u32> = codes
+        .iter()
+        .map(|&c| {
+            let c = c as u32;
+            assert!(c <= q_max, "code {c} out of range for bits={}", cfg.bits);
+            c
+        })
+        .collect();
+
+    let mut scales_bytes =
+        Vec::with_capacity(n_groups * cfg.scale_dtype.bytes_per_group() as usize);
+    let mut biases_bytes = Vec::with_capacity(if cfg.symmetric {
+        0
+    } else {
+        n_groups * cfg.scale_dtype.bytes_per_group() as usize
+    });
+    for g in 0..n_groups {
+        let (_, enc) = round_trip_scale(scales[g], cfg.scale_dtype);
+        scales_bytes.extend_from_slice(&enc);
+        if !cfg.symmetric {
+            let (_, enc) = round_trip_scale(biases[g], cfg.scale_dtype);
+            biases_bytes.extend_from_slice(&enc);
+        }
+    }
+
+    Packed {
+        packed_weights: pack_lanes(&lanes, cfg.bits),
+        scales: scales_bytes,
+        biases: biases_bytes,
+        group_size: cfg.group_size,
+        scale_dtype: Some(cfg.scale_dtype),
+    }
+}
+
+/// Decode a `pack`-produced per-group scale (or bias) byte stream back
+/// to f32 — the inverse of the encoding `pack` / `pack_codes` apply.
+pub fn decode_scales(bytes: &[u8], dt: ScaleDtype) -> Vec<f32> {
+    let w = dt.bytes_per_group() as usize;
+    assert_eq!(
+        bytes.len() % w,
+        0,
+        "scale stream is not whole {w}-byte values"
+    );
+    bytes.chunks_exact(w).map(|c| decode_scale(c, dt)).collect()
 }
 
 // ---------- Bit-level pack / unpack ----------
@@ -285,8 +489,7 @@ fn unpack_q3(bytes: &[u8], total: usize) -> Vec<u32> {
     assert!(total % 8 == 0);
     let mut out = Vec::with_capacity(total);
     for chunk in bytes.chunks_exact(3) {
-        let acc =
-            (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
+        let acc = (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
         for i in 0..8 {
             out.push((acc >> (i * 3)) & 0x7);
         }
@@ -353,8 +556,7 @@ fn unpack_q6(bytes: &[u8], total: usize) -> Vec<u32> {
     assert!(total % 4 == 0);
     let mut out = Vec::with_capacity(total);
     for chunk in bytes.chunks_exact(3) {
-        let acc =
-            (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
+        let acc = (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
         for i in 0..4 {
             out.push((acc >> (i * 6)) & 0x3F);
         }
@@ -447,7 +649,7 @@ fn encode_e4m3_approx(x: f32) -> u8 {
     let mag = x.abs();
     let log2 = mag.log2().round() as i32;
     let exp = (log2 + 7).clamp(0, 15) as u8; // 4-bit exponent, bias 7
-    // Mantissa: 3 bits of fraction beyond the implicit leading 1.
+                                             // Mantissa: 3 bits of fraction beyond the implicit leading 1.
     let frac = mag / 2f32.powi(log2) - 1.0;
     let mantissa = (frac * 8.0).round().clamp(0.0, 7.0) as u8;
     sign | (exp << 3) | (mantissa & 0x7)
@@ -483,10 +685,7 @@ mod tests {
         let r = unpack(&p, weights.len(), cfg);
         let levels = (1 << cfg.bits) as f32;
         let mn = weights.iter().cloned().fold(f32::INFINITY, f32::min);
-        let mx = weights
-            .iter()
-            .cloned()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let mx = weights.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let range = (mx - mn).max(1e-6);
         let step = range / levels;
         let tol = step * 0.6;
@@ -559,7 +758,9 @@ mod tests {
         let mut xs = Vec::with_capacity(1024);
         let mut s = 0xCAFEBABEu64;
         for _ in 0..1024 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let t = ((s >> 33) & 0x7FFFFFFF) as f32 / 0x7FFFFFFF as f32;
             xs.push(-1.5 + 3.0 * t);
         }
@@ -571,10 +772,27 @@ mod tests {
         };
         let new = pack(&xs, cfg);
         let old = crate::base_q4::pack(&xs);
-        assert_eq!(new.packed_weights.len(), old.packed_weights.len(), "weight byte count mismatch");
-        assert_eq!(new.scales.len(), old.scales.len(), "scale byte count mismatch");
-        assert_eq!(new.biases.len(), old.biases.len(), "bias byte count mismatch");
-        for (i, (a, b)) in new.packed_weights.iter().zip(old.packed_weights.iter()).enumerate() {
+        assert_eq!(
+            new.packed_weights.len(),
+            old.packed_weights.len(),
+            "weight byte count mismatch"
+        );
+        assert_eq!(
+            new.scales.len(),
+            old.scales.len(),
+            "scale byte count mismatch"
+        );
+        assert_eq!(
+            new.biases.len(),
+            old.biases.len(),
+            "bias byte count mismatch"
+        );
+        for (i, (a, b)) in new
+            .packed_weights
+            .iter()
+            .zip(old.packed_weights.iter())
+            .enumerate()
+        {
             if a != b {
                 panic!("weight bytes diverge at index {i}: new=0x{a:02x} old=0x{b:02x}");
             }
@@ -613,7 +831,11 @@ mod tests {
         let p = pack(&xs, cfg);
         assert!(p.biases.is_empty(), "symmetric must have no biases");
         let r = unpack(&p, xs.len(), cfg);
-        let max_err = xs.iter().zip(r.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let max_err = xs
+            .iter()
+            .zip(r.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
         assert!(max_err < 4.5, "symmetric q4 range max err {max_err}");
     }
 
@@ -764,5 +986,57 @@ mod tests {
             scale_dtype: ScaleDtype::E4m3,
         };
         let _ = pack(&zeros(64), cfg);
+    }
+
+    #[test]
+    fn pack_codes_matches_pack() {
+        // Feeding `pack`'s own codes / scales / biases back through
+        // `pack_codes` must reproduce `pack`'s bytes exactly, for every
+        // bit-width, both grids and both 2-byte scale dtypes.
+        let mut s = 0x9E3779B97F4A7C15u64;
+        let mut xs = Vec::with_capacity(1024);
+        for _ in 0..1024 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let t = ((s >> 33) & 0x7FFFFFFF) as f32 / 0x7FFFFFFF as f32;
+            xs.push(-0.8 + 1.7 * t);
+        }
+        for bits in [2u32, 3, 4, 5, 6, 8] {
+            for symmetric in [false, true] {
+                for scale_dtype in [ScaleDtype::Bf16, ScaleDtype::F16] {
+                    let cfg = RtnConfig {
+                        bits,
+                        group_size: RtnConfig::canonical(bits).group_size,
+                        symmetric,
+                        scale_dtype,
+                    };
+                    let p = pack(&xs, cfg);
+                    let codes: Vec<u8> = unpack_lanes(&p.packed_weights, bits, xs.len())
+                        .into_iter()
+                        .map(|c| c as u8)
+                        .collect();
+                    let scales = decode_scales(&p.scales, scale_dtype);
+                    let biases = decode_scales(&p.biases, scale_dtype);
+                    let q = pack_codes(&codes, &scales, &biases, cfg);
+                    assert_eq!(
+                        q.packed_weights, p.packed_weights,
+                        "bits={bits} sym={symmetric} {scale_dtype:?} weights"
+                    );
+                    assert_eq!(
+                        q.scales, p.scales,
+                        "bits={bits} sym={symmetric} {scale_dtype:?} scales"
+                    );
+                    assert_eq!(
+                        q.biases, p.biases,
+                        "bits={bits} sym={symmetric} {scale_dtype:?} biases"
+                    );
+                    assert_eq!(q.group_size, p.group_size);
+                    assert_eq!(q.scale_dtype, p.scale_dtype);
+                    // And the dequant image is the same one `pack` implies.
+                    assert_eq!(unpack(&q, xs.len(), cfg), unpack(&p, xs.len(), cfg));
+                }
+            }
+        }
     }
 }

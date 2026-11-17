@@ -97,8 +97,8 @@ impl GgufMapper for NomicBertMapper {
         let hidden_size = u32_key(&format!("{prefix}.embedding_length"))?;
         let num_hidden_layers = u32_key(&format!("{prefix}.block_count"))?;
         let num_attention_heads = u32_key(&format!("{prefix}.attention.head_count"))?;
-        let num_kv_heads = u32_key(&format!("{prefix}.attention.head_count_kv"))
-            .unwrap_or(num_attention_heads);
+        let num_kv_heads =
+            u32_key(&format!("{prefix}.attention.head_count_kv")).unwrap_or(num_attention_heads);
         let intermediate_size = u32_key(&format!("{prefix}.feed_forward_length"))?;
         let head_dim = u32_key(&format!("{prefix}.attention.key_length"))
             .unwrap_or(hidden_size / num_attention_heads);
@@ -112,8 +112,8 @@ impl GgufMapper for NomicBertMapper {
         let rope_theta = f32_key(&format!("{prefix}.rope.freq_base")).unwrap_or(10_000.0);
         // nomic-bert's epsilon key uses `_epsilon` (LayerNorm) rather
         // than `_rms_epsilon` (RMSNorm) — keep the same struct field.
-        let rms_norm_eps = f32_key(&format!("{prefix}.attention.layer_norm_epsilon"))
-            .unwrap_or(1e-12);
+        let rms_norm_eps =
+            f32_key(&format!("{prefix}.attention.layer_norm_epsilon")).unwrap_or(1e-12);
         let max_position_embeddings = u32_key(&format!("{prefix}.context_length")).unwrap_or(0);
         let bos_token_id = u32_key("tokenizer.ggml.bos_token_id").unwrap_or(0);
         let eos_token_id = u32_key("tokenizer.ggml.eos_token_id").unwrap_or(0);

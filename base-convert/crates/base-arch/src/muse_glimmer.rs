@@ -224,8 +224,8 @@ impl GgufMapper for MuseGlimmerGgufMapper {
         let hidden_size = u32_req(&format!("{prefix}.embedding_length"))?;
         let num_hidden_layers = u32_req(&format!("{prefix}.block_count"))?;
         let num_attention_heads = u32_req(&format!("{prefix}.attention.head_count"))?;
-        let num_kv_heads = u32_key(&format!("{prefix}.attention.head_count_kv"))
-            .unwrap_or(num_attention_heads);
+        let num_kv_heads =
+            u32_key(&format!("{prefix}.attention.head_count_kv")).unwrap_or(num_attention_heads);
         let intermediate_size = u32_req(&format!("{prefix}.feed_forward_length"))?;
         let vocab_size = u32_key(&format!("{prefix}.vocab_size"))
             .or_else(|| match m.get("tokenizer.ggml.tokens") {
@@ -280,8 +280,8 @@ impl GgufMapper for MuseGlimmerGgufMapper {
         // exported key; otherwise fall back to the published constant.
         config.qk_scale_factor = f32_any(&["attention.qk_scale_factor", "qk_scale_factor"])
             .unwrap_or(REF_QK_SCALE_FACTOR);
-        config.logit_softcap = f32_any(&["final_logit_softcapping", "logit_softcap"])
-            .unwrap_or(REF_LOGIT_SOFTCAP);
+        config.logit_softcap =
+            f32_any(&["final_logit_softcapping", "logit_softcap"]).unwrap_or(REF_LOGIT_SOFTCAP);
         config.post_norm_eps =
             f32_any(&["attention.post_norm_epsilon", "post_norm_eps"]).unwrap_or(REF_POST_NORM_EPS);
         // llama.cpp exports HF's `output_multiplier` under its own generic
@@ -293,17 +293,19 @@ impl GgufMapper for MuseGlimmerGgufMapper {
         // The derivation below is the fallback: the value is exactly
         // 1/sqrt(hidden_size/256) on the released checkpoint (6656/256 = 26
         // → 0.19611613…), so it beats hardcoding a width-specific number.
-        config.output_multiplier = f32_any(&["logit_scale", "output_multiplier"]).unwrap_or_else(|| {
-            let d = hidden_size as f32 / 256.0;
-            if d > 0.0 {
-                1.0 / d.sqrt()
-            } else {
-                0.0
-            }
-        });
+        config.output_multiplier =
+            f32_any(&["logit_scale", "output_multiplier"]).unwrap_or_else(|| {
+                let d = hidden_size as f32 / 256.0;
+                if d > 0.0 {
+                    1.0 / d.sqrt()
+                } else {
+                    0.0
+                }
+            });
 
         // ── Local/global + NoPE schedules ───────────────────────────
-        config.sliding_window = u32_any(&["attention.sliding_window"]).unwrap_or(REF_SLIDING_WINDOW);
+        config.sliding_window =
+            u32_any(&["attention.sliding_window"]).unwrap_or(REF_SLIDING_WINDOW);
         let n_layers = num_hidden_layers as usize;
         // A bool array under `attention.sliding_window_pattern` is the
         // shape Gemma 4 uses and the natural one for this arch; fall back
@@ -320,8 +322,12 @@ impl GgufMapper for MuseGlimmerGgufMapper {
             _ => None,
         };
         let layer_types = default_layer_types(n_layers);
-        config.swa_layers = swa_from_kv
-            .unwrap_or_else(|| layer_types.iter().map(|t| t == "sliding_attention").collect());
+        config.swa_layers = swa_from_kv.unwrap_or_else(|| {
+            layer_types
+                .iter()
+                .map(|t| t == "sliding_attention")
+                .collect()
+        });
 
         // NoPE mask. HF encodes it as `layer_rope_theta[i] == 0`; if a
         // per-layer theta array ever lands in GGUF metadata, honour it.
@@ -798,13 +804,25 @@ mod tests {
             ("v.post_ln.weight", "vision.ln_post.weight"),
             ("v.post_ln.bias", "vision.ln_post.bias"),
             // Encoder blocks — every stem, both tails.
-            ("v.blk.0.ln1.weight", "vision.layers.0.attention_norm.weight"),
+            (
+                "v.blk.0.ln1.weight",
+                "vision.layers.0.attention_norm.weight",
+            ),
             ("v.blk.0.ln1.bias", "vision.layers.0.attention_norm.bias"),
             ("v.blk.2.ln2.weight", "vision.layers.2.ffn_norm.weight"),
-            ("v.blk.3.attn_q.weight", "vision.layers.3.attention.q.weight"),
+            (
+                "v.blk.3.attn_q.weight",
+                "vision.layers.3.attention.q.weight",
+            ),
             ("v.blk.3.attn_k.bias", "vision.layers.3.attention.k.bias"),
-            ("v.blk.3.attn_v.weight", "vision.layers.3.attention.v.weight"),
-            ("v.blk.3.attn_out.weight", "vision.layers.3.attention.output.weight"),
+            (
+                "v.blk.3.attn_v.weight",
+                "vision.layers.3.attention.v.weight",
+            ),
+            (
+                "v.blk.3.attn_out.weight",
+                "vision.layers.3.attention.output.weight",
+            ),
             ("v.blk.7.ffn_up.weight", "vision.layers.7.ffn.up.weight"),
             ("v.blk.7.ffn_down.bias", "vision.layers.7.ffn.down.bias"),
             // Projector.
@@ -841,12 +859,30 @@ mod tests {
         let pairs = [
             ("vision_tower.layers.5.norm1.weight", "v.blk.5.ln1.weight"),
             ("vision_tower.layers.5.norm2.bias", "v.blk.5.ln2.bias"),
-            ("vision_tower.layers.5.attn.q_proj.weight", "v.blk.5.attn_q.weight"),
-            ("vision_tower.layers.5.attn.k_proj.bias", "v.blk.5.attn_k.bias"),
-            ("vision_tower.layers.5.attn.v_proj.weight", "v.blk.5.attn_v.weight"),
-            ("vision_tower.layers.5.attn.proj.weight", "v.blk.5.attn_out.weight"),
-            ("vision_tower.layers.5.mlp.fc1.weight", "v.blk.5.ffn_up.weight"),
-            ("vision_tower.layers.5.mlp.fc2.bias", "v.blk.5.ffn_down.bias"),
+            (
+                "vision_tower.layers.5.attn.q_proj.weight",
+                "v.blk.5.attn_q.weight",
+            ),
+            (
+                "vision_tower.layers.5.attn.k_proj.bias",
+                "v.blk.5.attn_k.bias",
+            ),
+            (
+                "vision_tower.layers.5.attn.v_proj.weight",
+                "v.blk.5.attn_v.weight",
+            ),
+            (
+                "vision_tower.layers.5.attn.proj.weight",
+                "v.blk.5.attn_out.weight",
+            ),
+            (
+                "vision_tower.layers.5.mlp.fc1.weight",
+                "v.blk.5.ffn_up.weight",
+            ),
+            (
+                "vision_tower.layers.5.mlp.fc2.bias",
+                "v.blk.5.ffn_down.bias",
+            ),
             ("vision_tower.ln_pre.weight", "v.pre_ln.weight"),
             ("vision_tower.ln_post.bias", "v.post_ln.bias"),
             (
@@ -879,11 +915,23 @@ mod tests {
         m.insert("muse-glimmer.embedding_length".into(), KvValue::U32(6656));
         m.insert("muse-glimmer.block_count".into(), KvValue::U32(4));
         m.insert("muse-glimmer.attention.head_count".into(), KvValue::U32(32));
-        m.insert("muse-glimmer.attention.head_count_kv".into(), KvValue::U32(2));
-        m.insert("muse-glimmer.feed_forward_length".into(), KvValue::U32(19968));
+        m.insert(
+            "muse-glimmer.attention.head_count_kv".into(),
+            KvValue::U32(2),
+        );
+        m.insert(
+            "muse-glimmer.feed_forward_length".into(),
+            KvValue::U32(19968),
+        );
         m.insert("muse-glimmer.vocab_size".into(), KvValue::U32(202048));
-        m.insert("muse-glimmer.attention.key_length".into(), KvValue::U32(128));
-        m.insert("muse-glimmer.rope.freq_base".into(), KvValue::F32(500_000.0));
+        m.insert(
+            "muse-glimmer.attention.key_length".into(),
+            KvValue::U32(128),
+        );
+        m.insert(
+            "muse-glimmer.rope.freq_base".into(),
+            KvValue::F32(500_000.0),
+        );
         m.insert("muse-glimmer.context_length".into(), KvValue::U32(131072));
         m.insert(
             "muse-glimmer.attention.layer_norm_rms_epsilon".into(),
@@ -903,8 +951,7 @@ mod tests {
             .expect("hyphenated `muse-glimmer` must resolve");
         assert_eq!(m.canonical_arch(), "muse_glimmer");
         assert_eq!(
-            crate::source_mapper_for_gguf("muse_glimmer")
-                .map(|m| m.canonical_arch()),
+            crate::source_mapper_for_gguf("muse_glimmer").map(|m| m.canonical_arch()),
             Some("muse_glimmer"),
             "underscored spelling accepted too"
         );
@@ -912,7 +959,9 @@ mod tests {
 
     #[test]
     fn gguf_config_matches_hf_config() {
-        let g = MuseGlimmerGgufMapper.config_from_gguf(&gguf_meta()).unwrap();
+        let g = MuseGlimmerGgufMapper
+            .config_from_gguf(&gguf_meta())
+            .unwrap();
         let h = MuseGlimmerHfMapper.config_from_hf(&cfg()).unwrap();
         assert_eq!(g.hidden_size, h.hidden_size);
         assert_eq!(g.num_hidden_layers, h.num_hidden_layers);
@@ -935,7 +984,9 @@ mod tests {
     /// hidden_size rather than hardcoded.
     #[test]
     fn gguf_falls_back_to_reference_scales() {
-        let g = MuseGlimmerGgufMapper.config_from_gguf(&gguf_meta()).unwrap();
+        let g = MuseGlimmerGgufMapper
+            .config_from_gguf(&gguf_meta())
+            .unwrap();
         assert_eq!(g.qk_scale_factor, 3.87);
         assert_eq!(g.logit_softcap, 20.0);
         assert_eq!(g.post_norm_eps, 1e-8);
@@ -956,7 +1007,10 @@ mod tests {
             "muse-glimmer.final_logit_softcapping".into(),
             KvValue::F32(30.0),
         );
-        m.insert("muse-glimmer.attention.sliding_window".into(), KvValue::U32(1024));
+        m.insert(
+            "muse-glimmer.attention.sliding_window".into(),
+            KvValue::U32(1024),
+        );
         let g = MuseGlimmerGgufMapper.config_from_gguf(&m).unwrap();
         assert_eq!(g.qk_scale_factor, 2.5);
         assert_eq!(g.output_multiplier, 0.5);
@@ -980,7 +1034,10 @@ mod tests {
                 "blk.7.post_attention_norm.weight",
                 "layers.7.post_attention_norm.weight",
             ),
-            ("blk.7.post_ffw_norm.weight", "layers.7.post_ffw_norm.weight"),
+            (
+                "blk.7.post_ffw_norm.weight",
+                "layers.7.post_ffw_norm.weight",
+            ),
             ("blk.1.attn_q.weight", "layers.1.self_attn.q_proj.weight"),
             ("blk.1.attn_k.weight", "layers.1.self_attn.k_proj.weight"),
             ("blk.1.attn_v.weight", "layers.1.self_attn.v_proj.weight"),
@@ -989,9 +1046,18 @@ mod tests {
                 "layers.1.self_attn.o_proj.weight",
             ),
             // NOT `self_attn.gate.weight` — see map_gguf_name's docs.
-            ("blk.1.attn_gate.weight", "layers.1.self_attn.gate_proj.weight"),
-            ("blk.1.attn_q_norm.weight", "layers.1.self_attn.q_norm.weight"),
-            ("blk.1.attn_k_norm.weight", "layers.1.self_attn.k_norm.weight"),
+            (
+                "blk.1.attn_gate.weight",
+                "layers.1.self_attn.gate_proj.weight",
+            ),
+            (
+                "blk.1.attn_q_norm.weight",
+                "layers.1.self_attn.q_norm.weight",
+            ),
+            (
+                "blk.1.attn_k_norm.weight",
+                "layers.1.self_attn.k_norm.weight",
+            ),
             ("blk.51.ffn_gate.weight", "layers.51.mlp.gate_proj.weight"),
             ("blk.51.ffn_up.weight", "layers.51.mlp.up_proj.weight"),
             ("blk.51.ffn_down.weight", "layers.51.mlp.down_proj.weight"),
@@ -1029,7 +1095,9 @@ mod tests {
     /// — v, o, the attention gate, the FFN — must be left alone.
     #[test]
     fn rope_unpermute_targets_q_and_k_only() {
-        let c = MuseGlimmerGgufMapper.config_from_gguf(&gguf_meta()).unwrap();
+        let c = MuseGlimmerGgufMapper
+            .config_from_gguf(&gguf_meta())
+            .unwrap();
         let m = MuseGlimmerGgufMapper;
         assert_eq!(
             m.rope_unpermute_heads("layers.0.self_attn.q_proj.weight", &c),

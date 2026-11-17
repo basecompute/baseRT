@@ -18,7 +18,9 @@ bitflags! {
         const HAS_HYBRID        = 1 << 3;
         /// Extension slots contain LoRA delta weights.
         const HAS_LORA          = 1 << 4;
-        /// Extension slots contain a paired speculator model.
+        /// The bundle carries a speculator sub-bundle (`header.speculator`):
+        /// a drafter that conditions on this model's hidden states — an
+        /// in-checkpoint MTP head, or a converted EAGLE / DFlash drafter.
         const HAS_SPECULATOR    = 1 << 5;
         /// Extension slots contain precompiled compute graphs.
         const HAS_COMPUTE_GRAPH = 1 << 6;
@@ -273,7 +275,6 @@ pub enum ComputeRegion {
     Cpu,
 }
 
-
 /// Per-region alignment in log2 bytes. Stored in the header so the runtime
 /// knows the packed layout without hardcoding assumptions, and so the
 /// converter can target different hardware page sizes.
@@ -398,6 +399,10 @@ impl TensorDtype {
 pub struct TensorEntry {
     pub name: String,
     pub dtype: TensorDtype,
+    /// Logical shape, outermost axis first: a linear weight is `[out, in]`
+    /// (an expert stack `[E, out, in]`) and its bytes are row-major in that
+    /// order. This holds for every dtype and layout, `gguf_super` included;
+    /// readers of other formats (GGUF lists `ne` fastest-first) convert.
     pub shape: Vec<u64>,
     pub offset: u64,
     pub length: u64,
@@ -463,6 +468,17 @@ pub struct TensorEntry {
     /// the bundle's `quant_scheme`, no GGUF-native dispatch needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_ggml_type: Option<u32>,
+
+    /// Weight-rounding algorithm that produced a quantized tensor
+    /// ("rtn" | "awq"). Provenance only — AWQ scales are folded into
+    /// the neighbouring norm/linear at convert time, so the runtime has
+    /// nothing to apply (awq_scale_offset/length stay absent). Absent on
+    /// bundles written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algo: Option<String>,
+    /// AWQ alpha chosen for this tensor's fold group (algo = "awq").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awq_alpha: Option<f32>,
 }
 
 fn is_default_region(r: &ComputeRegion) -> bool {
@@ -495,6 +511,13 @@ pub struct CalibrationInfo {
     pub calib_tokens: u32,
     #[serde(default)]
     pub per_layer_alpha: BTreeMap<String, Vec<f32>>,
+    /// Calibration dataset identifier (from the quant profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    /// Fingerprint of the source checkpoint the sidecar was measured on
+    /// (see base-awq `sidecar.rs` for the contract).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -503,6 +526,83 @@ pub struct Signature {
     pub key_id: String,
     /// Base64-encoded signature bytes.
     pub signature: String,
+}
+
+/// Conversion provenance: where every bundle tensor came from and what
+/// was done to it, written by the converter at conversion time. The
+/// runtime ignores this block entirely; it exists so verification
+/// tooling can check a bundle against its source checkpoint without a
+/// hand-maintained per-arch name table, and can prove coverage in both
+/// directions (every bundle tensor accounted for, every source tensor
+/// consumed).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Provenance {
+    pub schema: u32,
+    /// True when the converter ran the mirror policy on a quantized
+    /// source: tensors the source stores quantized are transplanted,
+    /// tensors it keeps unquantized are carried unquantized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mirror: bool,
+    /// Source tensors intentionally not represented in the bundle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<String>,
+    /// Source tensors routed into the mmproj sub-bundle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mmproj: Vec<String>,
+    /// Source tensors routed into the speculator sub-bundle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speculator: Vec<String>,
+    /// Bundle tensor name -> provenance record.
+    pub tensors: BTreeMap<String, TensorProvenance>,
+    /// `basert overlay`: the spec this subset bundle was built from and the
+    /// tensors carried only because an AWQ fold modified them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TensorProvenance {
+    /// Source tensor name(s) this bundle tensor was built from. Empty
+    /// only when `stack` describes the sources instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub src: Vec<String>,
+    /// Packed bytes copied verbatim from the source's identical scheme.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transplanted: bool,
+    /// Stored unquantized because the source stores it unquantized
+    /// (mirror policy).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub carried: bool,
+    /// Reparameterization baked into the stored values (e.g. "neg_exp"
+    /// for Mamba-2 `A = -exp(A_log)`). Verifiers re-derive the expected
+    /// values from this label independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<String>,
+    /// Additive shift baked into 1-D norm gains (Gemma-style +1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub norm_shift: Option<f32>,
+    /// Rows were reordered (HF split-half rotary -> interleaved).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub permuted: bool,
+    /// `[row_offset, row_count]` slice of the source tensor (fused
+    /// qkv_proj / gate_up_proj splits).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<[u64; 2]>,
+    /// `[col_offset, col_count]` input-column block of the source tensor
+    /// (the MTP head's `mtp.fc` split into fc_embed / fc_hidden, a block
+    /// drafter's per-tap `fc.{i}`, EAGLE-3's `*_proj_emb` / `*_proj_hid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<[u64; 2]>,
+    /// Stacked from `count` per-expert source tensors; `pattern`
+    /// contains `{e}` where the expert index goes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<StackRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackRef {
+    pub pattern: String,
+    pub count: u32,
 }
 
 /// Top-level header. Serialized as JSON with sorted keys for
@@ -562,9 +662,29 @@ pub struct Header {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub mmproj: Option<MmprojBundle>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub speculator: Option<SpeculatorBundle>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub calibration: Option<CalibrationInfo>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sig: Option<Signature>,
+
+    /// Conversion provenance: how every bundle tensor relates to the
+    /// source checkpoint's tensors. Written by the converter so a
+    /// fidelity gate can verify the bundle against the checkpoint without
+    /// a hand-maintained name table. Shape:
+    ///
+    /// ```json
+    /// {"tensors": {"<canonical name>": {"src": ["<source name>", ...],
+    ///                                    "transplanted": true,   // packed codes copied verbatim
+    ///                                    "transform": "neg_exp", // declared reparameterization
+    ///                                    "stack": {"pattern": "...{e}...", "count": N},
+    ///                                    "permuted": true, "rows": [off, cnt]}},
+    ///  "dropped": ["<source tensors deliberately not converted>"]}
+    /// ```
+    ///
+    /// Absent on bundles from converter paths that do not record it yet.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provenance: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -581,10 +701,33 @@ pub struct MmprojBundle {
     pub tensors: Vec<TensorEntry>,
 }
 
+/// Speculator sub-bundle: a drafter the runtime runs alongside the main
+/// model for speculative decoding. Same layout convention as `mmproj` —
+/// its tensors live in the same weights blob, listed here so a runtime
+/// without speculation skips them. Kinds so far:
+///   * `<arch>-mtp`: the checkpoint's own Multi-Token-Prediction head
+///     (Qwen3.5/3.6/3.8 `mtp.*`, GLM `nextn`): one decoder layer of the
+///     target's geometry plus `fc` / pre-fc norms / final norm, sharing the
+///     target's embeddings and lm_head. Tensors are named `mtp.<canonical>`
+///     (the decoder layer as `mtp.layers.0.*`, canonicalized exactly like a
+///     main layer, norm shifts baked). Kept unquantized (f16): the head's
+///     acceptance rate is what the whole scheme buys, and quantizing it
+///     measured near-zero acceptance on MoE targets.
+///
+/// `config` is open-namespace: `kind`, `num_layers`, `moe`,
+/// `shared_embeddings`, drafter-specific keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeculatorBundle {
+    pub arch: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, serde_json::Value>,
+    pub tensors: Vec<TensorEntry>,
+}
+
 /// Per-layer kind. Drives runtime dispatch: which forward path to run
 /// (attention vs SSM), which KV / SSM buffers to allocate, and whether
 /// the layer feeds into an MoE FFN.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayerKind {
     /// Standard dense multi-head attention (no GQA).
@@ -604,6 +747,37 @@ pub enum LayerKind {
     DenseMoe,
     /// Standard transformer block (attention + dense MLP).
     DenseMlp,
+    /// FFN-only MoE block: no attention/SSM mixer in the layer.
+    /// Nemotron-H MoE interleaves pure-Mamba, pure-attention and
+    /// pure-MoE-FFN blocks — each block has exactly one of the three.
+    MoeFfn,
+    /// Forward-compat fallback: a layer kind this build does not know.
+    /// Older tools must not hard-fail on a newer bundle's header just to
+    /// print an inventory (the C++ runtime never validated this enum,
+    /// and an old `basert inspect` once refused a Nemotron bundle over
+    /// exactly this). Never written by a converter.
+    Unknown,
+}
+
+// Deserialize by hand so unknown strings land on `Unknown` instead of a
+// serde hard error (`#[serde(other)]` is not available on externally
+// tagged unit enums).
+impl<'de> serde::Deserialize<'de> for LayerKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "attention_dense" => Self::AttentionDense,
+            "attention_gqa" => Self::AttentionGqa,
+            "attention_sliding" => Self::AttentionSliding,
+            "ssm" => Self::Ssm,
+            "ssm_moe" => Self::SsmMoe,
+            "attention_moe" => Self::AttentionMoe,
+            "dense_moe" => Self::DenseMoe,
+            "dense_mlp" => Self::DenseMlp,
+            "moe_ffn" => Self::MoeFfn,
+            _ => Self::Unknown,
+        })
+    }
 }
 
 /// Per-layer precision overrides. Absent = inherit bundle default.
@@ -851,6 +1025,8 @@ mod tests {
             flags: TensorFlags::empty(),
             checksum_xxh64: None,
             source_ggml_type: None,
+            algo: None,
+            awq_alpha: None,
         };
         let s = serde_json::to_string(&entry).unwrap();
         assert!(!s.contains("scale_dtype"), "scale_dtype: None should skip");
@@ -881,6 +1057,8 @@ mod tests {
             flags: TensorFlags::empty(),
             checksum_xxh64: None,
             source_ggml_type: None,
+            algo: None,
+            awq_alpha: None,
         };
         let s = serde_json::to_string(&entry).unwrap();
         let back: TensorEntry = serde_json::from_str(&s).unwrap();

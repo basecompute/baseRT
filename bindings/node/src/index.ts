@@ -19,6 +19,7 @@
 
 import koffi from "koffi";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 
 // ---------------------------------------------------------------------------
@@ -40,15 +41,44 @@ function libNames(): string[] {
   }
 }
 
+// The prebuilt engine is published to npm as one package per platform, listed
+// as optionalDependencies of @basecompute/basert; npm installs only the one
+// whose os/cpu match this machine.
+const ENGINE_PACKAGES: Record<string, string> = {
+  "darwin-arm64": "@basecompute/basert-darwin-arm64",
+  "linux-arm64": "@basecompute/basert-linux-arm64-cuda",
+  "linux-x64": "@basecompute/basert-linux-x64-rocm",
+};
+
+function enginePackageDir(): string | undefined {
+  const pkg = ENGINE_PACKAGES[`${process.platform}-${process.arch}`];
+  if (!pkg) return undefined;
+  try {
+    return path.join(path.dirname(require.resolve(`${pkg}/package.json`)), "engine");
+  } catch {
+    return undefined; // not installed: a source checkout, or --no-optional
+  }
+}
+
 function resolveLibPath(): string {
   if (process.env.BASERT_LIB_PATH) return process.env.BASERT_LIB_PATH;
   const here = __dirname; // dist/ or src/ at runtime
+  // A source checkout's build directory comes before the installed engines
+  // (install.sh / Homebrew) so a fresh local build is never shadowed by an
+  // older release. The working directory is tried last: whatever folder the
+  // script runs in must never outrank an installed engine, or a project could
+  // ship its own library.
+  const installDir = process.env.BASERT_INSTALL_DIR || path.join(os.homedir(), ".basert");
   const dirs = [
+    enginePackageDir(), // npm install @basecompute/basert
     path.resolve(here, "..", "..", "..", "build"), // bindings/node/{dist,src} -> repo/build
     path.resolve(here, "..", "..", "build"),
+    installDir, // install.sh
+    "/opt/homebrew/opt/basert/libexec", // brew, macOS
+    "/home/linuxbrew/.linuxbrew/opt/basert/libexec", // brew, Linux
     path.resolve(process.cwd(), "build"),
     path.resolve(process.cwd()),
-  ];
+  ].filter((d): d is string => d !== undefined);
   const names = libNames();
   const tried: string[] = [];
   for (const d of dirs) {
@@ -59,7 +89,7 @@ function resolveLibPath(): string {
     }
   }
   throw new Error(
-    `Cannot find ${names.join(" / ")}. Set BASERT_LIB_PATH or build with \`make shared\`. Looked in:\n  ${tried.join(
+    `Cannot find ${names.join(" / ")}. Install the engine (npm install @basecompute/basert, brew install basecompute/tap/basert, or install.sh), set BASERT_LIB_PATH, or build with \`make shared\`. Looked in:\n  ${tried.join(
       "\n  "
     )}`
   );
@@ -117,6 +147,12 @@ const ModelConfigC = koffi.struct("BaseRTModelConfig", {
   gdn_key_head_dim: "uint32",
   gdn_value_head_dim: "uint32",
   gdn_conv_kernel: "uint32",
+  // Nemotron-H hybrid Mamba-2 SSM
+  ssm_state_size: "uint32",
+  ssm_conv_kernel: "uint32",
+  ssm_num_groups: "uint32",
+  ssm_inner_size: "uint32",
+  ssm_num_heads: "uint32",
   // MoE
   n_experts: "uint32",
   n_experts_used: "uint32",
@@ -125,6 +161,7 @@ const ModelConfigC = koffi.struct("BaseRTModelConfig", {
   expert_gating: "uint8",
   norm_topk_prob: "uint8",
   _moe_pad: koffi.array("uint8", 2),
+  expert_weights_scale: "float",
   // Vision tower
   vision_n_layers: "uint32",
   vision_dim: "uint32",
@@ -186,6 +223,27 @@ const ModelConfigC = koffi.struct("BaseRTModelConfig", {
   vision_pos_embed_w: "uint32",
   vision_adapter_dim: "uint32",
   video_token_id: "uint32",
+  // GLM 5.2 / glm-dsa
+  q_lora_rank: "uint32",
+  kv_lora_rank: "uint32",
+  qk_nope_head_dim: "uint32",
+  qk_rope_head_dim: "uint32",
+  v_head_dim: "uint32",
+  routed_scaling_factor: "float",
+  first_k_dense_replace: "uint32",
+  nextn_predict_layers: "uint32",
+  indexer_head_count: "uint32",
+  indexer_key_length: "uint32",
+  indexer_top_k: "uint32",
+  // gpt-oss
+  rope_yarn_beta_fast: "float",
+  rope_yarn_beta_slow: "float",
+  swiglu_limit: "float",
+  swiglu_alpha: "float",
+  attention_sinks: "uint8",
+  attention_bias: "uint8",
+  rope_yarn_truncate: "uint8",
+  _gptoss_pad: "uint8",
 });
 
 const SamplingConfigC = koffi.struct("BaseRTSamplingConfig", {
@@ -353,6 +411,7 @@ interface BaseRTLib {
   baseRT_set_max_batch_size: (n: number) => void;
   baseRT_set_prefill_chunk: (n: number) => void;
   baseRT_set_paged_weights: (mode: number) => void;
+  baseRT_set_neural_engine: (enable: number) => void;
   baseRT_set_baked_decode: (enable: number) => void;
   baseRT_set_gpu_wait_timeout_ms: (ms: number) => void;
   baseRT_encode: (
@@ -502,6 +561,7 @@ function lib(): BaseRTLib {
     baseRT_set_max_batch_size: k.func("void baseRT_set_max_batch_size(int)"),
     baseRT_set_prefill_chunk: k.func("void baseRT_set_prefill_chunk(int)"),
     baseRT_set_paged_weights: k.func("void baseRT_set_paged_weights(int)"),
+    baseRT_set_neural_engine: k.func("void baseRT_set_neural_engine(int)"),
     baseRT_set_baked_decode: k.func("void baseRT_set_baked_decode(int)"),
     baseRT_set_gpu_wait_timeout_ms: k.func("void baseRT_set_gpu_wait_timeout_ms(double)"),
     baseRT_encode: k.func(
@@ -641,6 +701,10 @@ export const Engine = {
   /** Paged-weights load policy: 0=auto, 1=force, 2=no-retry (issue #113). */
   setPagedWeights(mode: number): void {
     lib().baseRT_set_paged_weights(mode);
+  },
+  /** The prefill's Neural Engine split: true=on (default), false=GPU alone. */
+  setNeuralEngine(enable: boolean): void {
+    lib().baseRT_set_neural_engine(enable ? 1 : 0);
   },
   /** Toggle the baked-decode fast path: true=on (default), false=force live. */
   setBakedDecode(enable: boolean): void {

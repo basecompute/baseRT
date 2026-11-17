@@ -12,9 +12,7 @@
 //! at verify time, as long as the canonicalizer is deterministic.
 
 use anyhow::{Context, Result};
-use ed25519_dalek::{
-    Signature, Signer, SigningKey, Verifier, VerifyingKey, SECRET_KEY_LENGTH,
-};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey, SECRET_KEY_LENGTH};
 use sha2::{Digest, Sha256};
 
 /// Sign a payload (canonical JSON || sha256(blob)) with an ed25519 key.
@@ -70,8 +68,7 @@ pub fn signing_key_from_bytes(bytes: &[u8]) -> Result<SigningKey> {
 pub fn b64_encode(bytes: &[u8]) -> String {
     // Minimal base64 implementation to avoid pulling in a crate just
     // for this. Standard alphabet, with `=` padding.
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
@@ -134,6 +131,21 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
 /// This is intentionally a post-process step: keeps `BaseWriter`
 /// streaming-friendly (no memory-buffered blob) while centralizing
 /// signing logic here.
+/// End of the weights blob relative to its start: max(offset + length) over
+/// EVERY tensor list — the main tensors and the sub-bundles that share the
+/// blob (mmproj towers, the speculator head). Scanning only `header.tensors`
+/// would leave every speculator payload out of the signed digest, so a
+/// modified MTP head still verified.
+fn blob_end_rel(h: &base_format::Header) -> u64 {
+    h.tensors
+        .iter()
+        .chain(h.mmproj.iter().flat_map(|m| m.tensors.iter()))
+        .chain(h.speculator.iter().flat_map(|m| m.tensors.iter()))
+        .map(|t| t.offset + t.length)
+        .max()
+        .unwrap_or(0)
+}
+
 pub fn sign_base_file<P: AsRef<std::path::Path>>(
     input: P,
     output: P,
@@ -148,13 +160,7 @@ pub fn sign_base_file<P: AsRef<std::path::Path>>(
         .with_context(|| format!("opening {:?}", input.as_ref()))?;
 
     // Compute end-of-blob as max(offset + length) over all tensors.
-    let blob_end_rel = reader
-        .header()
-        .tensors
-        .iter()
-        .map(|t| t.offset + t.length)
-        .max()
-        .unwrap_or(0);
+    let blob_end_rel = blob_end_rel(reader.header());
     let blob_start = reader.blob_offset();
     let blob_bytes: Vec<u8> = {
         let file_bytes = std::fs::read(input.as_ref())?;
@@ -226,32 +232,26 @@ pub fn sign_base_file<P: AsRef<std::path::Path>>(
 pub fn verify_base_file<P: AsRef<std::path::Path>>(path: P, key: &VerifyingKey) -> Result<()> {
     use base_format::BaseReader;
 
-    let reader = BaseReader::open(path.as_ref())
-        .with_context(|| format!("opening {:?}", path.as_ref()))?;
+    let reader =
+        BaseReader::open(path.as_ref()).with_context(|| format!("opening {:?}", path.as_ref()))?;
     let Some(recorded_sig) = reader.header().sig.clone() else {
         return Ok(());
     };
     if recorded_sig.alg != "ed25519" {
-        anyhow::bail!(
-            "unsupported signature algorithm: {:?}",
-            recorded_sig.alg
-        );
+        anyhow::bail!("unsupported signature algorithm: {:?}", recorded_sig.alg);
     }
     let sig_bytes = b64_decode(&recorded_sig.signature)?;
     if sig_bytes.len() != 64 {
-        anyhow::bail!("ed25519 signature must be 64 bytes, got {}", sig_bytes.len());
+        anyhow::bail!(
+            "ed25519 signature must be 64 bytes, got {}",
+            sig_bytes.len()
+        );
     }
     let mut sig_arr = [0u8; 64];
     sig_arr.copy_from_slice(&sig_bytes);
     let sig = Signature::from_bytes(&sig_arr);
 
-    let blob_end_rel = reader
-        .header()
-        .tensors
-        .iter()
-        .map(|t| t.offset + t.length)
-        .max()
-        .unwrap_or(0);
+    let blob_end_rel = blob_end_rel(reader.header());
     let blob_start = reader.blob_offset();
     let file_bytes = std::fs::read(path.as_ref())?;
     let blob_bytes = &file_bytes[blob_start as usize..(blob_start + blob_end_rel) as usize];

@@ -25,11 +25,14 @@
 //! than hanging the pull forever.
 //!
 //! Not locked against a second process pulling the same file at the same
-//! time. Both would write identical bytes at identical offsets, so the result
-//! is not corrupt, but the loser's final rename can fail once the winner has
-//! moved the partial away. hf-hub 0.5 did not lock here either, so this is
-//! not a regression; it is worth a lock file if concurrent pulls ever become
-//! a normal thing to do.
+//! time. Both write identical bytes at identical offsets, so the result is
+//! never corrupt. The one observable symptom was the LOSER's final rename
+//! failing once the winner had moved the shared partial away — which surfaced
+//! as a bogus "no .safetensors shards" failure on a pull that had actually
+//! succeeded. Finalize now treats "dst exists and the partial is gone" as
+//! success, so concurrent pulls converge instead of one spuriously failing.
+//! A real lock file would additionally stop the duplicated download work; that
+//! is a bandwidth optimization, not a correctness fix.
 
 use anyhow::{bail, Context, Result};
 use hf_hub::{HFClientSync, RepoTypeModel};
@@ -294,7 +297,19 @@ pub fn download_ranged(
     }
     drop(file);
     map.remove();
-    std::fs::rename(&partial, dst).with_context(|| format!("finalizing {}", dst.display()))?;
+    // A second process pulling the same blob concurrently may have finished
+    // first and renamed ITS partial onto dst — taking ours with it, since both
+    // use the same partial path. Both wrote identical bytes at identical
+    // offsets, so the winner's file IS our result: succeed rather than failing
+    // a pull that actually produced the right file. (Observed for real: a
+    // second `pull` of the same repo made the first fail with "no .safetensors
+    // shards".) Only tolerated when dst is present and the partial is gone —
+    // any other rename error is still an error.
+    if let Err(e) = std::fs::rename(&partial, dst) {
+        if !(dst.exists() && !partial.exists()) {
+            return Err(e).with_context(|| format!("finalizing {}", dst.display()));
+        }
+    }
     bar.finish_and_clear();
     Ok(())
 }

@@ -826,9 +826,15 @@ mod tests {
             num_hidden_layers: dec,
             ..ArchConfig::default()
         };
-        assert!(!supports_translate(&mk(32, 4)), "large-v3-turbo must drop translate");
+        assert!(
+            !supports_translate(&mk(32, 4)),
+            "large-v3-turbo must drop translate"
+        );
         for (enc, dec) in [(4u32, 4u32), (6, 6), (12, 12), (24, 24), (32, 32)] {
-            assert!(supports_translate(&mk(enc, dec)), "{enc}/{dec} keeps translate");
+            assert!(
+                supports_translate(&mk(enc, dec)),
+                "{enc}/{dec} keeps translate"
+            );
         }
     }
 

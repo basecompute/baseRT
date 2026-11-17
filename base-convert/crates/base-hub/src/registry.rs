@@ -63,6 +63,7 @@ pub enum ModelRef {
         arch: Option<String>,
         size: Option<u64>,
         sha256: Option<String>,
+        parts_sha256: Option<Vec<String>>,
     },
     /// Arbitrary HF repo of source safetensors — download and convert locally.
     HuggingFace {
@@ -101,6 +102,10 @@ pub struct ModelEntry {
     pub source_kind: SourceKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// The repo file the `.base` was pulled from (`hub.json`), or that a
+    /// catalog row publishes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// Common interface implemented by each individual source.
@@ -199,6 +204,10 @@ impl LocalRegistry {
             installed: true,
             source_kind: SourceKind::Local,
             path: Some(artifact.to_path_buf()),
+            file: cache::read_sidecar(variant_dir)
+                .ok()
+                .flatten()
+                .and_then(|s| s.file),
         })
     }
 
@@ -256,14 +265,16 @@ impl CatalogRegistry {
         }
     }
 
-    fn backend_ok(e: &crate::catalog::CatalogEntry) -> bool {
+    /// Whether this client can run `e`: a universal row, or one for its backend.
+    pub fn backend_ok(e: &crate::catalog::CatalogEntry) -> bool {
         e.backend
             .as_deref()
             .map(|b| b == Self::client_backend())
             .unwrap_or(true)
     }
 
-    fn entry_to_ref(e: &crate::catalog::CatalogEntry) -> ModelRef {
+    /// The [`ModelRef`] a catalog row resolves to.
+    pub fn entry_to_ref(e: &crate::catalog::CatalogEntry) -> ModelRef {
         ModelRef::Catalog {
             id: e.id.clone(),
             hf_repo: e.hf_repo.clone(),
@@ -273,6 +284,7 @@ impl CatalogRegistry {
             arch: e.arch.clone(),
             size: e.size,
             sha256: e.sha256.clone(),
+            parts_sha256: e.parts_sha256.clone(),
         }
     }
 
@@ -287,6 +299,74 @@ impl CatalogRegistry {
             Some(b) => b == w,
             None => entry_quant == want,
         }
+    }
+
+    /// The catalog row for `id` (exact id first, then case-insensitive),
+    /// whatever its quant or backend: where `pull --file` finds the repo a
+    /// cataloged id's files live in.
+    pub fn entry(&self, id: &str) -> Option<&crate::catalog::CatalogEntry> {
+        let rows = &self.catalog.models;
+        rows.iter()
+            .find(|e| e.id == id)
+            .or_else(|| rows.iter().find(|e| e.id.eq_ignore_ascii_case(id)))
+    }
+
+    /// Every catalog row of `id`, whatever its quant or backend: where a
+    /// `pull --file` finds the variant and checksums of a file the catalog
+    /// publishes. Rows of the exact id when there are any, else its
+    /// case-insensitive aliases, as resolution prefers.
+    pub fn rows<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> impl Iterator<Item = &'a crate::catalog::CatalogEntry> {
+        let exact = self.catalog.models.iter().any(|e| e.id == id);
+        self.catalog.models.iter().filter(move |e| {
+            if exact {
+                e.id == id
+            } else {
+                e.id.eq_ignore_ascii_case(id)
+            }
+        })
+    }
+
+    /// The drafter `basert serve --speculate auto` serves `target_id` with:
+    /// the sidecar row marked `speculator_auto` that drafts for that target
+    /// (`speculator_for`) and runs on this client, lowest rank first, its
+    /// default-q4 file (the measured one) before any other. None when the
+    /// catalog marks none.
+    pub fn auto_drafter(&self, target_id: &str) -> Option<&crate::catalog::CatalogEntry> {
+        self.catalog
+            .models
+            .iter()
+            .filter(|e| {
+                e.speculator_auto == Some(true)
+                    && e.speculator_for
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case(target_id))
+                    && Self::backend_ok(e)
+            })
+            .min_by_key(|e| {
+                (
+                    e.speculator_rank.unwrap_or(u32::MAX),
+                    u8::from(e.quant != "default-q4"),
+                )
+            })
+    }
+
+    /// The id of the one catalog target that publishes a file named `file`
+    /// (`Qwen3.8-27B-Q4.base`): how a bundle served by path, outside the hub
+    /// cache, is matched to its catalog row. None when no target row, or
+    /// rows of more than one id, carry that name; a sidecar's file never
+    /// names a target.
+    pub fn target_id_of_file(&self, file: &str) -> Option<&str> {
+        let mut ids = self
+            .catalog
+            .models
+            .iter()
+            .filter(|e| e.speculator_for.is_none() && e.file == file)
+            .map(|e| e.id.as_str());
+        let first = ids.next()?;
+        ids.all(|id| id == first).then_some(first)
     }
 
     /// Quant-agnostic, backend-aware resolve.
@@ -325,7 +405,11 @@ impl CatalogRegistry {
     /// fall through to a convert-on-pull of a bundle this client can't run. When
     /// the id+quant simply isn't published, both fields are `(None, false)` and
     /// the caller may convert-on-pull from the source repo.
-    pub fn resolve_with_status(&self, id: &str, want_quant: Option<&str>) -> (Option<ModelRef>, bool) {
+    pub fn resolve_with_status(
+        &self,
+        id: &str,
+        want_quant: Option<&str>,
+    ) -> (Option<ModelRef>, bool) {
         let is_exact = |e: &crate::catalog::CatalogEntry| e.id == id;
         let is_id = |e: &crate::catalog::CatalogEntry| e.id == id || e.id.eq_ignore_ascii_case(id);
 
@@ -351,13 +435,20 @@ impl CatalogRegistry {
             Some(w) => Self::quant_matches(&e.quant, w),
         };
 
-        let matched: Vec<&crate::catalog::CatalogEntry> =
-            self.catalog.models.iter().filter(|e| is_id(e) && quant_ok(e)).collect();
+        let matched: Vec<&crate::catalog::CatalogEntry> = self
+            .catalog
+            .models
+            .iter()
+            .filter(|e| is_id(e) && quant_ok(e))
+            .collect();
         if matched.is_empty() {
             return (None, false); // this id+quant isn't published — convert-on-pull
         }
-        let mut runnable: Vec<&crate::catalog::CatalogEntry> =
-            matched.iter().copied().filter(|e| Self::backend_ok(e)).collect();
+        let mut runnable: Vec<&crate::catalog::CatalogEntry> = matched
+            .iter()
+            .copied()
+            .filter(|e| Self::backend_ok(e))
+            .collect();
         if runnable.is_empty() {
             // Published, but only for a backend this client can't run.
             if let Some(e) = matched.first() {
@@ -398,6 +489,7 @@ impl Registry for CatalogRegistry {
                 installed: false,
                 source_kind: SourceKind::Catalog,
                 path: None,
+                file: Some(e.file.clone()).filter(|f| !f.is_empty()),
             })
             .collect())
     }
@@ -438,6 +530,24 @@ impl MergedRegistry {
         let root = cache::models_dir()?;
         let catalog = CatalogRegistry::load(&root);
         Ok(Self::new(root, catalog))
+    }
+
+    /// [`Self::load`] with no network: the catalog as cached, else the
+    /// bundled copy ([`Catalog::load_cached`]), for a caller told to stay
+    /// offline (`basert serve --offline`).
+    pub fn load_cached() -> Result<Self> {
+        let root = cache::models_dir()?;
+        let catalog = CatalogRegistry::from_catalog(Catalog::load_cached(&root));
+        Ok(Self::new(root, catalog))
+    }
+
+    /// Build from the cache root + the hosted catalog fetched past the cache
+    /// ([`Catalog::load_fresh`]): what a pull turns to when the cached rows
+    /// look behind the Hub. None when it cannot be fetched.
+    pub fn load_fresh() -> Option<Self> {
+        let root = cache::models_dir().ok()?;
+        let catalog = Catalog::load_fresh(&root)?;
+        Some(Self::new(root, CatalogRegistry::from_catalog(catalog)))
     }
 
     /// Resolve an id to a concrete [`ModelRef`].
@@ -551,7 +661,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let reg = MergedRegistry::new(tmp.path(), catalog_with_one());
 
-        match reg.resolve("basecompute/demo", "main", None, false).unwrap() {
+        match reg
+            .resolve("basecompute/demo", "main", None, false)
+            .unwrap()
+        {
             ModelRef::Catalog {
                 hf_repo, variant, ..
             } => {
@@ -590,7 +703,8 @@ mod tests {
 
         // Asking for q4 → the installed artifact.
         assert!(matches!(
-            reg.resolve("basecompute/demo", "main", Some("q4"), false).unwrap(),
+            reg.resolve("basecompute/demo", "main", Some("q4"), false)
+                .unwrap(),
             ModelRef::Local { .. }
         ));
         // Asking for q8 must NOT return the installed q4 — quant-aware catalog
@@ -610,8 +724,10 @@ mod tests {
     // Build a CatalogRegistry from inline JSON (test helper).
     fn catalog_json(models: &str) -> CatalogRegistry {
         CatalogRegistry::from_catalog(
-            Catalog::from_json(&format!(r#"{{"schema":1,"updated":"x","models":[{models}]}}"#))
-                .unwrap(),
+            Catalog::from_json(&format!(
+                r#"{{"schema":1,"updated":"x","models":[{models}]}}"#
+            ))
+            .unwrap(),
         )
     }
 
@@ -651,7 +767,10 @@ mod tests {
         for rows in [format!("{uni},{nat}"), format!("{nat},{uni}")] {
             let reg = catalog_json(&rows);
             reg.catalog.validate().unwrap(); // both rows coexist (backend in key)
-            match reg.resolve_variant("basecompute/hybrid", Some("q4")).unwrap() {
+            match reg
+                .resolve_variant("basecompute/hybrid", Some("q4"))
+                .unwrap()
+            {
                 ModelRef::Catalog { file, variant, .. } => {
                     assert_eq!(file, format!("hybrid-Q4-{be}.base"));
                     assert_eq!(variant, format!("{be}-q4")); // distinct cache dir
@@ -672,23 +791,37 @@ mod tests {
         }
         // A quant that isn't published: absent (not backend-locked) → the merged
         // resolver may convert-on-pull.
-        assert_eq!(reg.resolve_with_status("basecompute/demo", Some("q8")), (None, false));
+        assert_eq!(
+            reg.resolve_with_status("basecompute/demo", Some("q8")),
+            (None, false)
+        );
     }
 
     #[test]
     fn resolve_backend_locked_reports_status_not_absent() {
-        let foreign = if CatalogRegistry::client_backend() == "cuda" { "metal" } else { "cuda" };
+        let foreign = if CatalogRegistry::client_backend() == "cuda" {
+            "metal"
+        } else {
+            "cuda"
+        };
         let reg = catalog_json(&format!(
             r#"{{"id":"basecompute/locked","hf_repo":"basecompute/locked","file":"locked-Q4.base","arch":"llama","quant":"{foreign}-q4","backend":"{foreign}"}}"#
         ));
         // Published for this id+quant, but only for a foreign backend → refuse,
         // and flag it distinctly from "absent" so the caller errors (below).
-        assert_eq!(reg.resolve_with_status("basecompute/locked", Some("q4")), (None, true));
+        assert_eq!(
+            reg.resolve_with_status("basecompute/locked", Some("q4")),
+            (None, true)
+        );
     }
 
     #[test]
     fn merged_resolve_refuses_backend_locked_no_hf_fallthrough() {
-        let foreign = if CatalogRegistry::client_backend() == "cuda" { "metal" } else { "cuda" };
+        let foreign = if CatalogRegistry::client_backend() == "cuda" {
+            "metal"
+        } else {
+            "cuda"
+        };
         let tmp = tempfile::tempdir().unwrap();
         let reg = MergedRegistry::new(
             tmp.path(),
@@ -698,7 +831,9 @@ mod tests {
         );
         // Must ERROR (backend-locked), not fall through to a raw HF download of a
         // bundle this client can't run.
-        assert!(reg.resolve("basecompute/locked", "main", Some("q4"), false).is_err());
+        assert!(reg
+            .resolve("basecompute/locked", "main", Some("q4"), false)
+            .is_err());
     }
 
     #[test]
@@ -719,7 +854,10 @@ mod tests {
         let uni = cache::variant_dir(tmp.path(), "basecompute/h", "default-q4").unwrap();
         std::fs::create_dir_all(&uni).unwrap();
         std::fs::write(cache::base_artifact_path(&uni), b"universal").unwrap();
-        match reg.resolve("basecompute/h", "main", Some("q4"), false).unwrap() {
+        match reg
+            .resolve("basecompute/h", "main", Some("q4"), false)
+            .unwrap()
+        {
             ModelRef::Catalog { variant, .. } => assert_eq!(variant, format!("{be}-q4")),
             other => panic!("cached universal must not shadow the native pick, got {other:?}"),
         }
@@ -760,10 +898,28 @@ mod tests {
             r#"{"id":"basecompute/CamelModel","hf_repo":"basecompute/alias","file":"alias-Q4.base","arch":"llama","quant":"default-q4"},
                {"id":"basecompute/camelmodel","hf_repo":"basecompute/exact","file":"exact-Q4.base","arch":"llama","quant":"default-q4"}"#,
         );
-        match reg.resolve_variant("basecompute/camelmodel", Some("q4")).unwrap() {
+        match reg
+            .resolve_variant("basecompute/camelmodel", Some("q4"))
+            .unwrap()
+        {
             ModelRef::Catalog { hf_repo, .. } => assert_eq!(hf_repo, "basecompute/exact"),
             other => panic!("exact id must win, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rows_prefer_the_exact_id_over_case_aliases() {
+        let reg = catalog_json(
+            r#"{"id":"basecompute/CamelModel","hf_repo":"basecompute/alias","file":"alias-Q4.base","quant":"default-q4"},
+               {"id":"basecompute/camelmodel","hf_repo":"basecompute/exact","file":"exact-Q4.base","quant":"default-q4"}"#,
+        );
+        let repos = |id| reg.rows(id).map(|e| e.hf_repo.as_str()).collect::<Vec<_>>();
+        assert_eq!(repos("basecompute/camelmodel"), ["basecompute/exact"]);
+        assert_eq!(repos("basecompute/CamelModel"), ["basecompute/alias"]);
+        assert_eq!(
+            repos("basecompute/CAMELMODEL"),
+            ["basecompute/alias", "basecompute/exact"]
+        );
     }
 
     #[test]
@@ -800,7 +956,10 @@ mod tests {
         std::fs::create_dir_all(&vdir).unwrap();
         std::fs::write(cache::base_artifact_path(&vdir), b"not a real base").unwrap();
 
-        match reg.resolve("basecompute/demo", "main", None, false).unwrap() {
+        match reg
+            .resolve("basecompute/demo", "main", None, false)
+            .unwrap()
+        {
             ModelRef::Local { variant, .. } => assert_eq!(variant, "default-q4"),
             other => panic!("expected Local, got {other:?}"),
         }

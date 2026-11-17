@@ -34,7 +34,9 @@ fn make_header() -> Header {
         layers: vec![],
         tensors: vec![],
         mmproj: None,
+        speculator: None,
         calibration: None,
+        provenance: None,
         sig: None,
     }
 }
@@ -61,6 +63,8 @@ fn entry(name: &str) -> TensorEntry {
         flags: TensorFlags::empty(),
         checksum_xxh64: None,
         source_ggml_type: None,
+        algo: None,
+        awq_alpha: None,
     }
 }
 

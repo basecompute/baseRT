@@ -23,6 +23,12 @@ public enum BaseRTEngine {
         baseRT_set_paged_kv(enable ? 1 : 0)
     }
 
+    /// The prefill's Neural Engine split for subsequent loads: on by default;
+    /// false runs every prefill on the GPU alone.
+    public static func setNeuralEngine(_ enable: Bool) {
+        baseRT_set_neural_engine(enable ? 1 : 0)
+    }
+
     /// Max in-flight batch size for batched decode (sizes the logits scratch).
     public static func setMaxBatchSize(_ n: Int32) {
         baseRT_set_max_batch_size(n)

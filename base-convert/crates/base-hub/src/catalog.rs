@@ -68,6 +68,13 @@ pub struct CatalogEntry {
     /// Optional integrity check for the downloaded `.base`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// For a bundle the Hub's file cap split into `<file>.part-NNN` pieces:
+    /// the sha256 of each part, in order. The Hub knows only these, never a
+    /// whole-file hash, so this is what proves the listing still describes
+    /// the bundle `sha256` was pinned against, and what each part is checked
+    /// against as it lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parts_sha256: Option<Vec<String>>,
     /// Backend requirement. `None` = universal (runs on every backend —
     /// f16/bf16 weights and bf16-scale q4/q8 bundles). `Some("cuda")` /
     /// `Some("metal")` restricts resolution to clients of that backend
@@ -76,6 +83,41 @@ pub struct CatalogEntry {
     /// not at load after 30 GB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// Speculative-decoding role. On a target bundle: the in-bundle
+    /// speculator it carries (`"mtp"` — `superfluid serve --speculate
+    /// mtp-head` works out of the box). On a drafter sidecar row: its kind
+    /// (`"dflash"` / `"dspark"` / `"eagle3"`), served with
+    /// `--speculate <kind>:<pulled path>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculator: Option<String>,
+    /// Target rows with an in-bundle head: the head's version, when
+    /// `basert add-speculator --head-version` recorded one
+    /// (`speculator.config.head_version`). A client serving with
+    /// `--speculate` pulls the file again when its own head's version is
+    /// not this one. Absent: unversioned, only a missing head is stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculator_version: Option<String>,
+    /// Sidecar rows only: the catalog id of the target the drafter was
+    /// trained for (it shares that target's embedding / lm_head and taps
+    /// its hidden states). superfluid's `--speculate auto` pairs an installed
+    /// drafter with its target through this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculator_for: Option<String>,
+    /// Sidecar rows only: this drafter's preference among the sidecars of
+    /// the same target, lower first. `--speculate auto` takes the
+    /// lowest-ranked installed one; unranked sidecars follow, in strategy
+    /// order (dspark, dflash, eagle3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculator_rank: Option<u32>,
+    /// Sidecar rows only: `basert serve --speculate auto` serves the target
+    /// (`speculator_for`) with this drafter, ahead of a head the target's
+    /// own bundle carries, and pulls it when it is not installed. Set where
+    /// the drafter was measured faster than that head (Qwen3.8-27B and
+    /// Qwen3.6-35B-A3B with their DFlash2 drafters, Metal). Absent: `auto`
+    /// is left to superfluid, which takes an in-bundle head first, then an
+    /// installed drafter by rank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculator_auto: Option<bool>,
 }
 
 fn default_file() -> String {
@@ -118,6 +160,28 @@ impl Catalog {
             }
             None => Self::cache_or_bundled(&cache),
         }
+    }
+
+    /// The catalog as cached under `cache_dir` (whatever its age), else the
+    /// bundled copy, never fetched: what [`Self::load`] gives with
+    /// `$BASERT_CATALOG_OFFLINE` set, for a caller told to stay offline.
+    pub fn load_cached(cache_dir: &Path) -> Self {
+        Self::cache_or_bundled(&cache_dir.join(CACHE_FILE))
+    }
+
+    /// The hosted catalog fetched past the cache, and written to it: for a
+    /// caller with reason to think the cache is behind the Hub — a pull whose
+    /// bytes fail the cached row's sha256, when a bundle's row and file changed
+    /// together and the cache, under its TTL, has not looked since. None
+    /// offline (`BASERT_CATALOG_OFFLINE`) or when the fetch fails; the caller
+    /// then keeps what it had.
+    pub fn load_fresh(cache_dir: &Path) -> Option<Self> {
+        if std::env::var_os("BASERT_CATALOG_OFFLINE").is_some() {
+            return None;
+        }
+        let c = Self::fetch(&catalog_url())?;
+        let _ = Self::write_cache(&cache_dir.join(CACHE_FILE), &c);
+        Some(c)
     }
 
     /// Parse the cache regardless of age, then fall back to the bundled copy,
@@ -215,6 +279,17 @@ impl Catalog {
             if e.quant.is_empty() {
                 anyhow::bail!("{}: empty quant", e.id);
             }
+            if let Some(parts) = &e.parts_sha256 {
+                if parts.is_empty() {
+                    anyhow::bail!("{}: parts_sha256 is present but empty", e.id);
+                }
+                if let Some(bad) = parts
+                    .iter()
+                    .find(|p| p.len() != 64 || !p.bytes().all(|b| b.is_ascii_hexdigit()))
+                {
+                    anyhow::bail!("{}: parts_sha256 entry {bad:?} is not a sha256", e.id);
+                }
+            }
             // A model may carry a universal row AND a per-backend variant of the
             // same quant (the resolver prefers the backend-native one); those are
             // distinguished by `backend`, so the uniqueness key includes it. Two
@@ -290,7 +365,10 @@ mod tests {
     #[test]
     fn bundled_catalog_is_populated_and_resolves_default_q4() {
         let cat = Catalog::bundled().unwrap();
-        assert!(!cat.models.is_empty(), "bundled catalog should not be empty");
+        assert!(
+            !cat.models.is_empty(),
+            "bundled catalog should not be empty"
+        );
         // Every entry carries the fields the resolver/installer need.
         for e in &cat.models {
             assert!(e.id.starts_with("basecompute/"), "id: {}", e.id);

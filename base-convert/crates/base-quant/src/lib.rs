@@ -24,8 +24,8 @@ pub mod nvfp4;
 pub mod profile;
 pub mod rtn;
 
-pub use profile::{QuantProfile, ResolvedQuant, RuleEntry};
-pub use rtn::{pack as pack_rtn, unpack as unpack_rtn, RtnConfig};
+pub use profile::{QuantAlgo, QuantProfile, ResolvedQuant, RuleEntry};
+pub use rtn::{pack as pack_rtn, pack_codes, unpack as unpack_rtn, RtnConfig};
 
 /// One packed tensor with its three byte streams.
 #[derive(Debug, Clone)]

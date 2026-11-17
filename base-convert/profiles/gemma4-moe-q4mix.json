@@ -50,10 +50,11 @@
     {"pattern": "**.ffn_gate_exps.scale", "dtype": "f16"},
     {"pattern": "**.ffn_gate_up_exps.scale", "dtype": "f16"},
 
+    {"pattern": "**.self_attn.k_proj.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 64},
     {"pattern": "**.{q,k,v,o}_proj.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
     {"pattern": "**.{q,k,v,o}_proj.linear.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
     {"pattern": "**.attn_q.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
-    {"pattern": "**.attn_k.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
+    {"pattern": "**.attn_k.weight", "dtype": "base_q8", "scale_dtype": "bf16", "group_size": 64},
     {"pattern": "**.attn_v.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
     {"pattern": "**.attn_output.weight", "dtype": "base_q4", "scale_dtype": "bf16", "group_size": 64},
 

@@ -69,7 +69,11 @@ fn mlx_dir(
         "model_type": "test",
         "quantization": { "bits": bits, "group_size": 32 },
     });
-    std::fs::write(dir.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
     write_safetensors(
         &dir.join("model.safetensors"),
         &[
@@ -174,4 +178,121 @@ fn unsupported_bits_is_a_clear_error() {
     );
     let err = mlx.tensor_to_f32("layer.weight").unwrap_err().to_string();
     assert!(err.contains("unsupported bits=7"), "got: {err}");
+}
+
+/// Decode a `base_q4` payload the way the runtime kernels do:
+/// `value = q * scale + bias`, codes two per byte, low nibble first.
+/// Deliberately independent of `base-quant` (which this crate does not
+/// depend on) so the test checks the *layout contract*, not shared code.
+fn decode_base_q4(packed: &[u8], scales: &[u8], biases: &[u8], group_size: usize) -> Vec<f32> {
+    let total = packed.len() * 2;
+    (0..total)
+        .map(|i| {
+            let byte = packed[i / 2];
+            let q = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            let g = i / group_size;
+            let scale = half::f16::from_le_bytes([scales[g * 2], scales[g * 2 + 1]]).to_f32();
+            let bias = half::f16::from_le_bytes([biases[g * 2], biases[g * 2 + 1]]).to_f32();
+            (q as f32) * scale + bias
+        })
+        .collect()
+}
+
+/// The whole point of the transplant: MLX's 4-bit bytes, reinterpreted
+/// as `base_q4`, decode to exactly what MLX itself produces. Checked
+/// against `B4_EXPECTED` — mlx.core.dequantize's own output — so this
+/// pins the nibble order and scale/bias layout against ground truth
+/// rather than against our own reader.
+#[test]
+fn passthrough_decodes_identically_to_mlx_4bit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mlx = mlx_dir(
+        tmp.path(),
+        4,
+        &[3, 8],
+        &[3, 2],
+        B4_PACKED,
+        B4_SCALES,
+        B4_BIASES,
+    );
+
+    let p = mlx
+        .packed_base_q4("layer.weight", 32)
+        .unwrap()
+        .expect("4-bit gs=32 tensor should transplant");
+    assert_eq!(p.group_size, 32);
+    assert!(!p.narrowed_from_bf16, "f16 scales copy verbatim");
+    assert_eq!(p.out_of_f16_range, 0);
+    // Verbatim means verbatim: the weight bytes are MLX's own.
+    assert_eq!(p.packed_weights, u32_bytes(B4_PACKED));
+    assert_eq!(p.scales, u16_bytes(B4_SCALES));
+    assert_eq!(p.biases, u16_bytes(B4_BIASES));
+
+    let got = decode_base_q4(&p.packed_weights, &p.scales, &p.biases, 32);
+    assert_eq!(got.len(), B4_EXPECTED.len());
+    for (i, (g, e)) in got.iter().zip(B4_EXPECTED).enumerate() {
+        assert!(
+            (g - e).abs() <= TOL,
+            "element {i}: base_q4 decode {g}, mlx says {e}"
+        );
+    }
+}
+
+/// Anything that is not bit-for-bit the same scheme must decline rather
+/// than hand over bytes that would be misread. The caller then falls
+/// back to dequant → requant.
+#[test]
+fn passthrough_declines_on_scheme_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mlx = mlx_dir(
+        tmp.path(),
+        4,
+        &[3, 8],
+        &[3, 2],
+        B4_PACKED,
+        B4_SCALES,
+        B4_BIASES,
+    );
+    // Right bits, wrong group size: base_q4 at gs=64 cannot express a
+    // tensor whose scales are per-32.
+    assert!(mlx.packed_base_q4("layer.weight", 64).unwrap().is_none());
+
+    // Wrong bits: 6-bit codes cross byte boundaries, so the bytes are
+    // not a base_q4 nibble stream.
+    let tmp6 = tempfile::tempdir().unwrap();
+    let mlx6 = mlx_dir(
+        tmp6.path(),
+        6,
+        &[3, 12],
+        &[3, 2],
+        B6_PACKED,
+        B6_SCALES,
+        B6_BIASES,
+    );
+    assert!(mlx6.packed_base_q4("layer.weight", 32).unwrap().is_none());
+}
+
+/// A symmetric MLX tensor ships no `.biases`; `base_q4` is asymmetric
+/// and has nowhere to get the missing half of the affine pair.
+#[test]
+fn passthrough_declines_without_biases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({
+        "model_type": "test",
+        "quantization": { "bits": 4, "group_size": 32 },
+    });
+    std::fs::write(
+        tmp.path().join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    write_safetensors(
+        &tmp.path().join("model.safetensors"),
+        &[
+            ("layer.weight", "U32", &[3, 8], u32_bytes(B4_PACKED)),
+            ("layer.scales", "F16", &[3, 2], u16_bytes(B4_SCALES)),
+        ],
+    );
+    let mlx = MlxDir::open(tmp.path()).unwrap();
+    assert!(mlx.packed_base_q4("layer.weight", 32).unwrap().is_none());
 }

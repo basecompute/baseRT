@@ -1,52 +1,57 @@
 # BaseRT
 
-**A fast LLM inference runtime for Apple Silicon (Metal).**
+**A fast LLM inference runtime for Apple Silicon, NVIDIA GB10 and AMD Strix.**
 
-BaseRT runs large language models locally on Apple Silicon. Pull a model from
-HuggingFace, chat with it, or serve an OpenAI-compatible API — all through one
-CLI, `basert`.
+BaseRT runs large language models locally on Apple Silicon (Metal), NVIDIA
+GB10 / DGX Spark (CUDA) and AMD Strix Halo / Strix Point (ROCm). Pull a model
+from the BaseRT catalog or Hugging Face, chat with it, or serve it over
+OpenAI-, Anthropic- and Ollama-compatible APIs — all through one CLI, `basert`.
 
 ## Why BaseRT
 
-- **Self-contained engine.** No GPU drivers, Python runtime, or extra
-  components to install — drop in the binaries and run.
+- **Self-contained engine.** One prebuilt bundle per platform: install it
+  with one command or your package manager and run.
 - **One CLI for everything.** `basert pull`, `basert chat`, `basert serve`,
-  `basert convert` — model management and runtime in one front-end.
-- **OpenAI-compatible server.** Chat, completions, embeddings, transcription,
-  rerank, tool calls, continuous batching, paged-KV, prefix caching.
-- **Its own `.base` format.** Affine quantization (Q2–Q8), optional AWQ
-  calibration, signed bundles.
+  `basert convert` — model management and runtime in one front-end, and
+  `basert self update` to stay current.
+- **A local API server.** `basert serve` runs
+  [Superfluid](https://github.com/basecompute/superfluid), our open-source
+  server: OpenAI-, Anthropic- and Ollama-compatible endpoints, tool calls,
+  continuous batching, prefix caching and speculative decoding.
+- **Its own `.base` format.** Affine quantization (Q2–Q8), GGUF k-quants,
+  optional AWQ calibration, signed bundles.
 - **Bindings everywhere.** Python, Node, Rust, Swift over a stable C API.
 
 ## Get started
 
-- **[Installation](getting-started/installation.md)** — get
-  the engine + the `basert` CLI on your `PATH`.
+- **[Installation](getting-started/installation.md)** — install the engine
+  and the `basert` CLI.
 - **[Quickstart](getting-started/quickstart.md)** —
   pull a model and chat in under a minute.
 - **[CLI reference](cli/reference.md)** — every command and
   flag.
-- **[Server API](reference/server-api.md)** — the
-  OpenAI-compatible endpoints.
+- **[Server API](reference/server-api.md)** — the endpoints `basert serve`
+  exposes.
 
 ## At a glance
 
 ```sh
-# install (see Installation for details)
-export PATH="$PWD/build:$PWD/base-convert/target/release:$PATH"
+curl -LsSf https://basecompute.co/install.sh | sh   # or: brew / pip / npm, see Installation
 
-basert pull Qwen/Qwen3-4B            # download + convert
-basert chat Qwen/Qwen3-4B            # interactive chat
-basert serve --model Qwen/Qwen3-4B --api-key "$(uuidgen)"   # OpenAI server
+basert pull basecompute/Qwen3-4B                     # download from the catalog
+basert chat basecompute/Qwen3-4B                     # interactive chat
+basert serve basecompute/Qwen3-4B --api-key "$(uuidgen)"   # API server on 127.0.0.1:8453
+basert self update                                   # the newest release
 ```
 
 ## How the pieces fit
 
 | Piece | Role |
 | --- | --- |
-| `libbaseRT.dylib` | The engine (Metal kernels embedded). Prebuilt binary. |
-| `basert-serve`, `basert-chat`, … | Runtime tools that link the engine. |
-| `basert` | The CLI: model hub + converter + launcher for the tools. |
+| `libbaseRT` | The engine (`.dylib` on macOS, `.so` on Linux). Prebuilt binary. |
+| `basert-chat`, `basert-complete`, `basert-bench`, … | Runtime tools that link the engine. |
+| `basert` | The CLI: model hub, converter, updater, and launcher for the tools. |
+| Superfluid | The server `basert serve` runs, installed on first use. |
 | `.base` files | The on-disk model format the runtime loads. |
 | Bindings | Python / Node / Rust / Swift over the C API (`baseRT.h`). |
 
@@ -54,12 +59,20 @@ basert serve --model Qwen/Qwen3-4B --api-key "$(uuidgen)"   # OpenAI server
 > **Open ecosystem**
 >
 > The engine ships as a prebuilt binary; this repository — the CLI, format,
-> headers, bindings, and docs — is open source (Apache-2.0). The engine is
+> headers, bindings, and docs — is open source (Apache-2.0), and so is
+> [Superfluid](https://github.com/basecompute/superfluid). The engine is
 > consumed as a [prebuilt release](reference/engine-releases.md), so you never
 > need to build it yourself.
 
 ## Requirements
 
-- Apple Silicon (M1 or later), macOS 14+.
-- Rust 1.85+ to build the `basert` CLI.
-- A binding toolchain as needed (Python 3.9+, Node 18+, Swift 5.9+).
+One of:
+
+- Apple Silicon (M1 or later), macOS 15+.
+- NVIDIA GB10 (DGX Spark), Linux arm64 with the CUDA 13 runtime.
+- AMD Strix Halo (Ryzen AI Max) or Strix Point / Gorgon Point (Ryzen AI 300
+  or 400 with a Radeon 890M or 880M), Linux x86-64 with the ROCm 10 runtime.
+
+See [Installation](getting-started/installation.md#requirements) for the OS,
+kernel and driver details. To build the `basert` CLI yourself you need Rust
+1.85+; the bindings need Python 3.9+, Node 18+ or Swift 5.9+.

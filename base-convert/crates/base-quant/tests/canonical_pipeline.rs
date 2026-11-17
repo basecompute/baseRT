@@ -64,8 +64,12 @@ fn make_header() -> Header {
             sha256: "0".repeat(64),
             filename: "synthetic-fp16.safetensors".into(),
         },
-        tokenizer: TokenizerBlob { fields: BTreeMap::new() },
-        config: ModelConfig { fields: BTreeMap::new() },
+        tokenizer: TokenizerBlob {
+            fields: BTreeMap::new(),
+        },
+        config: ModelConfig {
+            fields: BTreeMap::new(),
+        },
         metadata: BTreeMap::new(),
         target_backend: TargetBackend::Metal,
         quant_profile: "smoke-q4-q8".into(),
@@ -74,12 +78,19 @@ fn make_header() -> Header {
         layers: vec![],
         tensors: vec![],
         mmproj: None,
+        speculator: None,
         calibration: None,
+        provenance: None,
         sig: None,
     }
 }
 
-fn make_entry(name: &str, dtype: TensorDtype, shape: Vec<u64>, group_size: Option<u32>) -> TensorEntry {
+fn make_entry(
+    name: &str,
+    dtype: TensorDtype,
+    shape: Vec<u64>,
+    group_size: Option<u32>,
+) -> TensorEntry {
     TensorEntry {
         name: name.into(),
         dtype,
@@ -101,6 +112,8 @@ fn make_entry(name: &str, dtype: TensorDtype, shape: Vec<u64>, group_size: Optio
         flags: TensorFlags::empty(),
         checksum_xxh64: None,
         source_ggml_type: None,
+        algo: None,
+        awq_alpha: None,
     }
 }
 
@@ -261,7 +274,10 @@ fn canonical_pipeline_round_trip_smoke() {
                 let recon = unpack_rtn(&packed, orig_weights.len(), *cfg);
 
                 let levels = (1u32 << cfg.bits) as f32;
-                let max = orig_weights.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let max = orig_weights
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
                 let min = orig_weights.iter().cloned().fold(f32::INFINITY, f32::min);
                 let step = (max - min) / levels;
                 // Tolerance: one full step + small absolute fudge.

@@ -1,6 +1,6 @@
 {
   "name": "@baseRT/node",
-  "version": "0.2.3",
+  "version": "0.5.2",
   "private": true,
   "description": "Node.js bindings for BaseRT — LLM inference engine for Apple Silicon (Metal)",
   "main": "dist/index.js",
@@ -32,7 +32,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/baseRT/baseRT",
+    "url": "https://github.com/basecompute/baseRT",
     "directory": "bindings/node"
   },
   "files": [

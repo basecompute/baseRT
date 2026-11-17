@@ -27,6 +27,22 @@ typedef enum {
 } BaseRTErrorCode;
 
 /// Model configuration extracted from weight file metadata.
+///
+/// ABI NOTE (0.2.4): this struct's layout CHANGED. New family support landed
+/// its fields beside the ones they belong with (`ssm_*` next to `gdn_*`, MLA
+/// and gpt-oss fields beside the attention block) rather than appended, so
+/// every offset after the first insertion moved, and the struct grew. That is
+/// a deliberate readability choice under the pre-1.0 clause in baseRT.h ("the
+/// above is intent, not contract"), not an oversight — but it means a caller
+/// built against 0.2.3 MUST be recompiled against this header. Note that
+/// appending would not have been sufficient on its own either:
+/// `baseRT_get_config` returns this struct BY VALUE, so growth alone
+/// overruns an older caller's return slot whatever the field order.
+///
+/// Mismatches are detectable rather than silent: `baseRT_model_config_sizeof()`
+/// reports the library's own `sizeof`, and the language bindings compare it
+/// against their mirrored definition at load time. Check it if you bind to
+/// this struct from outside the tree.
 typedef struct {
     // Decoder (or decoder-only LLM) parameters
     uint32_t dim;                     // embedding dimension
@@ -106,6 +122,18 @@ typedef struct {
     uint32_t gdn_value_head_dim;  // linear_value_head_dim
     uint32_t gdn_conv_kernel;     // linear_conv_kernel_dim (short causal conv width)
 
+    // ── Nemotron-H hybrid Mamba-2 SSM (0 = not a Mamba-2 hybrid) ─────
+    // Per-layer schedule: linear_attn_layers bit set = Mamba-2 layer,
+    // n_kv_heads_per_layer[il] > 0 = attention layer, otherwise (MoE) FFN.
+    // The gdn_* fields above are additionally aliased at load so the shared
+    // GDNStateCache sizes the SSM state pool: nk=ssm_num_groups,
+    // khd=ssm_state_size, nv=ssm_num_heads, vhd=ssm_inner/ssm_heads.
+    uint32_t ssm_state_size;   // per-head state width N (Nemotron 3 Nano: 128)
+    uint32_t ssm_conv_kernel;  // depthwise causal conv taps (4)
+    uint32_t ssm_num_groups;   // B/C groups (8)
+    uint32_t ssm_inner_size;   // heads * head_dim (4096)
+    uint32_t ssm_num_heads;    // SSM heads (64)
+
     // Mixture-of-Experts (0 = dense model).
     // Gemma 4 26B-A4B: n_experts=128, n_experts_used=8, n_experts_shared=1 (via dense ffn.*), expert_gating=0
     // (softmax), norm_topk_prob=0 Qwen3.6-35B-A3B (qwen35moe): n_experts=128, n_experts_used=8, n_experts_shared=0,
@@ -117,6 +145,9 @@ typedef struct {
     uint8_t expert_gating;      // 0 = softmax, 1 = sigmoid
     uint8_t norm_topk_prob;     // 1 = renormalize top-k weights to sum to 1 (Qwen), 0 = leave as-is (Gemma)
     uint8_t _moe_pad[2];        // align to 4 bytes
+    // Routed-expert output scale (DeepSeek/Nemotron routed_scaling_factor;
+    // applied to the renormalized top-k weights). 0 = disabled (treat as 1).
+    float expert_weights_scale;
 
     // Vision tower (Gemma 4, PaliGemma, Llava-style multimodal).
     // All zero = no vision tower.
@@ -234,6 +265,39 @@ typedef struct {
     uint32_t vision_pos_embed_w;  // learned position grid width  (e.g. 32)
     uint32_t vision_adapter_dim;  // projector hidden width (`projector_hidden_size`, e.g. 4096)
     uint32_t video_token_id;      // text-side placeholder token for video features (0 = none)
+
+    // ── GLM 5.2 / glm-dsa: Multi-head Latent Attention + MoE ─────────
+    // DeepSeek-V3.2-style decoder. All zero = not an MLA model. The
+    // struct's uniform head_dim can't express MLA's compressed/asymmetric
+    // Q/K/V dims, so the MLA encoder (src/core/models/glm_dsa.cpp) reads
+    // these explicit fields instead. See arch_descriptor.h is_mla flag.
+    uint32_t q_lora_rank;   // MLA query compression rank (attn_q_a output); 0 = not MLA
+    uint32_t kv_lora_rank;  // MLA KV latent rank (attn_kv_a_mqa kv part); K cache row = kv_lora_rank + qk_rope_head_dim
+    uint32_t qk_nope_head_dim;       // per-head non-positional Q/K dim (attends in latent space via k_b)
+    uint32_t qk_rope_head_dim;       // per-head decoupled-RoPE Q/K dim (the only rotated part; NORM/GPT-J rope)
+    uint32_t v_head_dim;             // per-head value dim after v_b up-projection
+    float routed_scaling_factor;     // routed-expert output scale (DeepSeek routed_scaling_factor); 0 = none
+    uint32_t first_k_dense_replace;  // first N layers use a dense SwiGLU FFN instead of MoE (GLM 5.2 = 3)
+    uint32_t nextn_predict_layers;   // Multi-Token-Prediction head layers (dropped at convert; recorded only)
+    // DSA lightning-indexer geometry. Loaded but UNUSED by the dense MLA
+    // path (llama.cpp's glm-dsa never runs the indexer at any context
+    // length). Kept for a future true-sparse-attention path. 0 = none.
+    uint32_t indexer_head_count;
+    uint32_t indexer_key_length;
+    uint32_t indexer_top_k;
+    // ── gpt-oss (0 / empty = not applicable) ─────────────────────────
+    // YaRN correction-range betas (HF `rope_scaling.beta_fast` / `beta_slow`);
+    // used with rope_scaling_type == 4 (yarn). 0 = the YaRN defaults (32 / 1).
+    float rope_yarn_beta_fast;
+    float rope_yarn_beta_slow;
+    // Clamped SwiGLU: gate = min(gate, limit), up = clamp(up, -limit, limit),
+    // act = (up + 1) * gate * sigmoid(alpha * gate). limit 0 = plain SwiGLU.
+    float swiglu_limit;
+    float swiglu_alpha;
+    uint8_t attention_sinks;     // 1 = learned per-head sink logits (`layers.N.attention.sinks`)
+    uint8_t attention_bias;      // 1 = q/k/v/o projections carry biases
+    uint8_t rope_yarn_truncate;  // 1 = floor/ceil the YaRN correction range (HF default); gpt-oss: 0
+    uint8_t _gptoss_pad;         // align to 4 bytes
 } BaseRTModelConfig;
 
 /// Transcription result statistics.

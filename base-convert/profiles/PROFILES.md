@@ -21,12 +21,13 @@ tensor, matched by glob pattern. Pass one with `--profile <file.json>`.
   from most-specific to the catch-all `**`.
 - `dtype` — `f16`, `bf16`, `f32`, or a packed quant: `base_q2` … `base_q8`
   (see `CANONICAL_QUANT_SPEC.md` for the layouts).
-- Optional `calibration` block enables AWQ:
-  ```json
-  "calibration": { "method": "awq", "tokens": 1024, "dataset": "wikitext-103" }
-  ```
-  AWQ needs a calibration corpus; download WikiText-103 and pass
-  `--calib-file <wiki.train.raw>`.
+- Optional `"algo": "awq"` on a rule asks for AWQ on the tensors it matches
+  (the default is `"rtn"`, round to nearest). AWQ also needs an
+  activation-stats sidecar, passed to `basert convert` with
+  `--awq-profile <sidecar.json>`; see
+  [AWQ calibration](../../docs/guides/converting.md#awq-calibration).
+- A top-level `calibration` block is accepted and recorded, but does not turn
+  AWQ on; the per-rule `algo` does.
 
 ## Bundled profiles
 
