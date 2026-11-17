@@ -3,7 +3,7 @@
 //! Profiles are reusable JSON configs that name a set of per-tensor
 //! quant rules. The converter takes `--profile <path>` and the
 //! resulting bundle records the profile name in `quant_profile` for
-//! audit. See `tools/base-convert/profiles/*.json`.
+//! audit. See the converter's `profiles/*.json`.
 //!
 //! Glob syntax (per `CANONICAL_QUANT_SPEC.md`):
 //!   - `*`    matches anything except `.`

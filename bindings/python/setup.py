@@ -6,18 +6,19 @@ long_description = (here / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="baseRT",
-    version="0.5.1",
-    description="Python bindings for the BaseRT LLM inference engine (Apple Silicon / Metal)",
+    version="0.5.2",
+    description="Python bindings for the BaseRT LLM inference engine",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    author="Prabod Rathnayaka",
-    license="MIT",
+    author="BaseCompute",
+    license="Apache-2.0",
     python_requires=">=3.9",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
         "Operating System :: MacOS",
+        "Operating System :: POSIX :: Linux",
         "Programming Language :: Python :: 3",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],

@@ -11,7 +11,7 @@ See [FORMAT.md](FORMAT.md) for the on-disk layout.
 | Crate           | Role                                                   |
 |-----------------|--------------------------------------------------------|
 | `base-format`   | `.base` file reader/writer, header schema              |
-| `base-quant`    | Packing routines: `base_q4`, `base_q8`, `mxfp4`, `nvfp4` |
+| `base-quant`    | Packing routines: `base_q2` … `base_q8`, `mxfp4`, `nvfp4`; quant profiles |
 | `base-awq`      | Full AWQ calibration (clip + per-layer alpha search)   |
 | `base-readers`  | Input readers: GGUF, MLX-safetensors, HF-safetensors   |
 | `base-arch`     | Per-architecture tensor-name normalization             |
@@ -28,7 +28,8 @@ cargo build --release -p base-convert   # produces the `basert` binary
 ## Model hub: `pull` / `list`
 
 `basert pull` fetches a model into a per-user cache
-(`$BASERT_MODELS_DIR`, default `~/.cache/baseRT/models`) laid out as
+(`$BASERT_MODELS_DIR`, default `~/Library/Caches/baseRT/models` on macOS and
+`~/.cache/baseRT/models` on Linux) laid out as
 `<org>/<model>/<variant>/model.base`. The runtime reads the same
 directory.
 
@@ -76,7 +77,7 @@ through pre-converted catalog artifacts.
 Run a model with the BaseRT runtime:
 
 ```
-basert serve    <model> [--model <model2> …]         # OpenAI-compatible server (--model repeats for multi-model)
+basert serve    <model> [--model <model2> …]         # HTTP server: runs Superfluid, installed on first use
 basert chat     <model>                              # interactive chat
 basert complete <model> --prompt <text>              # one-shot completion
 basert bench    <model>                              # throughput benchmark
@@ -85,11 +86,11 @@ basert bench    <model>                              # throughput benchmark
 ## Converter subcommands
 
 ```
-basert convert  --source <path> --target base-q4 --output <path>
-basert inspect  <path>                 # dump header + tensor inventory
-basert keygen   <key-prefix>           # ed25519 keypair (writes .key, .pub)
-basert sign     <bundle> <secret-key>  # signs an unsigned .base in-place
-basert verify   <bundle> <public-key>  # exits non-zero on tampered file
+basert convert  <path> --target base-q4 -o <out.base>
+basert inspect  <path> [--verify-checksums]       # dump header + tensor inventory
+basert keygen   --out <dir> [--name <name>]       # ed25519 keypair (<name>.secret, <name>.pub)
+basert sign     <bundle> --key <secret> -o <out>  # writes a signed copy
+basert verify   <bundle> --pubkey <pub>           # exits non-zero on a tampered or wrongly signed file; 0 on an unsigned one
 ```
 
 Probe tooling for HF checkpoints (per-tensor quant search; everything is

@@ -64,7 +64,7 @@ extern "C" {
 
 #define BASERT_VERSION_MAJOR 0
 #define BASERT_VERSION_MINOR 5
-#define BASERT_VERSION_PATCH 1
+#define BASERT_VERSION_PATCH 2
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
@@ -179,9 +179,9 @@ uint32_t baseRT_capabilities(baseRT_model_t model);
 int baseRT_reload_metallib(baseRT_model_t model, const char *metallib_path);
 
 /// A JSON capability descriptor for this loaded model (schema field
-/// `descriptor_version`): workload, modalities, serving, state, adaptation,
-/// and tick-op support, each capability either `true` or a stable reason
-/// string explaining why it is unavailable on this architecture + backend +
+/// `descriptor_version`): workload, modalities, serving, sampling, state,
+/// adaptation and tick-op support, each capability either `true` or a stable
+/// reason string explaining why it is unavailable on this architecture + backend +
 /// load-options triple. Computed once at load (verdicts frozen, like the
 /// multi-row overcommit verdict) — immutable, race-free, never touches the
 /// error state. The pointer is owned by the model handle and valid until
