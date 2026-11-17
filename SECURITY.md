@@ -2,9 +2,9 @@
 
 ## Supported Versions
 
-baseRT is pre-1.0. Security fixes are applied to the current `v1.0`
-branch only. Once we tag a `v1.0.0` release, the latest minor will be
-supported for security fixes; older minors may not be.
+baseRT is pre-1.0. Security fixes go into the next release only; update
+with `basert self update`. Once we tag a `v1.0.0` release, the latest
+minor will be supported for security fixes; older minors may not be.
 
 ## Reporting a Vulnerability
 
@@ -37,15 +37,20 @@ depend on severity; we will coordinate disclosure with you.
 
 ## Hardening notes for operators
 
-The HTTP server shipped via `basert-serve` is intended for trusted
-networks. Before exposing it to a public network:
+`basert serve` runs [Superfluid](https://github.com/basecompute/superfluid),
+which is intended for trusted networks. Before exposing it to a public
+network:
 
-- Always set `--api-key` to a non-empty value. The server will print a
-  loud warning at startup if no key is set.
+- Always set `--api-key` to a non-empty value. The server prints a
+  warning at startup when it binds off loopback without one.
 - Bind to a specific interface; do not bind to `0.0.0.0` without an
   upstream auth layer.
 - Place it behind a reverse proxy (nginx, Caddy) that enforces TLS,
   rate limiting, and request-size limits independent of the server's
   own caps.
 - Restrict who can call `POST /v1/models/load` — that endpoint accepts
-  a file path, and on the host where the server runs.
+  a file path on the host where the server runs.
+
+See [Security](docs/reference/security.md) for the rest, and
+[Superfluid's security policy](https://github.com/basecompute/superfluid/blob/main/SECURITY.md)
+for issues in the server itself.

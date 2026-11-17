@@ -4,9 +4,9 @@
 
 **Fastest LLM inference on Apple Silicon — now on NVIDIA GB10 (DGX Spark) and AMD Strix Halo / Strix Point, too.**
 
-Pull a model from HuggingFace, chat with it, or serve an OpenAI-compatible API — all from one CLI.
+Pull a model from HuggingFace, chat with it, or serve it over OpenAI-, Anthropic- and Ollama-compatible APIs — all from one CLI.
 
-[![Docs](https://img.shields.io/badge/docs-docs.basecompute.co-5b8fa8)](https://docs.basecompute.co)
+[![Docs](https://img.shields.io/badge/docs-basert.basecompute.co-5b8fa8)](https://basert.basecompute.co)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon%20%C2%B7%20NVIDIA%20GB10%20%C2%B7%20AMD%20Strix-black)](#requirements)
 [![Bindings](https://img.shields.io/badge/bindings-Python%20%C2%B7%20Node%20%C2%B7%20Rust%20%C2%B7%20Swift-444)](docs/bindings/index.md)
@@ -22,21 +22,23 @@ engine: the `basert` CLI (model hub + converter), the `.base` model format, the
 public C API, and language bindings for Python, Node, Rust, and Swift.
 
 - **One CLI for everything** — `basert pull`, `chat`, `serve`, `convert`.
-- **OpenAI-compatible server** — chat, completions, embeddings, transcription,
-  tool calls, continuous batching, paged-KV, and prefix caching.
+- **A local API server** — `basert serve` runs
+  [Superfluid](https://github.com/basecompute/superfluid): OpenAI-, Anthropic-
+  and Ollama-compatible endpoints, tool calls, continuous batching, prefix
+  caching and speculative decoding.
 - **Multimodal** — text, vision, and audio on supported models.
 - **Its own `.base` format** — affine quantization (Q2–Q8), optional AWQ
   calibration, and signed bundles.
 - **Bindings everywhere** — Python, Node, Rust, and Swift over a stable C API.
 - **A drop-in coding-agent backend** — see [below](#use-it-as-a-coding-agent).
 
-> **Documentation:** **[docs.basecompute.co](https://docs.basecompute.co)** (source in [`docs/`](docs/index.md)).
+> **Documentation:** **[basert.basecompute.co](https://basert.basecompute.co)** (source in [`docs/`](docs/index.md)). The server's API is documented at [docs.basecompute.co](https://docs.basecompute.co).
 
 ## Requirements
 
 One of:
 
-- Apple Silicon (M1 or later), macOS 14+.
+- Apple Silicon (M1 or later), macOS 15+.
 - NVIDIA GB10 (DGX Spark), Linux / arm64 with a CUDA driver.
 - AMD Strix Halo (Ryzen AI Max, gfx1151) or Strix Point (Ryzen AI 300,
   gfx1150), Linux / x86-64 on Ubuntu 24.04 or newer, with the ROCm 10 runtime
@@ -70,8 +72,18 @@ curl -LsSf https://basecompute.co/install.sh | sh
 
 This installs the prebuilt engine for your platform and the `basert` CLI to
 `~/.basert` and adds it to your `PATH`. Restart your shell afterward (or
-`export PATH="$HOME/.basert:$PATH"`). See
-[Installation](docs/getting-started/installation.md) for building from source.
+`export PATH="$HOME/.basert:$PATH"`). Update later with `basert self update`.
+
+Or use a package manager:
+
+```sh
+brew install basecompute/tap/basert
+pip install basert              # also pipx / uv tool
+npm install -g @basecompute/basert
+```
+
+See [Installation](docs/getting-started/installation.md) for the details and
+for building from source.
 
 ### 2. Pull a model
 
@@ -80,8 +92,8 @@ basert pull Qwen/Qwen3-4B    # download from HuggingFace + convert to .base
 basert list                  # show installed models
 ```
 
-Models are cached under `~/.cache/baseRT/models` (override with
-`$BASERT_MODELS_DIR`). To pick a specific quant build, append `:default-q8` to
+Models are cached under `~/Library/Caches/baseRT/models` on macOS and
+`~/.cache/baseRT/models` on Linux (override with `$BASERT_MODELS_DIR`). To pick a specific quant build, append `:default-q8` to
 the id (or pass `--variant default-q8`).
 
 ### 3. Chat
@@ -90,7 +102,7 @@ the id (or pass `--variant default-q8`).
 basert chat Qwen/Qwen3-4B
 ```
 
-### 4. Serve an OpenAI-compatible API
+### 4. Serve an API
 
 ```sh
 basert serve Qwen/Qwen3-4B --api-key "$(uuidgen)" --port 8080
@@ -134,8 +146,9 @@ Inside pi, run `/model` to pick a served model. See the
 
 ## The `basert` CLI
 
-`basert` is a single front-end. Model-management commands run natively; runtime
-commands are forwarded to the matching `basert-<cmd>` engine binary.
+`basert` is a single front-end. Model-management commands run natively; `chat`,
+`complete` and `bench` run the matching `basert-<cmd>` engine binary, and `serve`
+runs Superfluid, installing it on first use.
 
 | Command | What it does |
 | --- | --- |
@@ -143,11 +156,14 @@ commands are forwarded to the matching `basert-<cmd>` engine binary.
 | `basert list` | List installed models (`--remote` to include the catalog) |
 | `basert convert <src>` | Convert a local GGUF / HF / MLX checkpoint to `.base` |
 | `basert chat <model>` | Interactive chat |
-| `basert serve <model>` | OpenAI-compatible HTTP server (`--model` repeats for multi-model) |
+| `basert serve <model>` | HTTP server (Superfluid; `--model` repeats for multi-model) |
 | `basert complete <model>` | One-shot completion (text / image / audio) |
 | `basert bench <model>` | Throughput benchmark |
 | `basert inspect <model>` | Dump a `.base` header + tensor inventory |
 | `basert sign` / `verify` / `keygen` | ed25519 signing of `.base` bundles |
+| `basert computearena` | Run a ComputeArena benchmark and save a signed report |
+| `basert superfluid install` / `status` | Install or check the server `basert serve` runs |
+| `basert self update` / `check` / `list` / `use` | Update basert, or switch between installed versions |
 
 Full flag reference: [CLI reference](docs/cli/reference.md).
 
@@ -159,7 +175,7 @@ Full flag reference: [CLI reference](docs/cli/reference.md).
 | [`include/baseRT/`](include/baseRT/) | The stable public C API (`baseRT.h`, `types.h`). |
 | [`bindings/`](bindings/) | Python, Node, Rust, and Swift. |
 | [`benchmarks/`](benchmarks/) | Scripts and reference results. |
-| [`docs/`](docs/index.md) | The documentation site. |
+| [`docs/`](docs/index.md) | The documentation site ([basert.basecompute.co](https://basert.basecompute.co)). |
 
 This repository — the CLI, `.base` format, public headers, and bindings — is
 licensed under **Apache-2.0**. The engine ships as a separate prebuilt binary
@@ -168,7 +184,7 @@ under its own license; see
 
 ## Links
 
-- **[Documentation](https://docs.basecompute.co)** · [Server API](docs/reference/server-api.md) · [`.base` format](base-convert/FORMAT.md)
+- **[Documentation](https://basert.basecompute.co)** · [Server API](docs/reference/server-api.md) · [`.base` format](base-convert/FORMAT.md)
 - [Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md)
 
 ## License
