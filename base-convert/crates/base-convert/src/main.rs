@@ -129,16 +129,18 @@ struct ConvertArgs {
     #[arg(long, value_enum, default_value_t = TargetScheme::BaseQ4)]
     target: TargetScheme,
 
-    /// Calibration text file (UTF-8). Required for AWQ.
-    #[arg(long)]
+    /// Ignored. AWQ reads its calibration from the `--awq-profile` sidecar;
+    /// this, `--calib-tokens` and `--awq-mode` are still accepted so scripts
+    /// that pass them keep running.
+    #[arg(long, hide = true)]
     calib: Option<PathBuf>,
 
-    /// Number of calibration tokens.
-    #[arg(long, default_value_t = 512)]
+    /// Ignored (see `--calib`).
+    #[arg(long, hide = true, default_value_t = 512)]
     calib_tokens: u32,
 
-    /// AWQ calibration mode.
-    #[arg(long, value_enum, default_value_t = AwqMode::Full)]
+    /// Ignored (see `--calib`).
+    #[arg(long, hide = true, value_enum, default_value_t = AwqMode::Full)]
     awq_mode: AwqMode,
 
     /// Generate a synthetic end-to-end bundle instead of reading a real
@@ -159,8 +161,8 @@ struct ConvertArgs {
     #[arg(long, value_name = "V", requires = "mtp_head")]
     mtp_head_version: Option<String>,
 
-    /// Canonical-quant profile JSON (e.g.
-    /// `tools/base-convert/profiles/dense-q4mix.json`). When set,
+    /// Canonical-quant profile JSON (e.g. `profiles/default-q4.json` in the
+    /// converter's source tree). When set,
     /// per-tensor quant decisions come from the profile rules; the
     /// `--target` flag becomes the fallback for tensors the profile's
     /// catch-all `**.weight` rule should otherwise have covered. Sets
@@ -170,10 +172,10 @@ struct ConvertArgs {
     profile: Option<PathBuf>,
 
     /// AWQ activation-stats sidecar JSON (produced by baseRT
-    /// calibration mode). When set, every tensor whose profile rule
-    /// dispatches to a canonical `base_qN` dtype runs AWQ search +
-    /// rotation before the RTN pack. Tensors whose profile says
-    /// `dtype: bf16` are unaffected.
+    /// calibration mode). Needs `--profile`. Every tensor whose profile
+    /// rule says `"algo": "awq"` with a canonical `base_qN` dtype runs AWQ
+    /// search + rotation before the RTN pack; every other tensor is
+    /// packed as its rule says, without AWQ.
     #[arg(long)]
     awq_profile: Option<PathBuf>,
 

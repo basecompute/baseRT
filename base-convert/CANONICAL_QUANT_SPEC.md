@@ -6,16 +6,21 @@ per-tensor flexibility for the canonical bit-widths.
 ## Goals
 
 - One canonical kernel family per bit-width per backend.
-- Source format restricted to **fp16 / bf16 / fp32**. Already-quantized
-  sources are rejected with a clear error — no silent quant-to-quant
-  re-pack (it's lossy and contradicts the bit budget). Users with a
-  GGUF Q4_K_M only must re-fetch the bf16 original.
-- Quant happens at convert time. Multiple methods supported (AWQ,
-  GPTQ, SmoothQuant, RTN); converter picks per use case.
+- Quantization starts from **fp16 / bf16 / fp32** sources. Applying a
+  profile to an already-quantized source (GGUF, MLX 4/8-bit) is refused
+  unless `--allow-quant-from-quant` is given, since it re-packs lossy
+  weights. Source quantization can instead be kept as it is
+  (`--kquant-passthrough` for GGUF k-quants and i-quants,
+  `--mlx-passthrough` for MLX 4-bit).
+- Quant happens at convert time. A profile rule picks round-to-nearest
+  (`"algo": "rtn"`, the default) or AWQ (`"algo": "awq"`, with an
+  `--awq-profile` sidecar).
 - Mixed precision per-tensor (e.g. `mlp.experts: q4`, `mlp.shared_ffn:
   q8`, `lm_head: bf16`).
-- Multi-platform: Apple Silicon (Metal), CUDA, ROCm. **One bundle per
-  target backend**; the converter takes `--target=metal|cuda|rocm`.
+- Multi-platform: Apple Silicon (Metal), CUDA, ROCm. The converter has no
+  backend flag (`--target` names the quant scheme); a build for one
+  backend is a profile chosen for it, and the catalog publishes those
+  builds as variants.
 
 ## Bit-width defaults
 
@@ -116,6 +121,19 @@ one backend is not portable to another — re-convert from source.
 - Inherit MLX's affine packing exactly, so byte-identical bundles can
   be produced from MLX checkpoints (when source is fp16/bf16, not from
   pre-quantized MLX weights).
+- A *pre-quantized* MLX 4-bit checkpoint at group size 64 is the one
+  case where quant-from-quant is not lossy: `base_q4` is that same
+  scheme, so `--target base-q4` transplants the packed codes and the
+  f16 scale/bias pair verbatim rather than requantizing (disable with
+  `--no-mlx-passthrough`). This is not merely an optimization.
+  Re-deriving `scale = (max - min) / 15` from already-quantized values
+  lands on a *different* grid whenever a group's codes do not span the
+  full 0..15 range, so dequant → requant is **not** the identity.
+  Transplanting reproduces MLX's weights bit-for-bit, which is what
+  makes an MLX-vs-baseRT numerical comparison attributable to engine
+  math rather than to conversion. Tensors whose rows get permuted on
+  the way through (rotary q/k), stacked or split virtual tensors, and
+  any `--profile` run keep the f32 path.
 - Power-of-2 widths (q2/q4/q8): concatenated little-endian, lane `i`
   at bit `i*bits` in a uint32. Pack factor = `32/bits`.
 - q3 / q5: bit-spread across 3 / 5 bytes per 8 lanes.
@@ -171,7 +189,7 @@ backwards-compat with current `base_q4` bundles):
 
 ## Quant profile JSON
 
-Profiles live in `tools/base-convert/profiles/`. Reusable + diffable.
+Profiles live in `profiles/` beside this file. Reusable + diffable.
 The converter consumes one via `--profile <path>`; the resulting
 bundle records the profile name in `quant_profile` for audit.
 
@@ -214,8 +232,10 @@ dense models.
   biases are stored as bf16. Norms are stored at f16. The `*-f16scale.json`
   profiles (`default-q4-f16scale.json`, `default-q8-f16scale.json`) select
   f16 scales instead.
-- The source checkpoint must be fp16/bf16/fp32. Re-quantizing an
-  already-quantized checkpoint (e.g. a GGUF Q4_K) is not a supported target.
+- A profile applies to fp16/bf16/fp32 checkpoints. Re-quantizing an
+  already-quantized checkpoint (e.g. a GGUF Q4_K) needs
+  `--allow-quant-from-quant`; keeping its blocks as they are needs
+  `--kquant-passthrough`.
 
 ## Validation criterion
 

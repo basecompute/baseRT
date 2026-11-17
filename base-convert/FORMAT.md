@@ -126,6 +126,41 @@ The header schema is arch-open. Supported categories at v1:
   weights go under the `mmproj` sub-bundle. Tower config is
   `mmproj.config`. Projection head weights live in the main bundle under
   canonical names (`multi_modal_projector.*`).
+- **Speculator** (speculative decoding drafters): a drafter that
+  conditions on the model's hidden states goes under the `speculator`
+  sub-bundle — the checkpoint's own Multi-Token-Prediction head
+  (Qwen3.5/3.6/3.8 `mtp.*`, arch `<arch>-mtp`), or a converted EAGLE /
+  DFlash drafter. Same blob, own tensor list, so a runtime that does not
+  speculate skips it. An MTP head's decoder layer is canonicalized exactly
+  like a main layer and prefixed (`mtp.layers.0.self_attn.q_proj.weight`,
+  `mtp.layers.0.ffn_gate_exps.weight`), its own tensors keep their names
+  (`mtp.fc.weight`, `mtp.pre_fc_norm_embedding.weight`,
+  `mtp.pre_fc_norm_hidden.weight`, `mtp.norm.weight`); norm shifts are
+  baked like the main layers'. Speculator tensors stay f16 regardless of the
+  quant target. `speculator.config` is open-namespace: `kind` ("mtp"),
+  `num_layers`, `moe`, `shared_embeddings`, `shared_lm_head`, `fc_inputs`.
+  The header raises `HAS_SPECULATOR`.
+- **Block-drafter sidecars** (DFlash / DSpark): a drafter that ships as
+  its own checkpoint converts to its own small bundle, arch `dflash` /
+  `dspark` (recognised by `architectures`, not `model_type`, which is the
+  qwen3 backbone's). Its tensors are main tensors of the sidecar: the
+  qwen3 decoder under `layers.N.*` (canonicalized like a target's layers),
+  `fc.{i}.weight` (the fused `fc` split by input column, one `[dim, dim]`
+  block per `target_layer_ids` entry), `hidden_norm.weight`,
+  `final_norm.weight` (from `norm.weight`), and — DSpark — its own
+  `embed_tokens.weight` / `lm_head.weight`, `markov.w1/w2.weight`,
+  `confidence.proj.*`; a DFlash sidecar has no embedding or head and the
+  runtime resolves both from the target's bundle. Every tensor is f16
+  whatever the quant target. The header config carries the drafter's own
+  geometry in the usual HF keys plus `speculator_kind`, `block_size`,
+  `mask_token_id`, `logits_start`, `target_layer_ids`, `fc_scale` (1/256,
+  folded into every `fc.{i}` — hidden_norm is scale-invariant and the raw
+  fc output overflows f16 on the target's massive activations),
+  `num_target_layers`
+  and, when present, `markov_rank`, `confidence_head`, DFlash 2's
+  `conv_kernel_size` / `conv_group_size` / `selector_rank` /
+  `selector_top_k`. A sliding-window schedule is recorded as the runtime's
+  `sliding_window` + `sliding_window_pattern` period.
 
 Adding a new architecture = adding a `base-arch/<name>.rs` mapping from
 source tensor names to canonical names. **No `format_version` bump**
@@ -216,7 +251,7 @@ answer structural questions with a single bit-test.
 | 2    | HAS_SSM           |
 | 3    | HAS_HYBRID        |
 | 4    | HAS_LORA          |
-| 5    | HAS_SPECULATOR    |
+| 5    | HAS_SPECULATOR    | (the bundle carries a `speculator` sub-bundle)
 | 6    | HAS_COMPUTE_GRAPH |
 | 7    | HAS_KV_WARMUP     |
 | 8    | HAS_TRACE_REF     |
@@ -249,6 +284,19 @@ Supported kinds:
 - `ssm`, `ssm_moe` — SSM (Mamba, RWKV) with optional MoE FFN
 - `attention_moe`, `dense_moe` — attention + MoE FFN
 - `dense_mlp` — classic transformer block
+- `moe_ffn` — FFN-only MoE block with no attention/SSM mixer
+  (Nemotron-H MoE interleaves pure-Mamba, pure-attention and
+  pure-MoE-FFN blocks; each block has exactly one of the three)
+
+Hybrid checkpoints additionally mirror the schedule as a flat
+`config.layer_types` string array (one entry per layer). Vocabularies in
+use: `"linear_attention" | "full_attention"` (Qwen3.5/3.6 Gated
+DeltaNet) and `"mamba" | "attention" | "moe" | "mlp"` (Nemotron-H).
+Nemotron-H configs also carry the Mamba-2 mixer geometry
+(`ssm_state_size`, `ssm_conv_kernel`, `ssm_num_groups`,
+`ssm_inner_size`, `ssm_num_heads`) and DeepSeek-style router fields
+(`expert_gating`: 0 = softmax / 1 = sigmoid, `expert_weights_scale`,
+plus the per-layer `mlp.router.e_score_correction_bias` tensor).
 
 Per-layer precision overrides (`force_fp32_attn`, `force_fp32_ssm`,
 `no_quantize`) let the converter mark specific layers as untouchable
@@ -261,8 +309,8 @@ weights.
 A LoRA adapter is shipped as a stand-alone `.base` file, NOT as an
 extension slot on a base bundle. The runtime opens it with the same
 `WeightProvider` it uses for the base model, then installs it via
-`baseRT_lora_load(model, path)`. `tools/lora_convert.py` produces the
-file from a PEFT (HuggingFace) source.
+`baseRT_lora_load(model, path)`. `basert convert-lora <peft-dir> --base
+<model.base>` produces the file from a PEFT (HuggingFace) source.
 
 ### Header shape
 
@@ -354,17 +402,16 @@ ranks disagree.
 
 ### Per-arch fusion topology
 
-`tools/lora_convert.py` derives the fusion choice from the PEFT
-`adapter_config.json`'s `base_model_name_or_path`:
-
-| Base model family                            | QKV          | gate+up      |
-|----------------------------------------------|--------------|--------------|
-| Llama / Gemma 3 / Qwen3 / Mistral / BERT     | fused (3·r)  | fused (2·r)  |
-| Gemma 4                                      | separate     | separate     |
-
-Adding a new arch is a one-line entry in `ARCH_TOPOLOGY`. The
-runtime side needs no changes — `dispatch_gemm`'s tensor_name +
-shape together disambiguate.
+Quantized decode and prefill run QKV and gate+up as fused GEMMs (named
+for the q and gate projections); mixed-dtype configs run one GEMM per
+projection. The two never run together, so `basert convert-lora` emits
+both: stacked block-diagonal pairs under the fused names and
+per-projection pairs under the split names. The per-projection widths
+come from `--base`, which also checks that the adapter and the model
+agree on the hidden size. It covers the Llama-shaped families (llama,
+mistral, phi3) and refuses other architectures. The runtime side needs
+no changes — `dispatch_gemm`'s tensor_name + shape together
+disambiguate.
 
 ## Extension slots
 
@@ -389,9 +436,9 @@ Known kinds (all optional):
 - `0x0003 KvWarmup` — pre-filled KV cache tokens for common system
   prompts
 - `0x0004 TraceReference` — 16-token fixed input + expected fp32
-  logits. `baserT --validate` runs the forward pass at load and fails
-  loud on RMS-error regression — catches silent quantization bugs per
-  file, forever
+  logits, for a validating loader to compare a forward pass against at
+  load. Reserved: the converter writes none and the engine does not read
+  it yet
 - `0x0005 RopeTables` — precomputed cos/sin. Runtime skips RoPE compute
 - `0x0006 CalibrationData` — per-tensor AWQ activation stats, JSON
 - `0x00FF Custom` — vendor-defined
@@ -404,8 +451,7 @@ doesn't know how to process are a hard failure.
 ## Integrity
 
 - **Per-tensor xxh64** in each `TensorEntry.checksum_xxh64`. Computed at
-  write, lazy-verified at read. Strict mode (`baserT --validate`)
-  eagerly verifies all tensors before dispatch.
+  write; `basert inspect --verify-checksums` checks every tensor.
 - **Per-slot xxh64** in each extension slot header. Verified when the
   slot is parsed.
 - **ed25519 signature** over canonical-JSON header + sha256 of weights
@@ -422,7 +468,7 @@ ed25519 catches that because the attacker lacks the signing key.
 {
   "schema": 1,
   "arch": "qwen3",                 // model arch; drives tensor-name convention
-  "quant_scheme": "base_q4",       // one of: base_q4, base_q8, bf16, mxfp4, nvfp4
+  "quant_scheme": "base_q4",       // base_q2 … base_q8 | bf16 | f16 | mxfp4 | nvfp4 | passthrough_gguf
   "min_hw": "apple_m1",            // minimum hardware generation
   "created": "2026-04-24T12:00:00Z",
   "baserT_version": "0.9.0",
@@ -452,7 +498,7 @@ ed25519 catches that because the attacker lacks the signing key.
   "tensors": [
     {
       "name": "model.layers.0.self_attn.qkv_proj.weight",  // q/k/v fused at convert-time
-      "dtype": "base_q4",          // base_q4 | base_q8 | bf16 | f16 | f32 | mxfp4 | nvfp4
+      "dtype": "base_q4",          // base_q2 … base_q8 | bf16 | f16 | f32 | mxfp4 | nvfp4
       "shape": [2560, 2048],       // [fused_out, in]
       "offset": 0,                 // byte offset within weights_blob
       "length": 655360,            // byte length of packed data
@@ -471,6 +517,11 @@ ed25519 catches that because the attacker lacks the signing key.
   "mmproj": {                      // optional: multimodal projector
     "arch": "gemma4_vision",
     "tensors": [ ... ]             // same shape as top-level tensors
+  },
+  "speculator": {                  // optional: speculative-decoding drafter
+    "arch": "qwen35-mtp",
+    "config": { "kind": "mtp", "num_layers": 1, "moe": false, ... },
+    "tensors": [ ... ]             // same shape as top-level tensors; f16
   },
   "calibration": {                 // optional: AWQ audit trail
     "mode": "full",                // full | lite | none

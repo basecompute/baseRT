@@ -7,8 +7,9 @@
 //! On-disk: a plain UTF-8 text file with one wikitext line per text
 //! line (matches the standard distribution at
 //! `wikitext-103-raw/wiki.train.raw` from the HF Datasets mirror).
-//! No Python deps; the user downloads the file once and points the
-//! converter at it via `--calib-file <path>`.
+//! No Python deps; the user downloads the file once. The converter does
+//! not read it: AWQ takes the activation sidecar (`--awq-profile`) that a
+//! calibration run over this text records.
 //!
 //! This module deliberately doesn't tokenize — that's the runtime's
 //! job at calibration time, since it must use the model's own
