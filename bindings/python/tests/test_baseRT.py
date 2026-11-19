@@ -542,6 +542,17 @@ class TestBaseRTError:
         assert str(err) == "test error message"
 
 
+class TestSetNeuralEngine:
+    """The process-wide switch of the prefill's coprocessor split."""
+
+    def test_passes_the_switch_to_the_engine(self):
+        fake_lib = mock.MagicMock()
+        with mock.patch("baseRT._get_lib", return_value=fake_lib):
+            baseRT.set_neural_engine(False)
+            baseRT.set_neural_engine(True)
+        assert [c.args for c in fake_lib.baseRT_set_neural_engine.call_args_list] == [(0,), (1,)]
+
+
 class TestCheckModel:
     """Test _check_model helper."""
 

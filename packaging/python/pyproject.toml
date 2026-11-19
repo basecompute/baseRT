@@ -45,7 +45,9 @@ packages = ["baseRT"]
 include-package-data = false
 
 [tool.setuptools.package-data]
-baseRT = ["_engine/*"]
+# npu-designs/: the XDNA NPU design sets of the Linux ROCm engine (one folder
+# down; a glob does not descend).
+baseRT = ["_engine/*", "_engine/npu-designs/*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "baseRT.__version__" }

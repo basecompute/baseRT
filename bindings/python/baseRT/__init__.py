@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 # ---------------------------------------------------------------------------
 # Library loading
@@ -480,6 +480,10 @@ class TensorInfo:
 def _setup_signatures(lib: ctypes.CDLL) -> None:
     """Declare argtypes / restype for every C function we call."""
 
+    # Process-wide switches (set before a model loads)
+    lib.baseRT_set_neural_engine.argtypes = [ctypes.c_int]
+    lib.baseRT_set_neural_engine.restype = None
+
     # Model lifecycle
     lib.baseRT_load_model.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
     lib.baseRT_load_model.restype = ctypes.c_void_p
@@ -739,6 +743,17 @@ def get_error() -> Optional[str]:
     if msg:
         return msg.decode("utf-8")
     return None
+
+
+def set_neural_engine(enable: bool) -> None:
+    """Switch the prefill's coprocessor split for the models loaded afterwards.
+
+    On by default: where the box has one, part of each long prefill runs on
+    the Neural Engine (Apple silicon) or the XDNA NPU (AMD Strix). ``False``
+    runs every prefill on the GPU alone. Process-wide; call it before
+    ``Model(...)``.
+    """
+    _get_lib().baseRT_set_neural_engine(1 if enable else 0)
 
 
 class BaseRTError(RuntimeError):

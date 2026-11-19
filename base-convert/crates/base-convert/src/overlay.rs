@@ -34,7 +34,7 @@ use super::{
     QuantContext, TargetScheme,
 };
 use anyhow::{bail, Context, Result};
-use base_format::{Layout, TensorDtype, TensorEntry};
+use base_format::{Layout, TensorDtype, TensorEntry, BLOB_ALIGNMENT, PREFIX_LEN};
 use base_readers::gguf::{GgmlType, TensorInfo};
 use base_readers::safetensors::SafetensorsFile;
 use clap::Parser;
@@ -1112,21 +1112,139 @@ pub fn cmd_merge(args: MergeArgs) -> Result<()> {
         );
     }
 
-    // Header from the base; the writer rebuilds the tensor tables and the
+    // Header from the base; the tensor tables are rebuilt and the
     // signature no longer covers these bytes.
     let mut header = base.header().clone();
-    header.tensors.clear();
-    header.mmproj = None;
-    header.speculator = None;
     if header.sig.take().is_some() {
         eprintln!(
             "  note: base was signed; the merged bundle is unsigned (re-sign with `basert sign`)"
         );
     }
-    let tmp_out = temp_sibling(&args.output);
-    let mut writer = BaseWriter::create(&tmp_out, header)
-        .with_context(|| format!("creating {}", tmp_out.display()))?;
     let mut replaced: Vec<String> = Vec::new();
+    for t in &base.header().tensors {
+        if winner.contains_key(t.name.as_str()) {
+            replaced.push(t.name.clone());
+        }
+    }
+    let merge_prov = |method: &str| {
+        serde_json::json!({
+            "base": args.base.display().to_string(),
+            "overlays": args.overlays.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "replaced": replaced,
+            "lm_only": args.lm_only,
+            "method": method,
+        })
+    };
+    let provenance = |merge: serde_json::Value| match base.header().provenance.clone() {
+        Some(serde_json::Value::Object(mut m)) => {
+            m.insert("merge".into(), merge);
+            serde_json::Value::Object(m)
+        }
+        Some(other) => serde_json::json!({"base_provenance": other, "merge": merge}),
+        None => serde_json::json!({"merge": merge}),
+    };
+    // Either path writes a temp sibling and renames it over the output only
+    // once it is complete: a failure removes the temp and leaves whatever
+    // was at the output untouched.
+    let tmp_out = temp_sibling(&args.output);
+
+    // ── fast path: clone the base and patch the replaced tensors in place ──
+    // A dense overlay of the same dtype keeps every tensor's length, so the
+    // base's blob layout (offsets, slots, mmproj, speculator) is reused as
+    // is: the output is a copy-on-write clone of the base (APFS `clonefile`,
+    // instant and free until written), its header region is rewritten with
+    // the overlay's entries at the base's offsets, and only the replaced
+    // bytes are written. The full rewrite below needs a whole second bundle
+    // on disk (a 360 GB carry's probe = 360 GB more); this needs the overlay.
+    let sections_kept =
+        !args.lm_only || (base.header().mmproj.is_none() && base.header().speculator.is_none());
+    let mut patched_header = header.clone();
+    let mut in_place_ok = sections_kept;
+    let mut patches: Vec<(usize, u64, u64)> = Vec::new(); // (overlay index, file offset, length)
+    if in_place_ok {
+        for t in patched_header.tensors.iter_mut() {
+            let Some(&i) = winner.get(t.name.as_str()) else {
+                continue;
+            };
+            let e = overlays[i]
+                .header()
+                .tensors
+                .iter()
+                .find(|e| e.name == t.name)
+                .expect("winner index came from this overlay's table");
+            let dense = |x: &TensorEntry| {
+                x.scale_offset.is_none() && x.bias_offset.is_none() && x.awq_scale_offset.is_none()
+            };
+            if e.dtype != t.dtype || e.length != t.length || !dense(e) || !dense(t) {
+                in_place_ok = false;
+                break;
+            }
+            let mut entry = e.clone();
+            entry.offset = t.offset;
+            patches.push((i, base.blob_offset() + t.offset, t.length));
+            *t = entry;
+        }
+    }
+    if in_place_ok {
+        patched_header.provenance = Some(provenance(merge_prov("clone_patch")));
+        let header_json = patched_header
+            .to_canonical_json()
+            .context("serializing the merged header")?;
+        // The clone keeps the base's header_len when the JSON fits in it
+        // (a `convert --direct-write` base reserves 64 MiB, space-padded),
+        // and grows it only within the base's alignment block; the blob
+        // start the reader derives from it must be the base's own.
+        let header_len = (header_json.len() as u64).max(base.header_len());
+        let header_end = PREFIX_LEN + header_len;
+        let blob_start = (header_end + BLOB_ALIGNMENT - 1) & !(BLOB_ALIGNMENT - 1);
+        if blob_start == base.blob_offset() {
+            match clone_and_patch(
+                &args.base,
+                &tmp_out,
+                &header_json,
+                header_len,
+                blob_start,
+                &patches,
+                &overlays,
+                &replaced,
+            ) {
+                Ok(()) => {
+                    move_into_place(&tmp_out, &args.output)?;
+                    eprintln!(
+                        "merge: {} tensors, {} replaced from {} overlay(s) patched into a clone of the base -> {} ({:.1}s)",
+                        base.header().tensors.len(),
+                        winner.len(),
+                        overlays.len(),
+                        args.output.display(),
+                        t0.elapsed().as_secs_f64()
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_out);
+                    eprintln!("  note: clone-and-patch unavailable ({e:#}); rewriting the bundle");
+                }
+            }
+        }
+    }
+
+    // ── full rewrite: every tensor's bytes streamed into the output ──
+    // Direct-write (the blob streams into the temp sibling at a fixed blob
+    // start, the header is backfilled at finish) so the peak disk usage is
+    // one bundle, not a bundle plus its `.blobtmp` sibling.
+    header.tensors.clear();
+    header.mmproj = None;
+    header.speculator = None;
+    let reserve = {
+        let base_len = base
+            .header()
+            .to_canonical_json()
+            .map(|j| j.len() as u64)
+            .unwrap_or(0);
+        base_len + 2 * base_len / 10 + (1u64 << 20)
+    };
+    let mut writer = BaseWriter::create_direct(&tmp_out, header, reserve)
+        .with_context(|| format!("creating {}", tmp_out.display()))?;
     let mut n_mmproj = 0usize;
     let mut n_spec = 0usize;
     let mut n_slots = 0usize;
@@ -1137,7 +1255,6 @@ pub fn cmd_merge(args: MergeArgs) -> Result<()> {
         for t in &base.header().tensors {
             let (entry, bytes) = match winner.get(t.name.as_str()) {
                 Some(&i) => {
-                    replaced.push(t.name.clone());
                     let ov = &overlays[i];
                     let e = ov
                         .header()
@@ -1181,36 +1298,14 @@ pub fn cmd_merge(args: MergeArgs) -> Result<()> {
         for s in slots {
             writer.add_slot(s);
         }
-
-        let merge_prov = serde_json::json!({
-            "base": args.base.display().to_string(),
-            "overlays": args.overlays.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            "replaced": replaced,
-            "lm_only": args.lm_only,
-        });
-        let prov = match base.header().provenance.clone() {
-            Some(serde_json::Value::Object(mut m)) => {
-                m.insert("merge".into(), merge_prov);
-                serde_json::Value::Object(m)
-            }
-            Some(other) => serde_json::json!({"base_provenance": other, "merge": merge_prov}),
-            None => serde_json::json!({"merge": merge_prov}),
-        };
-        writer.set_provenance(prov);
+        writer.set_provenance(provenance(merge_prov("rewrite")));
         writer.finish().context("writing merged bundle")
     })();
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp_out);
         return Err(e);
     }
-    std::fs::rename(&tmp_out, &args.output).with_context(|| {
-        let _ = std::fs::remove_file(&tmp_out);
-        format!(
-            "moving {} into place as {}",
-            tmp_out.display(),
-            args.output.display()
-        )
-    })?;
+    move_into_place(&tmp_out, &args.output)?;
     eprintln!(
         "merge: {} tensors, {} replaced from {} overlay(s), {} mmproj, {} speculator, {} slots -> {} ({:.1}s)",
         base.header().tensors.len(),
@@ -1223,6 +1318,112 @@ pub fn cmd_merge(args: MergeArgs) -> Result<()> {
         t0.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// Rename the finished temp sibling over the output; on failure the temp is
+/// removed and the output is as it was.
+fn move_into_place(tmp_out: &std::path::Path, output: &std::path::Path) -> Result<()> {
+    std::fs::rename(tmp_out, output).with_context(|| {
+        let _ = std::fs::remove_file(tmp_out);
+        format!(
+            "moving {} into place as {}",
+            tmp_out.display(),
+            output.display()
+        )
+    })
+}
+
+/// `basert merge`'s in-place path: `output` becomes a copy-on-write clone
+/// of `base` (APFS `clonefile`; the blocks are shared until written), its
+/// prefix + header region is rewritten with `header_json` (space-padded to
+/// `header_len` like a direct-written header, then zero-padded to
+/// `blob_start`, the base's own blob start), and each `(overlay, file
+/// offset, length)` patch is written over the clone's bytes. Errors (no
+/// clone support on this filesystem, a cross-volume output, …) leave the
+/// caller to rewrite the bundle; the partial output (the temp sibling the
+/// caller hands in) is removed by it.
+#[allow(clippy::too_many_arguments)]
+fn clone_and_patch(
+    base: &std::path::Path,
+    output: &std::path::Path,
+    header_json: &[u8],
+    header_len: u64,
+    blob_start: u64,
+    patches: &[(usize, u64, u64)],
+    overlays: &[base_format::BaseReader],
+    replaced: &[String],
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::FileExt;
+    if output.exists() {
+        std::fs::remove_file(output).with_context(|| format!("removing {}", output.display()))?;
+    }
+    clone_file(base, output)
+        .with_context(|| format!("cloning {} to {}", base.display(), output.display()))?;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(output)
+        .with_context(|| format!("opening the clone {}", output.display()))?;
+    {
+        let mut w = std::io::BufWriter::new(&mut f);
+        w.write_all(&base_format::MAGIC)?;
+        w.write_all(&base_format::FORMAT_VERSION.to_le_bytes())?;
+        w.write_all(&header_len.to_le_bytes())?;
+        w.write_all(header_json)?;
+        let mut fill = |byte: u8, mut n: usize| -> std::io::Result<()> {
+            let buf = [byte; 8192];
+            while n > 0 {
+                let k = n.min(buf.len());
+                w.write_all(&buf[..k])?;
+                n -= k;
+            }
+            Ok(())
+        };
+        fill(b' ', (header_len - header_json.len() as u64) as usize)?;
+        fill(0, (blob_start - PREFIX_LEN - header_len) as usize)?;
+        w.flush()?;
+    }
+    for (k, &(i, at, len)) in patches.iter().enumerate() {
+        let name = &replaced[k];
+        let bytes = overlays[i].tensor_bytes(name)?;
+        anyhow::ensure!(
+            bytes.len() as u64 == len,
+            "{name}: {} overlay bytes for {len} in the base",
+            bytes.len()
+        );
+        f.write_all_at(bytes, at)
+            .with_context(|| format!("{name}: writing {len} bytes at {at}"))?;
+    }
+    f.sync_all()?;
+    Ok(())
+}
+
+/// A copy-on-write file clone (macOS `clonefile(2)`): instant, and the
+/// clone shares the source's blocks until either is written.
+#[cfg(target_os = "macos")]
+fn clone_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int};
+    use std::os::unix::ffi::OsStrExt;
+    extern "C" {
+        fn clonefile(src: *const c_char, dst: *const c_char, flags: c_int) -> c_int;
+    }
+    let s = CString::new(src.as_os_str().as_bytes())?;
+    let d = CString::new(dst.as_os_str().as_bytes())?;
+    // Safety: two NUL-terminated paths; the call creates `dst` or fails.
+    if unsafe { clonefile(s.as_ptr(), d.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_file(_src: &std::path::Path, _dst: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "file cloning is only implemented on macOS (APFS clonefile)",
+    ))
 }
 
 /// Decode one bundle tensor to f32: GGUF super-blocks (`layout: gguf_super`)

@@ -64,7 +64,7 @@ extern "C" {
 
 #define BASERT_VERSION_MAJOR 0
 #define BASERT_VERSION_MINOR 5
-#define BASERT_VERSION_PATCH 2
+#define BASERT_VERSION_PATCH 3
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
@@ -253,10 +253,11 @@ void baseRT_set_prefill_chunk(int n);
 /// Process-wide; read at load. Set before baseRT_load_model.
 void baseRT_set_paged_weights(int mode);
 
-/// The prefill's Neural Engine split (Apple silicon, Metal backend).
+/// The prefill's coprocessor split: with the Neural Engine on Apple silicon
+/// (Metal backend), with the XDNA NPU on AMD Strix (ROCm backend).
 ///   enable = 1 → on (default): a prefill chunk's dense FFN / projections are
-///     split between the GPU and the Neural Engine where that is faster for
-///     the chip and the model
+///     split between the GPU and the coprocessor where the box has one and
+///     that is faster for the chip and the model
 ///   enable = 0 → off: the GPU runs every prefill alone (bit-for-bit the
 ///     GPU path; the split's int8 part differs from it by ~2.5% RMS)
 /// Process-wide; read at load. Set before baseRT_load_model.

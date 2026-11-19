@@ -10,6 +10,7 @@ use std::path::Path;
 pub struct BaseReader {
     mmap: Mmap,
     header: Header,
+    header_len: u64,
     blob_offset: u64,
 }
 
@@ -71,12 +72,20 @@ impl BaseReader {
         Ok(Self {
             mmap,
             header,
+            header_len,
             blob_offset,
         })
     }
 
     pub fn header(&self) -> &Header {
         &self.header
+    }
+
+    /// The prefix's header_len: the bytes parsed as the header JSON, the
+    /// space padding of a direct-written (reserved) header included. The
+    /// blob starts at `align_up(PREFIX_LEN + header_len, BLOB_ALIGNMENT)`.
+    pub fn header_len(&self) -> u64 {
+        self.header_len
     }
 
     /// Parse only the header without mmapping the whole file. Reads the

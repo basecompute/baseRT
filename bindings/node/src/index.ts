@@ -702,7 +702,7 @@ export const Engine = {
   setPagedWeights(mode: number): void {
     lib().baseRT_set_paged_weights(mode);
   },
-  /** The prefill's Neural Engine split: true=on (default), false=GPU alone. */
+  /** The prefill's coprocessor split (Neural Engine on Apple silicon, XDNA NPU on AMD Strix): true=on (default), false=GPU alone. */
   setNeuralEngine(enable: boolean): void {
     lib().baseRT_set_neural_engine(enable ? 1 : 0);
   },
