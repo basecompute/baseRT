@@ -4676,8 +4676,8 @@ fn convert_generic(
         let is_sidecar = canonical.ends_with(".weight_scale_2")
             || canonical.ends_with(".input_scale")
             || canonical == "d2t";
-        // See GGUF path above for rationale on the f16/GPU route. Qwen3.5 GDN
-        // conv1d + per-head gate projections also route here (f16 on GPU).
+        // See GGUF path above for rationale on the f16/GPU route. The GDN
+        // conv1d (the mapper's `other`) also routes here (f16 on GPU).
         let is_norm_like = !is_sidecar && (shape.len() == 1 || is_gdn_f16(canonical));
         let is_embedding = canonical == "embed_tokens.weight" || canonical == "lm_head.weight";
         // GLM MLA k_b/v_b projections and router weights are raw-f16
@@ -5883,15 +5883,17 @@ fn is_gdn_f32(canonical: &str) -> bool {
     is_gdn_a_log(canonical) || canonical.ends_with(".linear_attn.dt_bias")
 }
 
-/// GDN short causal conv (`conv1d.weight`, [3*dim, 1, K]) and the tiny
-/// per-head gate projections (`in_proj_a` = decay, `in_proj_b` = beta, each
-/// [n_heads, dim]). Precision-critical but not recurrence-accumulated, so
-/// f16-on-GPU is enough — the point is only to escape Q4 (the conv's 4-wide
-/// last dim can't even form a sane quant group).
+/// GDN short causal conv (`conv1d.weight`, [3*dim, 1, K]): the mapper's
+/// `other` — the recurrence's own kernel reads it, and its 4-wide last dim
+/// cannot form a quant group — so it rides the f16-on-GPU route. The per-head
+/// gate projections `in_proj_a` / `in_proj_b` ([n_heads, dim]) are NOT here:
+/// the mapper declares them `linear` (qwen_decl::GDN_LINEARS — the encoder
+/// reads them through `dispatch_gemm`), so a profile / overlay cell for them
+/// is honoured like any linear's (§4.8: the class decides, never the name).
+/// Until 2026-11-14 this rule kept them f16 whatever the profile said; the
+/// first Flash-Next quant build then failed verify on 72 of them.
 fn is_gdn_f16(canonical: &str) -> bool {
     canonical.ends_with(".linear_attn.conv1d.weight")
-        || canonical.ends_with(".linear_attn.in_proj_a.weight")
-        || canonical.ends_with(".linear_attn.in_proj_b.weight")
 }
 
 /// Map an HF-style or MLX-style tensor name to canonical `.base` name.
@@ -8812,12 +8814,14 @@ mod canonical_name_tests {
         assert!(is_gdn_f32("layers.0.linear_attn.A_log"));
         assert!(is_gdn_f32("layers.7.linear_attn.dt_bias"));
         assert!(!is_gdn_a_log("layers.0.linear_attn.dt_bias"));
-        // f16 conv + gate projections.
+        // f16 conv only; the gate projections are the mapper's `linear`.
         assert!(is_gdn_f16("layers.0.linear_attn.conv1d.weight"));
-        assert!(is_gdn_f16("layers.0.linear_attn.in_proj_a.weight"));
-        assert!(is_gdn_f16("layers.0.linear_attn.in_proj_b.weight"));
-        // Big projections + everything else quantize normally (no override).
+        assert!(!is_gdn_f16("layers.0.linear_attn.in_proj_a.weight"));
+        assert!(!is_gdn_f16("layers.0.linear_attn.in_proj_b.weight"));
+        // Big projections, the gate projections + everything else quantize normally (no override).
         for n in [
+            "layers.0.linear_attn.in_proj_a.weight",
+            "layers.0.linear_attn.in_proj_b.weight",
             "layers.0.linear_attn.in_proj_qkv.weight",
             "layers.0.linear_attn.in_proj_z.weight",
             "layers.0.linear_attn.out_proj.weight",

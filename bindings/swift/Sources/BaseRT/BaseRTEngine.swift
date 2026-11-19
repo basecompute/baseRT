@@ -23,8 +23,9 @@ public enum BaseRTEngine {
         baseRT_set_paged_kv(enable ? 1 : 0)
     }
 
-    /// The prefill's Neural Engine split for subsequent loads: on by default;
-    /// false runs every prefill on the GPU alone.
+    /// The prefill's coprocessor split for subsequent loads (the Neural
+    /// Engine on Apple silicon; the XDNA NPU where the engine runs on AMD
+    /// Strix): on by default; false runs every prefill on the GPU alone.
     public static func setNeuralEngine(_ enable: Bool) {
         baseRT_set_neural_engine(enable ? 1 : 0)
     }
