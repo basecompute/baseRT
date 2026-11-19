@@ -44,6 +44,28 @@ The install script checks for the runtime, the BLAS kernels and access to
 `/dev/kfd`, and prints the commands for your machine when something is
 missing. It does not run `apt` itself.
 
+### The NPU on AMD
+
+From 0.5.3 the engine also uses the XDNA2 NPU of these machines beside the GPU
+while it reads a prompt. This is optional: without any of the following the
+engine prints one `[npu_ffn] the prefill stays on the GPU alone: ...` line when
+it loads a model and runs on the GPU as before.
+
+- **The NPU's kernel driver and firmware**, which make `/dev/accel/accel0`:
+  the `amdxdna` driver (in Linux 6.14 and later; Ubuntu 26.04's kernel has it)
+  and the `amdnpu` firmware from `linux-firmware`. The device belongs to the
+  `render` group, like the GPU.
+- **XRT, AMD's runtime for the NPU, with its NPU plugin.** On Ubuntu 26.04:
+  `sudo apt install libxrt2 libxrt-npu2`.
+- **An unlimited locked-memory limit**, because XRT locks a 64 MiB heap. Check
+  with `ulimit -l`. For logins, put `* - memlock unlimited` in a file under
+  `/etc/security/limits.d/` and log in again; for a systemd service, set
+  `LimitMEMLOCK=infinity`. A session that does not pass through PAM keeps the
+  limit of the service that started it.
+
+On a machine with an NPU the install script checks these three and prints what
+is missing, with the command or file for each. It changes none of them itself.
+
 ## One-shot install (recommended)
 
 ```sh

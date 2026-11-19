@@ -24,7 +24,7 @@
 #   BASERT_NO_MODIFY_PATH  set to 1 to skip editing shell profiles
 #
 # For the installer's tests only: BASERT_INSTALL_TEST_ROOT, a folder that
-# stands in for / where the AMD GPU and ROCm checks look.
+# stands in for / where the AMD GPU, ROCm and NPU checks look.
 set -eu
 
 REPO="basecompute/baseRT"
@@ -77,6 +77,105 @@ rocm_steps() {
     fi
   fi
   echo "sudo apt install amdrocm-blas10.0-$1"
+}
+
+# From 0.5.3 the Linux/x86_64 engine also uses the machine's XDNA2 NPU beside
+# the GPU while it reads a prompt; a release that does has the module
+# $NPU_MODULE in its bundle. The NPU is optional. It needs the kernel's amdxdna
+# driver with the NPU's firmware (they make /dev/accel/accel0), AMD's XRT
+# runtime with its NPU plugin, and a locked-memory limit that lets XRT lock
+# its 64 MiB heap; without any of them the engine runs on the GPU alone. This
+# installer says which are missing and how to add them, and changes none.
+NPU_MODULE="baseRT_rocm_npu.so"
+NPU_NODE="/dev/accel/accel0"
+npu_missing=""
+npu_engine=0
+
+# The PCI revision of this machine's XDNA2 NPU (1022:17f0), which also names
+# its firmware folder: 10 on Strix Point, 11 on Strix Halo. Nothing without
+# one.
+npu_pci_revision() {
+  for dev in "$sysroot"/sys/bus/pci/devices/*; do
+    [ "$(cat "$dev/vendor" 2>/dev/null)" = 0x1022 ] || continue
+    [ "$(cat "$dev/device" 2>/dev/null)" = 0x17f0 ] || continue
+    rev="$(sed 's/^0x//' "$dev/revision" 2>/dev/null || true)"
+    echo "${rev:-00}"
+    return 0
+  done
+}
+
+# "yes" when the dynamic loader finds a library ($1): in LD_LIBRARY_PATH, in
+# the folders /etc/ld.so.conf and ld.so.conf.d name, or in its own.
+loader_finds() {
+  {
+    printf '%s\n' "${LD_LIBRARY_PATH:-}" | tr ':' '\n'
+    cat "$sysroot/etc/ld.so.conf" "$sysroot"/etc/ld.so.conf.d/*.conf 2>/dev/null \
+      | sed -n 's|^\(/[^[:space:]#]*\).*|\1|p'
+    printf '%s\n' /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64 /lib /usr/lib
+  } | while IFS= read -r dir; do
+    if [ -n "$dir" ] && [ -e "$sysroot$dir/$1" ]; then echo yes; break; fi
+  done
+}
+
+# What this machine still needs before the engine can use its NPU: a "- " line
+# for each missing piece, and under it the command or file that adds it.
+# Nothing on a machine without an NPU, or with everything there.
+npu_steps() {
+  rev="$(npu_pci_revision)" || true
+  if [ ! -e "$sysroot$NPU_NODE" ]; then
+    [ -n "$rev" ] || return 0 # no NPU in this machine
+    fw="amdnpu/17f0_$rev"
+    if [ ! -d "$sysroot/sys/bus/pci/drivers/amdxdna" ]; then
+      echo "- the NPU's kernel driver, amdxdna, is not loaded, so there is no $NPU_NODE. Linux 6.14"
+      echo "  and later have the driver (Ubuntu 26.04's kernel does); where the kernel has it:"
+      echo "    sudo modprobe amdxdna"
+    elif [ ! -d "$sysroot/lib/firmware/$fw" ] && [ ! -d "$sysroot/usr/lib/firmware/$fw" ]; then
+      echo "- the NPU's firmware is not installed, so its driver made no $NPU_NODE. A current"
+      echo "  linux-firmware package has it (Ubuntu 26.04's does), in:"
+      echo "    /lib/firmware/$fw"
+    else
+      echo "- the NPU's driver, amdxdna, is loaded but made no $NPU_NODE. The kernel log says why:"
+      echo "    sudo dmesg | grep amdxdna"
+    fi
+  elif [ ! -r "$sysroot$NPU_NODE" ] || [ ! -w "$sysroot$NPU_NODE" ]; then
+    echo "- you cannot open $NPU_NODE, the NPU. Add yourself to the render group and log in again:"
+    echo "    sudo usermod -aG render \"\$USER\""
+  fi
+  # The engine's NPU module loads libxrt_coreutil.so.2, and XRT its own NPU
+  # plugin. Ubuntu 26.04 packages both; an older release has neither.
+  case "$(os_release ID) $(os_release VERSION_ID)" in
+    "ubuntu 26.04") from="" ;;
+    *) from=" Ubuntu 26.04 has it as:" ;;
+  esac
+  if [ -z "$(loader_finds libxrt_coreutil.so.2)" ]; then
+    echo "- XRT, the runtime the engine reaches the NPU through, is not installed (libxrt_coreutil.so.2).$from"
+    echo "    sudo apt install libxrt2 libxrt-npu2"
+  elif [ -z "$(loader_finds libxrt_driver_xdna.so.2)" ]; then
+    echo "- XRT is installed without its NPU plugin (libxrt_driver_xdna.so.2).$from"
+    echo "    sudo apt install libxrt-npu2"
+  fi
+  # In bytes, or "unlimited"; what a program started from this shell gets.
+  limit="$(sed -n 's/^Max locked memory  *\([^ ]*\) .*/\1/p' "$sysroot/proc/self/limits" 2>/dev/null || true)"
+  case "$limit" in
+    "" | *[!0-9]*) ;;
+    *)
+      if [ "${#limit}" -le 9 ] && [ "$limit" -lt 67108864 ]; then
+        echo "- the locked-memory limit here is $((limit / 1024)) KiB, and XRT locks a 64 MiB heap for the NPU. For"
+        echo "  logins, add this file and log in again:"
+        echo "    echo '* - memlock unlimited' | sudo tee /etc/security/limits.d/99-basert-npu.conf"
+        echo "  For a systemd service, in its [Service] section:"
+        echo "    LimitMEMLOCK=infinity"
+      fi ;;
+  esac
+}
+
+# The steps above, for a release whose engine uses the NPU.
+npu_report() {
+  [ -n "$npu_missing" ] || return 0
+  echo
+  echo "  Optional: this machine has an XDNA2 NPU, which the engine uses beside the GPU to read"
+  echo "  prompts faster. BaseRT works without it, on the GPU alone. To use the NPU:"
+  printf '%s\n' "$npu_missing" | sed 's/^/    /'
 }
 
 device_hint=""
@@ -250,6 +349,8 @@ case "$os $arch" in
       warn "are not there. Install them from AMD's ROCm 10 apt repository:"
       printf '%s\n' "$rocm_missing" | while IFS= read -r line; do warn "  $line"; done
     fi
+    # Never a reason to stop: the engine runs without the NPU.
+    npu_missing="$(npu_steps 2>/dev/null)" || true
     ASSET_PREFIX="basert-engine-linux-x64-rocm" ;;
   *)
     err "unsupported platform: $os/$arch. BaseRT ships macOS/arm64 (Metal), Linux/arm64 (NVIDIA CUDA) and Linux/x86_64 (AMD ROCm)." ;;
@@ -274,6 +375,7 @@ tag="$(printf '%s' "$json" | grep -o '"tag_name"[^,]*' | grep -o '"[^"]*"$' | tr
 if [ "${BASERT_FORCE:-0}" != "1" ] && [ -x "$INSTALL_DIR/basert" ] \
    && [ -f "$STAMP" ] && [ "$(cat "$STAMP" 2>/dev/null || true)" = "$tag" ]; then
   say "already on $tag at $INSTALL_DIR — nothing to do (set BASERT_FORCE=1 to reinstall)."
+  if [ -e "$INSTALL_DIR/$NPU_MODULE" ]; then npu_report; fi
   exit 0
 fi
 
@@ -299,6 +401,7 @@ mkdir "$stage"
 trap 'rm -rf "$tmp" "$stage"' EXIT
 tar -xzf "$tmp/bundle.tar.gz" -C "$stage"
 chmod +x "$stage"/basert* 2>/dev/null || true
+if [ -e "$stage/$NPU_MODULE" ]; then npu_engine=1; fi
 
 # From 0.4.3 the launcher places a release itself: under versions/, the links in
 # $INSTALL_DIR turned to it in one step, the copy there before kept. A release
@@ -394,6 +497,7 @@ if [ -n "$device_hint" ]; then
   echo "  The engine runs on HIP device 0, which is not your $gpu; make the $gpu device 0:"
   echo "    $device_hint"
 fi
+if [ "$npu_engine" = 1 ]; then npu_report; fi
 echo
 echo "  Try it:"
 echo "    basert pull basecompute/Qwen3-0.6B"
