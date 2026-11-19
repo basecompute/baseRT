@@ -160,6 +160,20 @@ basert list --remote    # also show catalog models not yet installed
 basert list --json      # machine-readable, with each install's variant, path and file
 ```
 
+## Removing
+
+```sh
+basert rm Qwen/Qwen3-4B
+```
+
+Use the exact installed id from `basert list`. This removes `model.base` and
+`hub.json` for all installed variants, then prunes empty variant/model
+directories. Other files and nested models are preserved. Removal runs without
+a confirmation prompt and returns an error if the model is not installed.
+
+Source snapshots and partial downloads under `.src` are retained, including
+sources explicitly kept with `BASERT_KEEP_HF_SOURCES=1`. They are separate from
+the installed variants and may be reused by later pulls.
 The table shows each model's id, architecture, quant, size and status.
 
 ## The catalog

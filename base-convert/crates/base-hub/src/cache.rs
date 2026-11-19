@@ -82,6 +82,98 @@ pub fn base_artifact_path(variant_dir: &Path) -> PathBuf {
     variant_dir.join(ARTIFACT_NAME)
 }
 
+/// Remove every installed variant's artifact and provenance for this exact id.
+/// Preserve staging, other files, and nested model ids; prune only empty dirs.
+pub fn remove_model(root: &Path, id: &str) -> Result<()> {
+    let rel = id_to_relpath(id)?;
+    // The general path helper also accepts filesystem-style separators. A
+    // destructive command accepts only hub ids, never drive paths or variants.
+    if id.contains([':', '\\'])
+        || id.chars().any(char::is_control)
+        || rel.components().any(|c| c.as_os_str() == SRC_STAGING)
+    {
+        bail!("invalid model id for removal: {id:?}");
+    }
+    let root = match std::fs::canonicalize(root) {
+        Ok(root) => root,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("model {id:?} is not installed");
+        }
+        Err(e) => return Err(e).context("resolving model cache"),
+    };
+    let mut model_dir = root.clone();
+    for component in rel.components() {
+        model_dir.push(component);
+        let meta = match std::fs::symlink_metadata(&model_dir) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!("model {id:?} is not installed");
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading {}", model_dir.display())),
+        };
+        // Refuse aliases even when they point to another model inside the cache.
+        if !meta.is_dir() || meta.is_symlink() {
+            bail!(
+                "model path must be a directory without symlinks: {}",
+                model_dir.display()
+            );
+        }
+    }
+    let resolved = std::fs::canonicalize(&model_dir)?;
+    if resolved != model_dir || !resolved.starts_with(&root) || resolved == root {
+        bail!("unsafe model path: {}", model_dir.display());
+    }
+
+    // Like LocalRegistry, recognize regular model.base files without requiring
+    // a valid header or sidecar. Inspect all candidates before deleting anything.
+    let mut variants = Vec::new();
+    for entry in std::fs::read_dir(&model_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || entry.file_name() == SRC_STAGING {
+            continue;
+        }
+        let dir = entry.path();
+        let artifact = base_artifact_path(&dir);
+        match std::fs::symlink_metadata(&artifact) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", artifact.display())),
+        }
+        let sidecar = dir.join(SIDECAR_NAME);
+        let has_sidecar = match std::fs::symlink_metadata(&sidecar) {
+            Ok(meta) if meta.is_file() || meta.is_symlink() => true,
+            Ok(_) => bail!("expected a sidecar file: {}", sidecar.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", sidecar.display())),
+        };
+        variants.push((dir, has_sidecar));
+    }
+    if variants.is_empty() {
+        bail!("model {id:?} is not installed");
+    }
+    variants.sort();
+    for (dir, has_sidecar) in variants {
+        let artifact = base_artifact_path(&dir);
+        std::fs::remove_file(&artifact)
+            .with_context(|| format!("removing {}", artifact.display()))?;
+        if has_sidecar {
+            let sidecar = dir.join(SIDECAR_NAME);
+            std::fs::remove_file(&sidecar)
+                .with_context(|| format!("removing {}", sidecar.display()))?;
+        }
+        remove_empty_dir(&dir)?;
+    }
+    remove_empty_dir(&model_dir)
+}
+
+fn remove_empty_dir(dir: &Path) -> Result<()> {
+    if std::fs::read_dir(dir)?.next().is_none() {
+        std::fs::remove_dir(dir).with_context(|| format!("removing {}", dir.display()))?;
+    }
+    Ok(())
+}
+
 /// Root for hf-hub downloads: `<root>/.src/hf`. Downloads land here (in
 /// hf-hub's own `models--<org>--<repo>/{blobs,snapshots,refs}` layout) instead
 /// of the user's global HuggingFace cache, so a pulled artifact is never
