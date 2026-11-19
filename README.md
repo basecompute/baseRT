@@ -62,6 +62,12 @@ sudo apt install amdrocm-blas10.0-gfx1151
 sudo usermod -aG render "$USER"   # access to the GPU; log in again afterwards
 ```
 
+From 0.5.3 the engine also uses the XDNA2 NPU beside the GPU to read prompts
+faster, when the machine has the NPU's driver (`/dev/accel/accel0`), AMD's XRT
+(`sudo apt install libxrt2 libxrt-npu2` on Ubuntu 26.04) and an unlimited
+locked-memory limit. Without them it runs on the GPU alone; the installer says
+which are missing ([details](docs/getting-started/installation.md#the-npu-on-amd)).
+
 ## Quickstart
 
 ### 1. Install
