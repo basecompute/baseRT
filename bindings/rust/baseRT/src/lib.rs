@@ -233,8 +233,31 @@ impl Model {
     }
 
     /// Get model configuration.
+    ///
+    /// Read through `baseRT_get_config_into` with this crate's
+    /// `size_of::<ModelConfig>()`: the library fills exactly that many bytes
+    /// (zeros past its own struct, truncated if its struct is larger), so a
+    /// mirror built against another header revision can never be overrun the
+    /// way the by-value `baseRT_get_config` would overrun it. Fields the
+    /// library does not know read as zero, which every field treats as "not
+    /// applicable".
     pub fn config(&self) -> ModelConfig {
-        unsafe { baseRT_sys::baseRT_get_config(self.handle) }
+        // SAFETY: all-zero bytes are a valid value of this all-POD #[repr(C)]
+        // struct, and the library writes at most `size_of::<ModelConfig>()`
+        // bytes into it.
+        let mut cfg: ModelConfig = unsafe { std::mem::zeroed() };
+        let lib_size = unsafe {
+            baseRT_sys::baseRT_get_config_into(
+                self.handle,
+                &mut cfg as *mut ModelConfig as *mut c_void,
+                std::mem::size_of::<ModelConfig>(),
+            )
+        };
+        debug_assert!(
+            lib_size > 0,
+            "baseRT_get_config_into returned no configuration"
+        );
+        cfg
     }
 
     /// Get total GPU memory used by the model in bytes.

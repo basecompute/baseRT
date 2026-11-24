@@ -23,6 +23,19 @@ impl crate::HfMapper for Gemma3HfMapper {
     fn canonical_arch(&self) -> &'static str {
         "gemma3"
     }
+    /// The Llama-shaped block. The runtime never reads a head: the one
+    /// (tied) table is `embedding`, read through both the lookup and
+    /// `dispatch_gemm`, and the converter synthesizes no copy.
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> crate::decl::TensorClass {
+        crate::decl::dense::class(canonical, shape)
+    }
+    fn fold_groups(
+        &self,
+        tensors: &[(String, Vec<u64>)],
+        cfg: &crate::ArchConfig,
+    ) -> Vec<crate::decl::FoldGroup> {
+        crate::decl::dense::fold_groups(tensors, cfg, &|n| self.norm_shift(n))
+    }
 
     /// Gemma 3 stores zero-centered RMSNorm gamma and applies
     /// `rmsnorm(x) * (1 + weight)` at inference. Bake the +1 into
@@ -90,6 +103,71 @@ impl crate::HfMapper for Gemma3HfMapper {
 impl crate::HfMapper for Gemma4HfMapper {
     fn canonical_arch(&self) -> &'static str {
         "gemma4"
+    }
+    /// Gemma 4 = the Gemma 3 block plus per-layer embeddings (PLE) and,
+    /// on the MoE builds, fused expert stacks beside the shared dense FFN.
+    /// `per_layer_token_embd` is a lookup (the engine's quant-aware
+    /// embedding kernel with `n_layers·ple_dim` rows); `per_layer_model_proj`
+    /// and the per-layer `per_layer_inp_gate` / `per_layer_proj` are
+    /// `dispatch_gemm` GEMMs. The router (`mlp.router`), its scalar
+    /// (`ffn_gate_inp.scale`), the per-expert scale (`ffn_down_exps.scale`)
+    /// and every norm are `other`. No head: the table is tied.
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> crate::decl::TensorClass {
+        use crate::decl::{moe, tail, TensorClass};
+        if canonical == "per_layer_token_embd.weight" {
+            return TensorClass::Embedding;
+        }
+        if canonical == "per_layer_model_proj.weight" {
+            return TensorClass::Linear;
+        }
+        if moe::is_stack(canonical, shape) {
+            return TensorClass::ExpertStack;
+        }
+        match tail(canonical) {
+            "per_layer_inp_gate.weight" | "per_layer_proj.weight" => TensorClass::Linear,
+            _ => crate::decl::dense::class(canonical, shape),
+        }
+    }
+    /// The dense groups, the routed experts' `moe` (their own
+    /// `pre_ffw_norm_2`, which nothing else consumes) and `moe_down`, and
+    /// no `o`: Gemma 4 RMS-normalizes V per head without a weight, so a
+    /// `1/s` folded into v's rows is normalized away. The PLE projections
+    /// read the residual stream and `gelu(gate) ⊙ ple` — no norm in front
+    /// of either — so they declare no fold.
+    fn fold_groups(
+        &self,
+        tensors: &[(String, Vec<u64>)],
+        cfg: &crate::ArchConfig,
+    ) -> Vec<crate::decl::FoldGroup> {
+        use crate::decl::{dense, moe, Declare, TensorSet};
+        let set = TensorSet::new(tensors);
+        let norm_shift = |n: &str| self.norm_shift(n);
+        let mut d = Declare::new(&set, &norm_shift);
+        for layer in set.layers() {
+            let p = format!("layers.{layer}.");
+            dense::attn_groups(&mut d, layer);
+            if set.has(&format!("{p}self_attn.o_proj.weight")) {
+                d.refuse_last(format!(
+                    "gemma4 RMS-normalizes V per head (no weight); 1/s in {p}self_attn.v_proj.weight's rows would be normalized away"
+                ));
+            }
+            dense::mlp_groups(&mut d, layer);
+            d.gamma(
+                "moe",
+                Some(layer),
+                format!("{p}pre_ffw_norm_2.weight"),
+                &[format!("{p}ffn_gate_up_exps.weight")],
+            );
+            moe::down_group(
+                &mut d,
+                layer,
+                "ffn_gate_up_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+            );
+        }
+        dense::head_group(&mut d, cfg);
+        d.finish()
     }
     fn config_from_hf(&self, c: &serde_json::Value) -> Result<crate::ArchConfig> {
         // Gemma-4 multimodal configs nest text under "text_config". For

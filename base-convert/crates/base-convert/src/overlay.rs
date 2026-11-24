@@ -481,6 +481,7 @@ pub(crate) fn emit_kquant_blocks(
     canonical: &str,
     shape: Vec<u64>,
     st: &SafetensorsFile,
+    is_embedding: bool,
 ) -> Result<(TensorEntry, Vec<u8>)> {
     use base_readers::safetensors::StDtype;
     let kq = e.kquant.as_ref().expect("validated: a k-quant entry");
@@ -543,7 +544,8 @@ pub(crate) fn emit_kquant_blocks(
         ggml_type: kq.ggml_type,
         data_offset: 0,
     };
-    let (mut entry, data) = kquant_passthrough_entry(&src, bytes, canonical.to_string());
+    let (mut entry, data) =
+        kquant_passthrough_entry(&src, bytes, canonical.to_string(), is_embedding);
     entry.algo = Some(
         match e.algo {
             OverlayAlgo::Gptq => "gptq",
@@ -809,6 +811,7 @@ impl OverlayPlan {
         e: &OverlaySpecEntry,
         canonical: &str,
         shape: Vec<u64>,
+        is_embedding: bool,
     ) -> Result<(TensorEntry, Vec<u8>)> {
         let (path, what) = match (&e.kquant, &e.values) {
             (Some(kq), _) => (&kq.blocks, "blocks"),
@@ -825,7 +828,7 @@ impl OverlayPlan {
             files.insert(path.clone(), st);
         }
         if e.kquant.is_some() {
-            emit_kquant_blocks(e, canonical, shape, &files[path])
+            emit_kquant_blocks(e, canonical, shape, &files[path], is_embedding)
                 .with_context(|| format!("k-quant blocks for {canonical}"))
         } else if e.values.is_some() {
             emit_values(e, canonical, shape, &files[path])
@@ -1980,7 +1983,7 @@ mod tests {
             let st = SafetensorsFile::open(&path).unwrap();
             let spec = serde_json::json!({"tensors": {name: {"dtype": spec_name, "blocks": path, "algo": "gptq"}}});
             let e = parse_overlay_spec(&spec).unwrap().remove(0);
-            let (entry, got) = emit_kquant_blocks(&e, name, vec![n, k], &st).unwrap();
+            let (entry, got) = emit_kquant_blocks(&e, name, vec![n, k], &st, false).unwrap();
             assert_eq!(got, blocks, "{spec_name}: bytes must be verbatim");
 
             // the same weight as a GGUF file lists it: ne = [k, n]
@@ -1990,7 +1993,8 @@ mod tests {
                 ggml_type: ty,
                 data_offset: 0,
             };
-            let (mut want, want_bytes) = kquant_passthrough_entry(&src, &blocks, name.to_string());
+            let (mut want, want_bytes) =
+                kquant_passthrough_entry(&src, &blocks, name.to_string(), false);
             assert_eq!(want_bytes, blocks);
             want.algo = Some("gptq".to_string());
             assert_eq!(
@@ -2070,20 +2074,22 @@ mod tests {
             .unwrap()
             .remove(0)
         };
-        assert!(emit_kquant_blocks(&entry_for(name), name, vec![2, n, k], &st).is_err());
-        assert!(emit_kquant_blocks(&entry_for(name), name, vec![n, 500], &st).is_err());
-        assert!(emit_kquant_blocks(&entry_for(name), name, vec![n, k], &st).is_err()); // wrong shape
-        assert!(emit_kquant_blocks(&entry_for("missing"), "missing", vec![n, k], &st).is_err());
-        assert!(emit_kquant_blocks(&entry_for("f16"), "f16", vec![n, k], &st).is_err());
-        assert!(emit_kquant_blocks(&entry_for("other"), "other", vec![n, k], &st).is_ok());
+        let emit =
+            |nm: &str, shape: Vec<u64>| emit_kquant_blocks(&entry_for(nm), nm, shape, &st, false);
+        assert!(emit(name, vec![2, n, k]).is_err());
+        assert!(emit(name, vec![n, 500]).is_err());
+        assert!(emit(name, vec![n, k]).is_err()); // wrong shape
+        assert!(emit("missing", vec![n, k]).is_err());
+        assert!(emit("f16", vec![n, k]).is_err());
+        assert!(emit("other", vec![n, k]).is_ok());
         // a 3-D expert stack: packs in Q4_K (expert_stack_kquant), refused in Q6_K
-        assert!(emit_kquant_blocks(&entry_for("exps4"), "exps4", vec![2, n, k], &st).is_ok());
+        assert!(emit("exps4", vec![2, n, k]).is_ok());
         let e6 = parse_overlay_spec(
             &serde_json::json!({"tensors": {"exps6": {"dtype": "q6_k", "blocks": path}}}),
         )
         .unwrap()
         .remove(0);
-        let err = emit_kquant_blocks(&e6, "exps6", vec![2, n, k], &st)
+        let err = emit_kquant_blocks(&e6, "exps6", vec![2, n, k], &st, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("3-D expert stack"), "{err}");

@@ -23,6 +23,20 @@ impl crate::HfMapper for NomicBertHfMapper {
     fn canonical_arch(&self) -> &'static str {
         "nomic-bert"
     }
+    /// The word and token-type tables are lookups; the fused `qkv_proj`,
+    /// `o_proj` and the GLU FFN are GEMMs; the layer norms and biases are
+    /// `other`. No head, no folds (outside the pipeline).
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> crate::decl::TensorClass {
+        use crate::decl::{tail, TensorClass};
+        match canonical {
+            "embed_tokens.weight" | "token_types.weight" => return TensorClass::Embedding,
+            _ => {}
+        }
+        match tail(canonical) {
+            "self_attn.qkv_proj.weight" => TensorClass::Linear,
+            _ => crate::decl::dense::class(canonical, shape),
+        }
+    }
     fn config_from_hf(&self, c: &serde_json::Value) -> Result<ArchConfig> {
         // Nomic uses GPT-2-style key names (n_embd / n_head / n_inner)
         // rather than the LLaMA convention (hidden_size / num_attention_heads).

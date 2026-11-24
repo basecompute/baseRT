@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
+import shutil
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -72,6 +75,9 @@ class TestBaseRTModelConfig:
             "vision_n_layers",      # vision tower
             "vision_arch",          # vision family selector
             "audio_n_layers",       # audio tower
+            "q_lora_rank",          # GLM 5.2 / glm-dsa
+            "rope_yarn_beta_fast",  # gpt-oss
+            "hc_count",             # Qwen3.8-Flash-Next (qwen4_exp)
         ]
         indices = [names.index(f) for f in block_order]
         assert indices == sorted(indices)
@@ -80,7 +86,20 @@ class TestBaseRTModelConfig:
         # Keep this in sync with include/baseRT/types.h. The runtime ABI-size
         # assertion below catches layout drift; this count catches accidental
         # omission of same-sized fields from the ctypes mirror.
-        assert len(BaseRTModelConfig._fields_) == 131
+        assert len(BaseRTModelConfig._fields_) == 149
+
+    def test_qwen4_exp_tail_layout(self):
+        # The qwen4_exp block is the first with a uint64_t member: it starts
+        # right after the gpt-oss block (1792, the whole struct before it) and
+        # its ngram_mult[4] lands on an 8-byte boundary, so the struct is now
+        # 8-byte aligned. Offsets from include/baseRT/types.h.
+        assert BaseRTModelConfig.hc_count.offset == 1792
+        assert BaseRTModelConfig.ngram_head_vocab.offset == 1832
+        assert BaseRTModelConfig.ngram_head_off.offset == 1960
+        assert BaseRTModelConfig.indexer_n_heads.offset == 2088
+        assert BaseRTModelConfig._q4_pad.offset == 2104
+        assert BaseRTModelConfig.ngram_mult.offset == 2112
+        assert ctypes.alignment(BaseRTModelConfig) == 8
 
     def test_architecture_field_is_char_array(self):
         # architecture should be a fixed 32-byte char array
@@ -618,7 +637,7 @@ class TestStructSizes:
         # Exact sizeof(BaseRTModelConfig) from include/baseRT/types.h; the
         # library cross-check happens at import via baseRT_model_config_sizeof.
         # Must match the Rust mirror test (bindings/rust/baseRT-sys).
-        assert ctypes.sizeof(BaseRTModelConfig) == 1792
+        assert ctypes.sizeof(BaseRTModelConfig) == 2144
 
     def test_sampling_config_size(self):
         size = ctypes.sizeof(BaseRTSamplingConfig)
@@ -852,3 +871,136 @@ class TestGetLib:
                     result = baseRT._get_lib()
                     load_mock.assert_called_once()
                     setup_mock.assert_called_once_with(fake_lib)
+
+
+# -------------------------------------------------------------------------
+# Mixed-version engine: the binding and the installed library disagree on
+# sizeof(BaseRTModelConfig)
+# -------------------------------------------------------------------------
+
+# Every C symbol the binding resolves: _setup_signatures touches each one, so
+# the stand-in engine exports all of them (never called here).
+_BINDING_SOURCE = (_BINDINGS_DIR / "baseRT" / "__init__.py").read_text()
+_ALL_SYMBOLS = sorted(set(re.findall(r"\bbaseRT_[A-Za-z0-9_]+\b", _BINDING_SOURCE)))
+
+# The previous layout (0.5.2, before the qwen4_exp block) ends where the first
+# appended field begins.
+_OLD_SIZE = BaseRTModelConfig.hc_count.offset
+
+_IMPLEMENTED = {
+    "baseRT_load_model",
+    "baseRT_free_model",
+    "baseRT_get_error",
+    "baseRT_version_string",
+    "baseRT_model_config_sizeof",
+    "baseRT_get_config",
+    "baseRT_get_config_into",
+}
+
+
+def _build_old_engine(tmp_path: Path, *, sized_getter: bool) -> str:
+    """Compile an engine built against the previous header, with or without the sized getter."""
+    off = lambda f: getattr(BaseRTModelConfig, f).offset  # noqa: E731
+    stubs = "\n".join(f"void {s}(void) {{}}" for s in _ALL_SYMBOLS if s not in _IMPLEMENTED)
+    sized = (
+        """
+size_t baseRT_get_config_into(void *m, void *out, size_t out_size) {
+    size_t n = out_size < OLD_SIZE ? out_size : OLD_SIZE;
+    if (!m) { memset(out, 0, out_size); return OLD_SIZE; }
+    memcpy(out, &g_cfg, n);
+    if (out_size > n) memset((unsigned char *)out + n, 0, out_size - n);
+    return OLD_SIZE;
+}"""
+        if sized_getter
+        else ""
+    )
+    src = f"""
+#include <stddef.h>
+#include <string.h>
+#define OLD_SIZE {_OLD_SIZE}
+typedef struct {{ unsigned char b[OLD_SIZE]; }} OldConfig;
+static OldConfig g_cfg;
+static void fill(void) {{
+    unsigned int v;
+    memset(&g_cfg, 0, sizeof g_cfg);
+    v = 4096u;   memcpy(g_cfg.b + {off("dim")}, &v, 4);
+    v = 32u;     memcpy(g_cfg.b + {off("n_layers")}, &v, 4);
+    v = 151936u; memcpy(g_cfg.b + {off("vocab_size")}, &v, 4);
+    memcpy(g_cfg.b + {off("architecture")}, "qwen3", 6);
+    /* _gptoss_pad, the old struct's last byte: a copy that stops short shows here */
+    g_cfg.b[OLD_SIZE - 1] = 0xA5;
+}}
+void *baseRT_load_model(const char *p, const char *k, int c) {{ (void)p; (void)k; (void)c; fill(); return &g_cfg; }}
+void baseRT_free_model(void *m) {{ (void)m; }}
+const char *baseRT_get_error(void) {{ return "stand-in engine"; }}
+const char *baseRT_version_string(void) {{ return "0.5.2-stand-in"; }}
+size_t baseRT_model_config_sizeof(void) {{ return OLD_SIZE; }}
+OldConfig baseRT_get_config(void *m) {{ (void)m; return g_cfg; }}
+{sized}
+{stubs}
+"""
+    tag = "sized" if sized_getter else "legacy"
+    src_path = tmp_path / f"engine-{tag}.c"
+    ext = "dylib" if sys.platform == "darwin" else "so"
+    lib_path = tmp_path / f"libbaseRT-prev-{tag}.{ext}"
+    src_path.write_text(src)
+    subprocess.run(["cc", "-shared", "-fPIC", "-o", str(lib_path), str(src_path)], check=True)
+    return str(lib_path)
+
+
+@pytest.mark.skipif(shutil.which("cc") is None, reason="needs a C compiler for the stand-in engine")
+class TestMixedVersionEngine:
+    """A newer binding over an engine still on the previous BaseRTModelConfig layout.
+
+    The struct only ever grows by appended fields and baseRT_get_config_into
+    copies the caller's size (zeros past the library's own struct), so such an
+    engine must load and read the fields the two share. Only the by-value
+    baseRT_get_config fallback needs the exact size. The stand-in engine is
+    compiled with ``cc`` (the toolchain ``make shared`` needs anyway).
+    """
+
+    def test_previous_layout_is_smaller_than_the_mirror(self):
+        assert _OLD_SIZE == 1792
+        assert ctypes.sizeof(BaseRTModelConfig) > _OLD_SIZE
+
+    def test_sized_getter_loads_and_appended_fields_read_zero(self, tmp_path):
+        lib_path = _build_old_engine(tmp_path, sized_getter=True)
+        with mock.patch.dict(os.environ, {"BASERT_LIB_PATH": lib_path}), mock.patch("baseRT._lib", None):
+            lib = baseRT._get_lib()  # the size check must accept the smaller engine
+            assert lib.baseRT_model_config_sizeof() == _OLD_SIZE
+
+            m = baseRT.Model("any.base")
+            try:
+                cfg = m.config
+                assert cfg.dim == 4096
+                assert cfg.n_layers == 32
+                assert cfg.vocab_size == 151936
+                assert cfg.architecture == "qwen3"
+
+                # Through the raw sized getter, into a full-size mirror that
+                # starts out all ones: only the engine's zero-fill can clear it.
+                c = BaseRTModelConfig()
+                ctypes.memset(ctypes.addressof(c), 0xFF, ctypes.sizeof(c))
+                lib_size = lib.baseRT_get_config_into(m._handle, ctypes.byref(c), ctypes.sizeof(c))
+                assert lib_size == _OLD_SIZE
+                assert c.dim == 4096
+                assert c._gptoss_pad == 0xA5  # the old struct's last byte arrived
+                raw = bytes(c)
+                assert raw[_OLD_SIZE:] == b"\x00" * (ctypes.sizeof(c) - _OLD_SIZE)
+                assert c.hc_count == 0
+                assert c.indexer_n_heads == 0
+                assert list(c.ngram_mult) == [0, 0, 0, 0]
+            finally:
+                m.close()
+
+    def test_without_sized_getter_another_size_is_still_refused(self, tmp_path):
+        lib_path = _build_old_engine(tmp_path, sized_getter=False)
+        with mock.patch.dict(os.environ, {"BASERT_LIB_PATH": lib_path}), mock.patch("baseRT._lib", None):
+            with pytest.raises(RuntimeError, match="layout drift"):
+                baseRT.Model("any.base")
+            # The refused library was not cached: a caller that catches the
+            # error and retries is refused again, not handed the half-declared
+            # library and its by-value getter.
+            assert baseRT._lib is None
+            with pytest.raises(RuntimeError, match="layout drift"):
+                baseRT._get_lib()

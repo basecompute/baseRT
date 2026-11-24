@@ -43,6 +43,18 @@ impl crate::HfMapper for LlamaHfMapper {
             None
         }
     }
+    /// The Llama block exactly as `decl::dense` describes it: the lookup,
+    /// the head and the seven projections; norms are `other`.
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> crate::decl::TensorClass {
+        crate::decl::dense::class(canonical, shape)
+    }
+    fn fold_groups(
+        &self,
+        tensors: &[(String, Vec<u64>)],
+        cfg: &crate::ArchConfig,
+    ) -> Vec<crate::decl::FoldGroup> {
+        crate::decl::dense::fold_groups(tensors, cfg, &|n| self.norm_shift(n))
+    }
 }
 
 /// Phi-3 through the Llama mapper, minus the variants the engine cannot
@@ -76,6 +88,16 @@ impl crate::HfMapper for Phi3HfMapper {
     }
     fn rope_permute_heads(&self, canonical: &str, cfg: &crate::ArchConfig) -> Option<u32> {
         LlamaHfMapper.rope_permute_heads(canonical, cfg)
+    }
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> crate::decl::TensorClass {
+        LlamaHfMapper.tensor_class(canonical, shape)
+    }
+    fn fold_groups(
+        &self,
+        tensors: &[(String, Vec<u64>)],
+        cfg: &crate::ArchConfig,
+    ) -> Vec<crate::decl::FoldGroup> {
+        LlamaHfMapper.fold_groups(tensors, cfg)
     }
 }
 

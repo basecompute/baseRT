@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
-__version__ = "0.5.3"
+__version__ = "0.5.4"
 
 # ---------------------------------------------------------------------------
 # Library loading
@@ -97,8 +97,12 @@ _lib: Optional[ctypes.CDLL] = None
 def _get_lib() -> ctypes.CDLL:
     global _lib
     if _lib is None:
-        _lib = _load_lib()
-        _setup_signatures(_lib)
+        # Published to _lib only once _setup_signatures has accepted it: a
+        # library it refused (layout drift) must not be cached half-declared
+        # for a caller that catches the error and retries.
+        candidate = _load_lib()
+        _setup_signatures(candidate)
+        _lib = candidate
     return _lib
 
 
@@ -253,6 +257,26 @@ class BaseRTModelConfig(ctypes.Structure):
         ("attention_bias", ctypes.c_uint8),
         ("rope_yarn_truncate", ctypes.c_uint8),
         ("_gptoss_pad", ctypes.c_uint8),
+        # Qwen3.8-Flash-Next (qwen4_exp; 0 / empty = not applicable)
+        ("hc_count", ctypes.c_uint32),
+        ("hc_lowrank", ctypes.c_uint32),
+        ("gdn_gate_sigmoid", ctypes.c_uint32),
+        ("ple_layer", ctypes.c_uint32),
+        ("ple_embed_dim", ctypes.c_uint32),
+        ("ple_conv_kernel", ctypes.c_uint32),
+        ("ngram_size", ctypes.c_uint32),
+        ("heads_per_ngram", ctypes.c_uint32),
+        ("ple_eos_token", ctypes.c_uint32),
+        ("ngram_padded_vocab", ctypes.c_uint32),
+        ("ngram_head_vocab", ctypes.c_uint32 * 32),
+        ("ngram_head_off", ctypes.c_uint32 * 32),
+        ("indexer_n_heads", ctypes.c_uint32),
+        ("indexer_head_dim", ctypes.c_uint32),
+        ("indexer_budget", ctypes.c_uint32),
+        ("indexer_compress", ctypes.c_uint32),
+        ("_q4_pad", ctypes.c_uint32),
+        # uint64_t: the struct is 8-byte aligned from here on (2144 bytes).
+        ("ngram_mult", ctypes.c_uint64 * 4),
     ]
 
 
@@ -495,20 +519,36 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.baseRT_get_config.argtypes = [ctypes.c_void_p]
     lib.baseRT_get_config.restype = BaseRTModelConfig
 
-    # BaseRTModelConfig is mirrored by hand above; a size mismatch means the
-    # mirror drifted from include/baseRT/types.h and every field after the
-    # divergence point decodes as garbage. Fail at import, not at use.
-    # (Older libraries predate the symbol; skip the check there.)
+    # Preferred getter (since 0.4.0): copies the config into a buffer of the
+    # caller's size, zero-filling past the library's struct and truncating a
+    # larger one, and returns the library's sizeof. Model.config uses it when
+    # present so the native side never writes past our mirror; the by-value
+    # baseRT_get_config stays declared as the fallback for older libraries.
+    has_sized_getter = hasattr(lib, "baseRT_get_config_into")
+    if has_sized_getter:
+        lib.baseRT_get_config_into.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+        lib.baseRT_get_config_into.restype = ctypes.c_size_t
+
+    # BaseRTModelConfig is mirrored by hand above. The struct only ever grows
+    # by appended fields, so with the sized getter a library of another size
+    # is the supported mixed-version case (an engine still on the previous
+    # layout under a newer binding, or the reverse): we read the fields we
+    # share and see zeros for the rest, which every field treats as "not
+    # applicable". Only the by-value fallback needs the exact size -- ctypes
+    # sizes its return slot from our mirror, so a different library size
+    # would decode garbage past the divergence point there. Fail at import,
+    # not at use. (Older libraries predate the symbol; skip the check there.)
     if hasattr(lib, "baseRT_model_config_sizeof"):
         lib.baseRT_model_config_sizeof.argtypes = []
         lib.baseRT_model_config_sizeof.restype = ctypes.c_size_t
         c_size = lib.baseRT_model_config_sizeof()
         py_size = ctypes.sizeof(BaseRTModelConfig)
-        if c_size != py_size:
+        if c_size != py_size and not has_sized_getter:
             raise RuntimeError(
                 f"BaseRTModelConfig layout drift: library says {c_size} bytes, "
-                f"Python mirror is {py_size} bytes. Update the _fields_ list in "
-                "bindings/python/baseRT/__init__.py to match include/baseRT/types.h."
+                f"Python mirror is {py_size} bytes, and the library has no "
+                "baseRT_get_config_into to read it by size. Update the _fields_ list "
+                "in bindings/python/baseRT/__init__.py to match include/baseRT/types.h."
             )
 
     lib.baseRT_model_memory.argtypes = [ctypes.c_void_p]
@@ -1088,7 +1128,20 @@ class Model:
         """Return the model configuration."""
         with self._handle_lock:
             self._ensure_open()
-            c = self._lib.baseRT_get_config(self._handle)
+            if hasattr(self._lib, "baseRT_get_config_into"):
+                # Caller-sized copy: the library fills exactly sizeof(mirror)
+                # bytes (zeros past its own struct), so a size difference
+                # between the two can never overrun the buffer. It returns its
+                # own sizeof; anything we are missing reads as zero, which
+                # every field treats as "not applicable".
+                c = BaseRTModelConfig()
+                lib_size = self._lib.baseRT_get_config_into(
+                    self._handle, ctypes.byref(c), ctypes.sizeof(c)
+                )
+                if lib_size == 0:
+                    raise BaseRTError("baseRT_get_config_into returned no configuration")
+            else:
+                c = self._lib.baseRT_get_config(self._handle)
         return ModelConfig._from_c(c)
 
     @property

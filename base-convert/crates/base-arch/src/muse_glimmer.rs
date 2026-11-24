@@ -51,6 +51,17 @@ impl HfMapper for MuseGlimmerHfMapper {
     fn canonical_arch(&self) -> &'static str {
         "muse_glimmer"
     }
+    /// A Llama-shaped dense block (Gemma-style four norms, all `other`).
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> crate::decl::TensorClass {
+        crate::decl::dense::class(canonical, shape)
+    }
+    fn fold_groups(
+        &self,
+        tensors: &[(String, Vec<u64>)],
+        cfg: &crate::ArchConfig,
+    ) -> Vec<crate::decl::FoldGroup> {
+        crate::decl::dense::fold_groups(tensors, cfg, &|n| self.norm_shift(n))
+    }
 
     /// Bake the +1 unit offset into the zero-centered per-layer RMSNorm
     /// gammas so the runtime's plain `rmsnorm(x) * weight` kernel yields

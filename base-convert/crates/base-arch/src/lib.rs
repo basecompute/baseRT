@@ -7,6 +7,7 @@
 //! consistently regardless of source format.
 
 pub mod bert;
+pub mod decl;
 pub mod dflash;
 pub mod gemma;
 pub mod glm;
@@ -212,6 +213,88 @@ pub trait HfMapper: Sync {
     fn row_rms_normalize(&self, _canonical: &str, _cfg: &ArchConfig) -> Option<f32> {
         None
     }
+
+    /// The §4.8 class of a canonical main-bundle tensor — how the engine
+    /// reads it ([`decl::TensorClass`]). The mapper is the only source of
+    /// it: `basert inventory` reports it, the convert path routes the
+    /// tensor by it (embedding layout, expert packing, `other` kept as
+    /// stored), and nothing downstream derives a class from the name.
+    /// Default: `other` — a mapper outside the pipeline must declare its
+    /// classes before quant can price its tensors.
+    fn tensor_class(&self, _canonical: &str, _shape: &[u64]) -> decl::TensorClass {
+        decl::TensorClass::Other
+    }
+
+    /// A §4.8 extension request for an `other` main-bundle tensor: the
+    /// class it would take if the shared helper could serve it, and what
+    /// the helper lacks ([`decl::DispatchExtension`]). `basert inventory`
+    /// lists it (`extension`), the add record carries it and finish writes
+    /// the `TODO_dispatch` hand-off; the `other` bound does not price it.
+    /// Only for an `other` tensor, and never `other` as the class.
+    /// Default: none.
+    fn dispatch_extension(
+        &self,
+        _canonical: &str,
+        _shape: &[u64],
+    ) -> Option<decl::DispatchExtension> {
+        None
+    }
+
+    /// The class of a tensor of the `mmproj` section (a vision / audio
+    /// tower and its projector). Default: [`decl::tower_class_default`].
+    fn mmproj_class(&self, canonical: &str, shape: &[u64]) -> decl::TensorClass {
+        decl::tower_class_default(canonical, shape)
+    }
+
+    /// The class of a tensor of the `speculator` section (`mtp.<name>`:
+    /// a Multi-Token-Prediction head built from the main block's own
+    /// tensors). Default: the main-bundle class of the inner name; the
+    /// head's own projections (`mtp.fc*`) are GEMMs.
+    fn speculator_class(&self, canonical: &str, shape: &[u64]) -> decl::TensorClass {
+        let inner = canonical.strip_prefix("mtp.").unwrap_or(canonical);
+        if inner.starts_with("fc") && inner.ends_with(".weight") && shape.len() == 2 {
+            return decl::TensorClass::Linear;
+        }
+        self.tensor_class(inner, shape)
+    }
+
+    /// The AWQ fold groups over the checkpoint's canonical main-bundle
+    /// tensors (`(name, shape)`), as [`decl`] describes them. The
+    /// inventory reports them and `build_awq_fold_plan` applies exactly
+    /// these. Default: no folds.
+    fn fold_groups(
+        &self,
+        _tensors: &[(String, Vec<u64>)],
+        _cfg: &ArchConfig,
+    ) -> Vec<decl::FoldGroup> {
+        Vec::new()
+    }
+}
+
+/// The mapper that declares classes and folds for a canonical arch (the
+/// `.base` header's `arch`), for the paths that know the arch but not the
+/// HF `model_type` (the GGUF convert path, the fold plan).
+pub fn declaring_mapper(canonical_arch: &str) -> Option<&'static dyn HfMapper> {
+    Some(match canonical_arch {
+        "llama" => &llama::LlamaHfMapper,
+        "qwen" => &qwen::QwenHfMapper,
+        "qwen_moe" | "qwen3_moe" => &qwen::QwenMoeHfMapper,
+        "qwen35" => &qwen::Qwen35HfMapper,
+        "qwen35moe" => &qwen::Qwen35MoeHfMapper,
+        "qwen4_exp" => &qwen::Qwen4ExpHfMapper,
+        "gemma3" => &gemma::Gemma3HfMapper,
+        "gemma4" => &gemma::Gemma4HfMapper,
+        "nemotron_h_moe" => &nemotron::NemotronHHfMapper,
+        "glm_dsa" => &glm::GlmDsaMapper,
+        "muse_glimmer" => &muse_glimmer::MuseGlimmerHfMapper,
+        "gpt_oss" => &gpt_oss::GptOssHfMapper,
+        "nomic-bert" => &bert::NomicBertHfMapper,
+        "whisper" => &whisper::WhisperHfMapper,
+        "dflash" => &dflash::DflashHfMapper,
+        "dspark" => &dflash::DsparkHfMapper,
+        "eagle3" => &dflash::Eagle3HfMapper,
+        _ => return None,
+    })
 }
 
 pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMapper> {
@@ -249,6 +332,9 @@ pub fn hf_mapper_for_model_type(model_type: &str) -> Option<&'static dyn HfMappe
         // `qwen3_5_text`) and the multimodal wrapper convert identically.
         "qwen3_5" | "qwen3_5_text" | "qwen35" => Some(&qwen::Qwen35HfMapper),
         "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen35_moe" => Some(&qwen::Qwen35MoeHfMapper),
+        // Qwen3.8-Flash-Next: the Qwen3.5-MoE hybrid plus hyper-connections,
+        // a per-layer n-gram embedding and the QSA sparse-attention indexer.
+        "qwen4_exp" | "qwen4_exp_text" => Some(&qwen::Qwen4ExpHfMapper),
         "nomic_bert" | "nomic-bert" => Some(&bert::NomicBertHfMapper),
         // Muse Glimmer: dense SWA/global decoder with a perception (ViT)
         // tower. The multimodal wrapper is `muse_glimmer`
@@ -309,6 +395,8 @@ pub const SUPPORTED_HF_MODEL_TYPES: &[&str] = &[
     "qwen3_5_moe",
     "qwen3_5_moe_text",
     "qwen35_moe",
+    "qwen4_exp",
+    "qwen4_exp_text",
     "nomic_bert",
     "gemma",
     "gemma2",

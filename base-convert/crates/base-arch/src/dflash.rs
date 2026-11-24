@@ -468,9 +468,32 @@ pub fn check_block_drafter_qk_norms<'a>(
     )
 }
 
+/// Classes of a drafter sidecar (DFlash / DSpark / EAGLE-3): the target's
+/// embedding copy is a lookup, the head and the decoder layer's
+/// projections are GEMMs, and so are the drafter's own projections —
+/// the context `fc` (one tensor, or the converter's per-tap column
+/// blocks `fc.N.weight`), the Markov head's `w1` / `w2` and the
+/// confidence head's `proj`. Norms, biases, the `d2t` id table and the
+/// DFlash 2 convolution / selector parameters are `other`. No folds.
+pub fn drafter_class(canonical: &str, shape: &[u64]) -> crate::decl::TensorClass {
+    use crate::decl::TensorClass;
+    if shape.len() == 2
+        && canonical.ends_with(".weight")
+        && (canonical.starts_with("fc.")
+            || canonical.starts_with("markov.")
+            || canonical.starts_with("confidence."))
+    {
+        return TensorClass::Linear;
+    }
+    crate::decl::dense::class(canonical, shape)
+}
+
 impl HfMapper for DflashHfMapper {
     fn canonical_arch(&self) -> &'static str {
         "dflash"
+    }
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> crate::decl::TensorClass {
+        drafter_class(canonical, shape)
     }
     fn config_from_hf(&self, c: &serde_json::Value) -> Result<ArchConfig> {
         let mut cfg = drafter_config_from_hf(c, "dflash")?;
@@ -578,6 +601,9 @@ impl HfMapper for Gemma4MtpHfMapper {
 impl HfMapper for DsparkHfMapper {
     fn canonical_arch(&self) -> &'static str {
         "dspark"
+    }
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> crate::decl::TensorClass {
+        drafter_class(canonical, shape)
     }
     fn config_from_hf(&self, c: &serde_json::Value) -> Result<ArchConfig> {
         drafter_config_from_hf(c, "dspark")
@@ -1127,6 +1153,9 @@ fn eagle3_config_from_hf(c: &serde_json::Value) -> Result<ArchConfig> {
 impl HfMapper for Eagle3HfMapper {
     fn canonical_arch(&self) -> &'static str {
         "eagle3"
+    }
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> crate::decl::TensorClass {
+        drafter_class(canonical, shape)
     }
     fn config_from_hf(&self, c: &serde_json::Value) -> Result<ArchConfig> {
         eagle3_config_from_hf(c)

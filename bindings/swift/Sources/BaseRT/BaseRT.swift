@@ -435,9 +435,26 @@ public final class BaseRTModel {
     // MARK: Model info
 
     /// The model configuration (dimensions, layers, architecture, etc.).
+    ///
+    /// Read through `baseRT_get_config_into` with this package's
+    /// `MemoryLayout<BaseRTModelConfig>.size`: the library fills exactly that
+    /// many bytes (zeros past its own struct, truncated if its struct is
+    /// larger), so the vendored header and the linked engine may differ in
+    /// revision without the engine writing past our struct the way the
+    /// by-value `baseRT_get_config` would. Fields the engine lacks read as
+    /// zero, which every field treats as "not applicable".
     /// - Throws: `BaseRTError.reentrantModelCall` if read from within a callback.
     public var config: ModelConfig {
-        get throws { try withHandleLock { ModelConfig(baseRT_get_config(handle)) } }
+        get throws {
+            try withHandleLock {
+                var c = BaseRTModelConfig()
+                let libSize = withUnsafeMutableBytes(of: &c) { raw in
+                    baseRT_get_config_into(handle, raw.baseAddress, raw.count)
+                }
+                precondition(libSize > 0, "baseRT_get_config_into returned no configuration")
+                return ModelConfig(c)
+            }
+        }
     }
 
     /// Total GPU memory used by the model, in bytes.

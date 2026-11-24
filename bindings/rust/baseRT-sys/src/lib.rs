@@ -17,6 +17,10 @@ pub type baseRT_model_t = *mut c_void;
 /// allocation (memory corruption). Earlier revisions of this binding dropped
 /// `sliding_window` and every field after the encoder block; do not reintroduce
 /// that. New fields in C are appended at the end (`#[repr(C)]` keeps offsets).
+/// Prefer `baseRT_get_config_into` with `size_of::<BaseRTModelConfig>()`: the
+/// library then writes exactly that many bytes whatever its own struct size.
+/// Since the qwen4_exp block (`ngram_mult: [u64; 4]`) the struct is 2144 bytes
+/// with 8-byte alignment; the layout tests below pin that.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BaseRTModelConfig {
@@ -171,6 +175,26 @@ pub struct BaseRTModelConfig {
     pub attention_bias: u8,
     pub rope_yarn_truncate: u8,
     pub _gptoss_pad: u8,
+    // Qwen3.8-Flash-Next (qwen4_exp; 0 / empty = not applicable)
+    pub hc_count: u32,
+    pub hc_lowrank: u32,
+    pub gdn_gate_sigmoid: u32,
+    pub ple_layer: u32,
+    pub ple_embed_dim: u32,
+    pub ple_conv_kernel: u32,
+    pub ngram_size: u32,
+    pub heads_per_ngram: u32,
+    pub ple_eos_token: u32,
+    pub ngram_padded_vocab: u32,
+    pub ngram_head_vocab: [u32; 32],
+    pub ngram_head_off: [u32; 32],
+    pub indexer_n_heads: u32,
+    pub indexer_head_dim: u32,
+    pub indexer_budget: u32,
+    pub indexer_compress: u32,
+    pub _q4_pad: u32,
+    /// The first 8-byte member: repr(C) pads to 2112 before it, as C does.
+    pub ngram_mult: [u64; 4],
 }
 
 /// Transcription result statistics.
@@ -775,7 +799,7 @@ mod tests {
     #[test]
     fn model_config_size() {
         // Full struct: decoder + encoder + Gemma4 + Qwen3.5-GDN + MoE +
-        // vision + audio.
+        // vision + audio + GLM-DSA + gpt-oss + qwen4_exp.
         // Must be far larger than the old 112-byte truncation; returning a
         // 112-byte struct by value from baseRT_get_config corrupted memory.
         assert!(
@@ -783,7 +807,9 @@ mod tests {
             "config struct unexpectedly small ({})",
             mem::size_of::<BaseRTModelConfig>()
         );
-        assert_eq!(mem::size_of::<BaseRTModelConfig>(), 1792);
+        // 1792 before the qwen4_exp block, which appended 352 bytes
+        // (18 fields including the `[u64; 4]` and 4 bytes of tail padding).
+        assert_eq!(mem::size_of::<BaseRTModelConfig>(), 2144);
     }
 
     #[test]
@@ -801,7 +827,8 @@ mod tests {
 
     #[test]
     fn model_config_alignment() {
-        assert_eq!(mem::align_of::<BaseRTModelConfig>(), 4);
+        // `ngram_mult: [u64; 4]` (qwen4_exp) raised this from 4 to 8.
+        assert_eq!(mem::align_of::<BaseRTModelConfig>(), 8);
     }
 
     #[test]
@@ -917,6 +944,14 @@ mod tests {
             &base.rope_yarn_beta_fast as *const _ as usize - base_ptr,
             1772
         );
+        // qwen4_exp block: starts where the struct ended before it; ngram_mult
+        // sits on the first 8-byte boundary after _q4_pad (2108 -> 2112).
+        assert_eq!(&base.hc_count as *const _ as usize - base_ptr, 1792);
+        assert_eq!(&base.ngram_head_vocab as *const _ as usize - base_ptr, 1832);
+        assert_eq!(&base.ngram_head_off as *const _ as usize - base_ptr, 1960);
+        assert_eq!(&base.indexer_n_heads as *const _ as usize - base_ptr, 2088);
+        assert_eq!(&base._q4_pad as *const _ as usize - base_ptr, 2104);
+        assert_eq!(&base.ngram_mult as *const _ as usize - base_ptr, 2112);
     }
 
     #[test]
