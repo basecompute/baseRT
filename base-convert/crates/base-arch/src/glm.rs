@@ -217,6 +217,77 @@ impl GgufMapper for GlmDsaMapper {
 ///   * The DSA full/shared layer pattern (`indexer_types` + friends)
 ///     only exists here; GGUF metadata doesn't carry it.
 impl HfMapper for GlmDsaMapper {
+    /// MLA: `q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa` and `o_proj` are
+    /// `dispatch_gemm` GEMMs; the absorbed `k_b_proj` / `v_b_proj` are read
+    /// raw f16 by the absorb kernels and the fused `kv_b_proj` the HF
+    /// checkpoint ships is split into them at convert (never read as is):
+    /// `other`. The DSA indexer's `k_proj`, `q_b_proj` and `weights_proj`
+    /// are GEMMs (fetched only in DSA mode — `unread` otherwise); its
+    /// `k_norm` is `other`. MoE: the split expert stacks are the MoE
+    /// GEMMs, the shared expert and the leading dense FFNs are GEMMs, the
+    /// router and its correction bias are `other`.
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> crate::decl::TensorClass {
+        use crate::decl::{moe, tail, TensorClass};
+        if moe::is_stack(canonical, shape) {
+            return TensorClass::ExpertStack;
+        }
+        match tail(canonical) {
+            "self_attn.q_a_proj.weight"
+            | "self_attn.q_b_proj.weight"
+            | "self_attn.kv_a_proj_with_mqa.weight"
+            | "self_attn.indexer.k_proj.weight"
+            | "self_attn.indexer.q_b_proj.weight"
+            | "self_attn.indexer.weights_proj.weight"
+            | "mlp.shared_expert.gate_proj.weight"
+            | "mlp.shared_expert.up_proj.weight"
+            | "mlp.shared_expert.down_proj.weight" => TensorClass::Linear,
+            _ => crate::decl::dense::class(canonical, shape),
+        }
+    }
+    /// `attn`: `input_norm` feeds the two MLA down-projections and the
+    /// indexer's `k_proj` / `weights_proj`, all GEMMs. No `o`: MLA has no
+    /// `v_proj` whose rows could absorb `1/s` (the value path is the
+    /// absorbed `v_b_proj`, `other`). `q_a_layernorm` → `q_b_proj` would
+    /// be exact but is not a fold kind autoquant's tables know, and
+    /// `kv_a_layernorm` feeds only the absorbed projections: no fold.
+    /// Dense layers: `mlp` / `down`. MoE layers: no input-side group (the
+    /// router reads the same norm output); `moe_down` over the split `up`
+    /// stack and the shared expert's `down`.
+    fn fold_groups(
+        &self,
+        tensors: &[(String, Vec<u64>)],
+        cfg: &crate::ArchConfig,
+    ) -> Vec<crate::decl::FoldGroup> {
+        use crate::decl::{dense, moe, Declare, TensorSet};
+        let set = TensorSet::new(tensors);
+        let norm_shift = |n: &str| self.norm_shift(n);
+        let mut d = Declare::new(&set, &norm_shift);
+        for layer in set.layers() {
+            let p = format!("layers.{layer}.");
+            d.gamma(
+                "attn",
+                Some(layer),
+                format!("{p}input_norm.weight"),
+                &[
+                    format!("{p}self_attn.q_a_proj.weight"),
+                    format!("{p}self_attn.kv_a_proj_with_mqa.weight"),
+                    format!("{p}self_attn.indexer.k_proj.weight"),
+                    format!("{p}self_attn.indexer.weights_proj.weight"),
+                ],
+            );
+            dense::mlp_groups(&mut d, layer);
+            moe::down_group(
+                &mut d,
+                layer,
+                "mlp.experts.gate_up_proj.weight",
+                "mlp.experts.up_proj.weight",
+                "mlp.experts.down_proj.weight",
+            );
+            dense::shared_expert_down(&mut d, layer);
+        }
+        dense::head_group(&mut d, cfg);
+        d.finish()
+    }
     fn canonical_arch(&self) -> &'static str {
         // Same string as the GGUF side — the runtime dispatches on
         // `strstr(arch, "glm")`.

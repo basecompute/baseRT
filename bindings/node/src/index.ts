@@ -244,6 +244,26 @@ const ModelConfigC = koffi.struct("BaseRTModelConfig", {
   attention_bias: "uint8",
   rope_yarn_truncate: "uint8",
   _gptoss_pad: "uint8",
+  // Qwen3.8-Flash-Next (qwen4_exp; 0 / empty = not applicable)
+  hc_count: "uint32",
+  hc_lowrank: "uint32",
+  gdn_gate_sigmoid: "uint32",
+  ple_layer: "uint32",
+  ple_embed_dim: "uint32",
+  ple_conv_kernel: "uint32",
+  ngram_size: "uint32",
+  heads_per_ngram: "uint32",
+  ple_eos_token: "uint32",
+  ngram_padded_vocab: "uint32",
+  ngram_head_vocab: koffi.array("uint32", 32),
+  ngram_head_off: koffi.array("uint32", 32),
+  indexer_n_heads: "uint32",
+  indexer_head_dim: "uint32",
+  indexer_budget: "uint32",
+  indexer_compress: "uint32",
+  _q4_pad: "uint32",
+  // uint64_t: the struct is 8-byte aligned from here on (2144 bytes).
+  ngram_mult: koffi.array("uint64", 4),
 });
 
 const SamplingConfigC = koffi.struct("BaseRTSamplingConfig", {
@@ -404,6 +424,12 @@ interface BaseRTLib {
   ) => unknown;
   baseRT_free_model: (model: unknown) => void;
   baseRT_get_config: (model: unknown) => Record<string, unknown>;
+  /** Since 0.4.0; undefined when the loaded library predates it. */
+  baseRT_get_config_into?: (
+    model: unknown,
+    out: Record<string, unknown>,
+    outSize: number
+  ) => number | bigint;
   baseRT_model_memory: (model: unknown) => number;
   baseRT_get_error: () => string;
   baseRT_set_kv_bits: (bits: number) => void;
@@ -547,7 +573,9 @@ function lib(): BaseRTLib {
   const k = koffi.load(resolveLibPath());
   const out = "_Out_";
   void out;
-  _lib = {
+  // Built into a local and published to _lib only once every check below has
+  // passed: a refused library must not stay cached as a half-checked table.
+  const l: BaseRTLib = {
     baseRT_version_string: k.func("const char *baseRT_version_string()"),
     baseRT_load_model: k.func(
       "void *baseRT_load_model(const char *, const char *, int)"
@@ -650,18 +678,36 @@ function lib(): BaseRTLib {
     ),
   } as BaseRTLib;
 
-  // ModelConfigC is mirrored by hand above; a size mismatch means the mirror
-  // drifted from include/baseRT/types.h and every field after the divergence
-  // point decodes as garbage. Fail at load, not at use. (Older libraries
-  // predate the symbol; skip the check there.)
+  // Preferred config getter (since 0.4.0): the library copies exactly
+  // sizeof(ModelConfigC) bytes into our buffer (zeros past its own struct), so
+  // the by-value baseRT_get_config above — whose return slot koffi sizes from
+  // OUR mirror — is only used when the symbol is missing.
+  try {
+    l.baseRT_get_config_into = k.func(
+      "size_t baseRT_get_config_into(void *, _Out_ BaseRTModelConfig *, size_t)"
+    );
+  } catch {
+    // Symbol missing in an older library — fall back to the by-value getter.
+  }
+
+  // ModelConfigC is mirrored by hand above. The struct only ever grows by
+  // appended fields, so with the sized getter a library of another size is the
+  // supported mixed-version case (an engine still on the previous layout under
+  // a newer binding, or the reverse): we read the fields we share and see
+  // zeros for the rest, which every field treats as "not applicable". Only the
+  // by-value fallback needs the exact size — koffi sizes its return slot from
+  // our mirror, so a different library size would decode garbage past the
+  // divergence point there. Fail at load, not at use. (Older libraries predate
+  // the symbol; skip the check there.)
   try {
     const configSizeof = k.func("size_t baseRT_model_config_sizeof()");
     const cSize = Number(configSizeof());
     const jsSize = koffi.sizeof(ModelConfigC);
-    if (cSize !== jsSize) {
+    if (cSize !== jsSize && !l.baseRT_get_config_into) {
       throw new Error(
         `BaseRTModelConfig layout drift: library says ${cSize} bytes, ` +
-          `Node mirror is ${jsSize} bytes. Update ModelConfigC in ` +
+          `Node mirror is ${jsSize} bytes, and the library has no ` +
+          `baseRT_get_config_into to read it by size. Update ModelConfigC in ` +
           `bindings/node/src/index.ts to match include/baseRT/types.h.`
       );
     }
@@ -669,7 +715,8 @@ function lib(): BaseRTLib {
     if (e instanceof Error && e.message.includes("layout drift")) throw e;
     // Symbol missing in an older library — no check possible.
   }
-  return _lib;
+  _lib = l;
+  return l;
 }
 
 // ---------------------------------------------------------------------------
@@ -871,7 +918,16 @@ export class BaseRTModel {
   // -- Model info ------------------------------------------------------------
 
   get config(): ModelConfig {
-    return toModelConfig(this._l.baseRT_get_config(this.handle));
+    const into = this._l.baseRT_get_config_into;
+    if (!into) return toModelConfig(this._l.baseRT_get_config(this.handle));
+    const out: Record<string, unknown> = {};
+    // Returns the library's sizeof; fields it lacks read as zero, which every
+    // field treats as "not applicable". 0 never happens for a live handle.
+    const libSize = Number(into(this.handle, out, koffi.sizeof(ModelConfigC)));
+    if (libSize === 0) {
+      throw new Error("baseRT_get_config_into returned no configuration");
+    }
+    return toModelConfig(out);
   }
 
   get memoryUsage(): number {
@@ -1239,4 +1295,8 @@ export const __internal = {
   TranscribeSegmentC,
   toSamplingC,
   toModelConfig,
+  /** Drop the cached library so the next model load resolves BASERT_LIB_PATH again. */
+  resetLib(): void {
+    _lib = null;
+  },
 };

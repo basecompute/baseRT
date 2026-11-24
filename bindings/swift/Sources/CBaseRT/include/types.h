@@ -298,6 +298,37 @@ typedef struct {
     uint8_t attention_bias;      // 1 = q/k/v/o projections carry biases
     uint8_t rope_yarn_truncate;  // 1 = floor/ceil the YaRN correction range (HF default); gpt-oss: 0
     uint8_t _gptoss_pad;         // align to 4 bytes
+
+    // ── Qwen3.8-Flash-Next (qwen4_exp; 0 / empty = not applicable) ──
+    // Hyper-connections: the residual runs as hc_count streams, each block
+    // reads a gated low-rank mix of them and injects its output back with
+    // per-stream weights (Qwen4ExpTextGatedResidual).
+    uint32_t hc_count;          // residual streams (0 or 1 = plain residual)
+    uint32_t hc_lowrank;        // input_mix_weight_down width
+    uint32_t gdn_gate_sigmoid;  // 1 = the GDN output norm's gate is sigmoid(z) (output_gate_type), 0 = silu
+    // Per-layer n-gram embedding (Qwen4ExpTextPLELayer) at decoder layer
+    // `ple_layer` (UINT32_MAX = none): hashed 2/3-gram ids over the token
+    // history (eos resets it) gather rows of one table, projected to a key
+    // per stream and a value, gated and run through a dilated causal conv.
+    uint32_t ple_layer;
+    uint32_t ple_embed_dim;
+    uint32_t ple_conv_kernel;
+    uint32_t ngram_size;
+    uint32_t heads_per_ngram;
+    uint32_t ple_eos_token;
+    uint32_t ngram_padded_vocab;  // rows of the stacked table
+    uint32_t ngram_head_vocab[32];
+    uint32_t ngram_head_off[32];
+    // QSA indexer: per full-attention layer, `indexer_n_heads` query heads
+    // of `indexer_head_dim` score mean-pooled key blocks of
+    // `indexer_compress` tokens; a query attends to its top
+    // indexer_budget / indexer_compress blocks plus its incomplete block.
+    uint32_t indexer_n_heads;
+    uint32_t indexer_head_dim;
+    uint32_t indexer_budget;
+    uint32_t indexer_compress;
+    uint32_t _q4_pad;
+    uint64_t ngram_mult[4];  // layer multipliers (int64 in the checkpoint; < 2^63)
 } BaseRTModelConfig;
 
 /// Transcription result statistics.

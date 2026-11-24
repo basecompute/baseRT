@@ -291,6 +291,47 @@ impl crate::HfMapper for NemotronHHfMapper {
     fn canonical_arch(&self) -> &'static str {
         "nemotron_h_moe"
     }
+    /// Mamba-2 `ssm.in_proj` / `ssm.out_proj`, the attention projections,
+    /// the shared expert's up / down and the head are `dispatch_gemm`
+    /// GEMMs; the expert stacks (`mlp.experts.{up,down}_proj`, no gate:
+    /// squared ReLU) are the MoE GEMMs; the router, its correction bias,
+    /// the conv, the scan parameters (`a_log`, `d`, `dt_bias`) and the
+    /// grouped gated norm are `other`.
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> crate::decl::TensorClass {
+        use crate::decl::{moe, tail, TensorClass};
+        if moe::is_stack(canonical, shape) {
+            return TensorClass::ExpertStack;
+        }
+        match tail(canonical) {
+            "ssm.in_proj.weight"
+            | "ssm.out_proj.weight"
+            | "mlp.shared_expert.up_proj.weight"
+            | "mlp.shared_expert.down_proj.weight" => TensorClass::Linear,
+            _ => crate::decl::dense::class(canonical, shape),
+        }
+    }
+    /// Attention blocks: `attn` and `o` as on Llama, and the head. Mamba
+    /// blocks declare no fold (the block's `input_norm` → `ssm.in_proj`
+    /// and `ssm.norm` → `ssm.out_proj` would be exact, but neither is one
+    /// of the fold kinds autoquant's tables know). MoE blocks: no fold —
+    /// the `input_norm` output also feeds the router (`other`), and a
+    /// squared-ReLU expert is not linear in `up`, so neither the routed
+    /// nor the shared `down` can absorb `1/s` into up's rows.
+    fn fold_groups(
+        &self,
+        tensors: &[(String, Vec<u64>)],
+        cfg: &crate::ArchConfig,
+    ) -> Vec<crate::decl::FoldGroup> {
+        use crate::decl::{dense, Declare, TensorSet};
+        let set = TensorSet::new(tensors);
+        let norm_shift = |n: &str| self.norm_shift(n);
+        let mut d = Declare::new(&set, &norm_shift);
+        for layer in set.layers() {
+            dense::attn_groups(&mut d, layer);
+        }
+        dense::head_group(&mut d, cfg);
+        d.finish()
+    }
 
     fn value_transform(&self, canonical: &str) -> Option<crate::ValueTransform> {
         // The HF checkpoint stores the Mamba-2 state-transition matrix

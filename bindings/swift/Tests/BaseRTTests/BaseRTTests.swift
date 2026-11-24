@@ -66,6 +66,17 @@ final class BaseRTTests: XCTestCase {
 
     // MARK: - ModelConfig mapping from the real C struct
 
+    func testModelConfigCStructLayout() {
+        // Exact sizeof(BaseRTModelConfig) from the vendored types.h (a verbatim
+        // copy of include/baseRT/types.h, diffed in CI); must match the
+        // Python / Node / Rust mirror tests. The qwen4_exp block appended a
+        // uint64_t ngram_mult[4], which raised the alignment from 4 to 8.
+        XCTAssertEqual(MemoryLayout<BaseRTModelConfig>.size, 2144)
+        XCTAssertEqual(MemoryLayout<BaseRTModelConfig>.alignment, 8)
+        XCTAssertEqual(MemoryLayout<BaseRTModelConfig>.offset(of: \.hc_count), 1792)
+        XCTAssertEqual(MemoryLayout<BaseRTModelConfig>.offset(of: \.ngram_mult), 2112)
+    }
+
     func testModelConfigFromZeroedCStruct() {
         var c = BaseRTModelConfig()
         memset(&c, 0, MemoryLayout<BaseRTModelConfig>.size)

@@ -1110,6 +1110,13 @@ fn convert_gguf(
         };
         let bytes: &[u8] = unpermuted_bytes.as_deref().unwrap_or(raw);
 
+        // The mapper's §4.8 class (never the name): the embedding routes
+        // hot to the GPU region, whatever the source called it.
+        let class = base_arch::declaring_mapper(mapper.canonical_arch())
+            .map(|m| m.tensor_class(&canonical, &base_shape(info)))
+            .unwrap_or(base_arch::decl::TensorClass::Other);
+        let is_embedding = hot_placement(&canonical, class);
+
         // ── k-quant passthrough ─────────────────────────────────────
         // Copy the super-blocks in verbatim. Must come BEFORE the
         // dequant below: the canonical-quant spec forbids the
@@ -1119,7 +1126,7 @@ fn convert_gguf(
         // scale/bias regions — `scale_offset` / `bias_offset` stay None
         // and the runtime keys off `source_ggml_type` + `Layout::GgufSuper`.
         if kquant_passthrough && kquant_passes_through(info) {
-            let (entry, data) = kquant_passthrough_entry(info, bytes, canonical);
+            let (entry, data) = kquant_passthrough_entry(info, bytes, canonical, is_embedding);
             passthrough_tensors += 1;
             writer.add_tensor(TensorPayload { entry, data });
             continue;
@@ -1160,7 +1167,6 @@ fn convert_gguf(
         // duplicate allocation (the source of the Phase-2/3 .base 3x
         // memory bloat).
         let is_norm_like = info.shape.len() == 1;
-        let is_embedding = canonical == "embed_tokens.weight" || canonical == "lm_head.weight";
         // Emit at f16 (not the target quant) for two precision-sensitive
         // GLM 5.2 cases:
         //   * MLA k_b/v_b up-projections — consumed by dedicated absorb
@@ -1478,7 +1484,7 @@ fn convert_gguf(
                 || canonical.ends_with(".bias");
 
             if !must_stay_raw && kquant_passthrough && kquant_passes_through(info) {
-                let (entry, data) = kquant_passthrough_entry(info, raw, canonical);
+                let (entry, data) = kquant_passthrough_entry(info, raw, canonical, false);
                 mm_passthrough += 1;
                 mm_kept += 1;
                 writer.add_mmproj_tensor(TensorPayload { entry, data });
@@ -1831,16 +1837,16 @@ fn kquant_passthrough_entry(
     info: &base_readers::gguf::TensorInfo,
     bytes: &[u8],
     canonical: String,
+    is_embedding: bool,
 ) -> (base_format::TensorEntry, Vec<u8>) {
     use base_format::{ComputeRegion, Layout, TensorFlags};
 
     // Unreachable: the callers gate on `is_passthrough_kquant`.
     let (dtype, ggml_code) = kquant_passthrough_dtype(info.ggml_type)
         .unwrap_or_else(|| unreachable!("kquant passthrough called with {:?}", info.ggml_type));
-    // Same role-based routing the re-quantizing path uses: the
-    // embed/lm_head pair stays hot in the GPU region, bulk layer weights
-    // go warm to the accelerator region.
-    let is_embedding = canonical == "embed_tokens.weight" || canonical == "lm_head.weight";
+    // Same class-based routing the re-quantizing path uses: an
+    // `embedding` (the mapper's class) stays hot in the GPU region, bulk
+    // layer weights go warm to the accelerator region.
     let (region, residency) = if is_embedding {
         (ComputeRegion::Gpu, base_format::ResidencyHint::Hot)
     } else {
@@ -2065,6 +2071,13 @@ fn convert_hf(input: &std::path::Path, output: &std::path::Path, ctx: &QuantCont
         // mirrors.
         nvfp4_source,
         &|n| mapper.row_rms_normalize(n, &config_for_permute),
+        &|n, s, spec| {
+            if spec {
+                mapper.speculator_class(n, s)
+            } else {
+                mapper.tensor_class(n, s)
+            }
+        },
     )
 }
 
@@ -2546,6 +2559,13 @@ fn convert_mlx(
         // unquantized).
         true,
         &|n| mapper.row_rms_normalize(n, &config_for_permute),
+        &|n, s, spec| {
+            if spec {
+                mapper.speculator_class(n, s)
+            } else {
+                mapper.tensor_class(n, s)
+            }
+        },
     )?;
     if ctx.validate {
         validate_mlx_bundle(output, &mlx, &names, mapper.canonical_arch(), &|n| {
@@ -3314,6 +3334,244 @@ impl<'a> TensorProvider for MlxTensorProvider<'a> {
     }
 }
 
+/// Qwen3.8-Flash-Next ships its per-layer n-gram embedding (~320M rows x 160,
+/// bf16) as `split_ngram_parts` row shards
+/// (`…ple.ple_embedding.ngram_embedding.shard_{e}.weight`, concatenated on
+/// dim 0 in shard order by the modeling code's loader). The runtime wants ONE
+/// table it can index by hashed id, so this provider exposes the virtual name
+/// `…ngram_embedding.weight` (shape [sum rows, dim]) and `raw_concat` hands
+/// back the shards' bf16 bytes concatenated — a byte copy, never an f32 round
+/// trip (205 GB at this size). Provenance records a `stack` over the shard
+/// pattern. `build` refuses a checkpoint whose shards are not exactly
+/// `shard_0..shard_{split_ngram_parts}` or whose rows do not add up to the
+/// layer's `ngram_padded_vocab`: the shards are concatenated by position,
+/// so a missing or extra shard shifts every later row id onto the wrong
+/// data while the written shape still looks plausible. Pass-through for
+/// every other name / source.
+struct NgramStackingProvider<'a> {
+    inner: &'a dyn TensorProvider,
+    stacks: std::collections::BTreeMap<String, Vec<String>>,
+    rewritten: Vec<String>,
+}
+impl<'a> NgramStackingProvider<'a> {
+    fn build(
+        inner: &'a dyn TensorProvider,
+        source_names: &[String],
+        config: &base_arch::ArchConfig,
+    ) -> Result<Self> {
+        use std::collections::{BTreeMap, BTreeSet, HashSet};
+        const MARK: &str = ".ngram_embedding.shard_";
+        let mut groups: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+        let mut consumed: HashSet<String> = HashSet::new();
+        for n in source_names {
+            let Some(idx) = n.find(MARK) else { continue };
+            let rest = &n[idx + MARK.len()..];
+            let Some(e_str) = rest.strip_suffix(".weight") else {
+                continue;
+            };
+            if e_str.is_empty() || !e_str.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let e: usize = e_str.parse().unwrap_or(usize::MAX);
+            let vname = format!("{}.ngram_embedding.weight", &n[..idx]);
+            groups.entry(vname).or_default().push((e, n.clone()));
+            consumed.insert(n.clone());
+        }
+        let extra = &config.extra_config;
+        let u64_at = |key: &str, i: usize| {
+            extra
+                .get(key)
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.get(i))
+                .and_then(|v| v.as_u64())
+        };
+        let mut stacks: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (v, mut es) in groups {
+            let parts = extra
+                .get("split_ngram_parts")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{v}: the checkpoint ships n-gram shards but the config has no split_ngram_parts"
+                    )
+                })? as usize;
+            es.sort_by_key(|(e, _)| *e);
+            let have: BTreeSet<usize> = es.iter().map(|(e, _)| *e).collect();
+            anyhow::ensure!(
+                have.len() == es.len(),
+                "{v}: n-gram shard indices repeat: {:?}",
+                es.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>()
+            );
+            let want: BTreeSet<usize> = (0..parts).collect();
+            let missing: Vec<usize> = want.difference(&have).copied().collect();
+            let unexpected: Vec<usize> = have.difference(&want).copied().collect();
+            anyhow::ensure!(
+                missing.is_empty() && unexpected.is_empty(),
+                "{v}: n-gram shards must be shard_0..shard_{} (split_ngram_parts {parts}): missing {missing:?}, unexpected {unexpected:?}",
+                parts.saturating_sub(1)
+            );
+            stacks.insert(v, es.into_iter().map(|(_, n)| n).collect());
+        }
+        // A table may also arrive whole (`…ngram_embedding.weight`, no
+        // shards): it passes through untouched and counts as that layer's
+        // table, so a layer never has both.
+        let whole: Vec<String> = source_names
+            .iter()
+            .filter(|n| n.ends_with(".ngram_embedding.weight"))
+            .cloned()
+            .collect();
+        for w in &whole {
+            anyhow::ensure!(
+                !stacks.contains_key(w),
+                "{w}: the checkpoint ships this n-gram table both whole and as shards"
+            );
+        }
+        let mut rewritten: Vec<String> = source_names
+            .iter()
+            .filter(|n| !consumed.contains(*n))
+            .cloned()
+            .collect();
+        rewritten.extend(stacks.keys().cloned());
+        let me = NgramStackingProvider {
+            inner,
+            stacks,
+            rewritten,
+        };
+        // Exactly one table (stacked or whole) per configured PLE layer: a
+        // bundle must not advertise PLE without carrying its weights. The
+        // rows are the layer's padded hash vocab: one entry of
+        // `ngram_padded_vocab` per PLE layer, in `ple_layer_ids` order. The
+        // tables pair with those entries by position (ascending layer index):
+        // the checkpoint's `layers.N` is not the same numbering as the
+        // config's `ple_layer_ids` (Qwen3.8-Flash-Next ships its table under
+        // `layers.1` with `ple_layer_ids: [2]`).
+        let n_ple = extra
+            .get("ple_layer_ids")
+            .and_then(|a| a.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let tables: Vec<&String> = me.stacks.keys().chain(whole.iter()).collect();
+        anyhow::ensure!(
+            tables.len() == n_ple,
+            "{} n-gram table(s) (`…ple.ple_embedding.ngram_embedding.weight`, sharded or whole) for {n_ple} PLE layer(s) in the config's ple_layer_ids: {tables:?}",
+            tables.len()
+        );
+        let mut by_layer: Vec<(u64, &String)> = Vec::new();
+        for v in tables {
+            let layer: u64 = v
+                .split(".layers.")
+                .nth(1)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|l| l.parse().ok())
+                .ok_or_else(|| anyhow::anyhow!("{v}: no `.layers.N.` in the n-gram table name"))?;
+            by_layer.push((layer, v));
+        }
+        by_layer.sort();
+        for (ple_index, (layer, v)) in by_layer.into_iter().enumerate() {
+            // A stacked table is 2-D by construction (source_shape checks
+            // each shard); a whole one is whatever the checkpoint stored.
+            let shape = me.source_shape(v)?;
+            anyhow::ensure!(
+                shape.len() == 2,
+                "{v}: the n-gram table is not 2-D ([rows, dim]): shape {shape:?}"
+            );
+            let rows = shape[0];
+            let padded = u64_at("ngram_padded_vocab", ple_index).ok_or_else(|| {
+                anyhow::anyhow!("{v}: the config has no ngram_padded_vocab entry {ple_index}")
+            })?;
+            let holds = match me.stacks.get(v) {
+                Some(parts) => format!("the {} n-gram shards hold", parts.len()),
+                None => "the n-gram table holds".to_string(),
+            };
+            anyhow::ensure!(
+                rows == padded,
+                "{v}: {holds} {rows} rows, PLE layer {ple_index} (layers.{layer})'s ngram_padded_vocab is {padded}"
+            );
+        }
+        Ok(me)
+    }
+    fn rewritten_names(&self) -> Vec<String> {
+        self.rewritten.clone()
+    }
+    /// The stacked table's bf16 bytes (shards concatenated in order), or None
+    /// when a shard is not a plain bf16 tensor (the f32 path then applies).
+    fn raw_concat(&self, name: &str) -> Option<Vec<u8>> {
+        let parts = self.stacks.get(name)?;
+        let mut total = 0usize;
+        for p in parts {
+            match self.inner.raw_rows(p)? {
+                base_awq::MemberData::Bf16(b) => total += b.len(),
+                _ => return None,
+            }
+        }
+        let mut out: Vec<u8> = Vec::with_capacity(total);
+        for p in parts {
+            match self.inner.raw_rows(p)? {
+                base_awq::MemberData::Bf16(b) => out.extend_from_slice(b),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+}
+impl TensorProvider for NgramStackingProvider<'_> {
+    fn source_shape(&self, name: &str) -> Result<Vec<u64>> {
+        match self.stacks.get(name) {
+            Some(parts) => {
+                let mut rows = 0u64;
+                let mut cols = 0u64;
+                for p in parts {
+                    let sh = self.inner.source_shape(p)?;
+                    anyhow::ensure!(sh.len() == 2, "ngram shard {p} is not 2-D");
+                    if cols == 0 {
+                        cols = sh[1];
+                    }
+                    anyhow::ensure!(sh[1] == cols, "ngram shard {p} width {} != {cols}", sh[1]);
+                    rows += sh[0];
+                }
+                Ok(vec![rows, cols])
+            }
+            None => self.inner.source_shape(name),
+        }
+    }
+    fn to_f32(&self, name: &str) -> Result<Vec<f32>> {
+        match self.stacks.get(name) {
+            Some(parts) => {
+                let mut out: Vec<f32> = Vec::new();
+                for p in parts {
+                    out.extend(self.inner.to_f32(p)?);
+                }
+                Ok(out)
+            }
+            None => self.inner.to_f32(name),
+        }
+    }
+    fn raw_rows(&self, name: &str) -> Option<base_awq::MemberData<'_>> {
+        match self.stacks.get(name) {
+            Some(_) => None,
+            None => self.inner.raw_rows(name),
+        }
+    }
+    fn packed_base_q4(&self, name: &str, group_size: u32) -> Result<Option<base_quant::Packed>> {
+        match self.stacks.get(name) {
+            Some(_) => Ok(None),
+            None => self.inner.packed_base_q4(name, group_size),
+        }
+    }
+    fn packed_nvfp4(&self, name: &str) -> Result<Option<base_quant::Packed>> {
+        match self.stacks.get(name) {
+            Some(_) => Ok(None),
+            None => self.inner.packed_nvfp4(name),
+        }
+    }
+    fn source_is_quantized(&self, name: &str) -> bool {
+        match self.stacks.get(name) {
+            Some(_) => false,
+            None => self.inner.source_is_quantized(name),
+        }
+    }
+}
+
 /// Wraps a provider to stack HF-mainline MoE *per-expert* tensors into the
 /// fused 3D form the runtime requires. HF Qwen3-MoE (and Mixtral-style) ships
 /// experts as `…layers.N.mlp.experts.{e}.{gate,up,down}_proj.weight` — one
@@ -3992,6 +4250,100 @@ impl TensorProvider for FcSplitProvider<'_> {
 /// `ffn_gate_inp`), the Qwen3.5-MoE per-token shared-expert gate
 /// (`ffn_shexp_gate`, a [1, dim] row) and the GLM MLA absorb
 /// projections. `mlp.gate_proj` (a dense FFN) does not match.
+/// Whether the profile rule that covers `name` is a catch-all (`**`,
+/// `*.weight`, …) rather than one naming the tensor or its role. Under a
+/// catch-all — as under a bare `--target` (no profile) — an `other`-class
+/// tensor stays as stored (§4.8: it has no quant cells); a rule that
+/// names it still decides.
+/// Placement, not class: the tensors streamed on every decode step —
+/// an `embedding` table (the lookup) and the logit projection — stay hot
+/// in the GPU region; bulk layer weights go warm to the accelerator
+/// region. The head keeps its hot placement whatever its class (`linear`,
+/// or the embedding itself where the runtime projects through the tied
+/// table).
+fn hot_placement(canonical: &str, class: base_arch::decl::TensorClass) -> bool {
+    class == base_arch::decl::TensorClass::Embedding
+        || matches!(canonical, "lm_head.weight" | "output.weight")
+}
+
+fn profile_rule_is_catch_all(profile: Option<&base_quant::QuantProfile>, name: &str) -> bool {
+    let Some(p) = profile else {
+        return true;
+    };
+    match p
+        .rules
+        .iter()
+        .find(|r| base_quant::profile::pattern_matches(&r.pattern, name))
+    {
+        Some(r) => {
+            let core = r
+                .pattern
+                .trim_end_matches(".weight")
+                .trim_end_matches(".bias");
+            core.chars().all(|c| c == '*' || c == '.')
+        }
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod class_routing_tests {
+    use super::{hot_placement, profile_rule_is_catch_all};
+    use base_arch::decl::TensorClass;
+
+    /// `other` stays as stored under a catch-all rule, not under a rule
+    /// that names the tensor or its role.
+    #[test]
+    fn catch_all_rules_are_recognized() {
+        let p = |rules: serde_json::Value| {
+            let pj = serde_json::json!({"name": "t", "arch": "*", "rules": rules});
+            base_quant::QuantProfile::from_json(pj.to_string().as_bytes()).unwrap()
+        };
+        assert!(profile_rule_is_catch_all(None, "layers.0.mlp.gate.weight"));
+        let catch = p(serde_json::json!([{"pattern": "**", "dtype": "base_q4"}]));
+        assert!(profile_rule_is_catch_all(
+            Some(&catch),
+            "layers.0.mlp.gate.weight"
+        ));
+        let catch_w = p(serde_json::json!([{"pattern": "**.weight", "dtype": "base_q4"}]));
+        assert!(profile_rule_is_catch_all(
+            Some(&catch_w),
+            "layers.0.mlp.gate.weight"
+        ));
+        let named = p(serde_json::json!([
+            {"pattern": "layers.*.mlp.gate.weight", "dtype": "base_q8"},
+            {"pattern": "**", "dtype": "base_q4"}
+        ]));
+        assert!(!profile_rule_is_catch_all(
+            Some(&named),
+            "layers.0.mlp.gate.weight"
+        ));
+        assert!(profile_rule_is_catch_all(
+            Some(&named),
+            "layers.0.mlp.up_proj.weight"
+        ));
+    }
+
+    /// The lookup table and the head stay hot whatever the head's class.
+    #[test]
+    fn hot_placement_is_the_embedding_and_the_head() {
+        assert!(hot_placement("embed_tokens.weight", TensorClass::Embedding));
+        assert!(hot_placement(
+            "per_layer_token_embd.weight",
+            TensorClass::Embedding
+        ));
+        assert!(hot_placement("lm_head.weight", TensorClass::Linear));
+        assert!(!hot_placement(
+            "layers.0.mlp.up_proj.weight",
+            TensorClass::Linear
+        ));
+        assert!(!hot_placement(
+            "layers.0.mlp.gate.weight",
+            TensorClass::Other
+        ));
+    }
+}
+
 fn f16_consumer(canonical: &str) -> bool {
     canonical.ends_with(".mlp.router.weight")
         || canonical.ends_with(".mlp.gate.weight")
@@ -4092,6 +4444,10 @@ fn convert_generic(
     shape_fastest_first: bool,
     mirror_unquantized: bool,
     row_rms_normalize: &dyn Fn(&str) -> Option<f32>,
+    // The mapper's §4.8 class of `(canonical, shape, is_speculator)`: the
+    // embedding routing, the expert packing and the `other`-stays-stored
+    // rule key on it, never on the name.
+    class_of: &dyn Fn(&str, &[u64], bool) -> base_arch::decl::TensorClass,
 ) -> Result<()> {
     use base_format::{
         AlignmentConfig, BaseReader, BaseWriter, ComputeRegion, Header, HeaderFlags, ModelConfig,
@@ -4139,6 +4495,18 @@ fn convert_generic(
     }
     let source_names = stacking.rewritten_names();
     let provider: &dyn TensorProvider = &stacking;
+
+    // Qwen3.8-Flash-Next's row-sharded n-gram embedding → one table (see
+    // NgramStackingProvider; written shard by shard below).
+    let ngram = NgramStackingProvider::build(provider, &source_names, &config)?;
+    if !ngram.stacks.is_empty() {
+        eprintln!(
+            "  ngram:   stacked {} sharded n-gram embedding table(s)",
+            ngram.stacks.len()
+        );
+    }
+    let source_names = ngram.rewritten_names();
+    let provider: &dyn TensorProvider = &ngram;
 
     // Split HF fused attention/MLP projections (Phi-3: `qkv_proj`,
     // `gate_up_proj`) into the separate q/k/v + gate/up tensors the llama path
@@ -4615,11 +4983,13 @@ fn convert_generic(
             .and_then(|p| p.entry(canonical))
             .filter(|e| e.is_prepacked())
         {
-            let (entry, data) =
-                ctx.overlay
-                    .as_ref()
-                    .unwrap()
-                    .prepacked_payload(e, canonical, shape.clone())?;
+            let is_embedding = hot_placement(canonical, class_of(canonical, &shape, is_spec));
+            let (entry, data) = ctx.overlay.as_ref().unwrap().prepacked_payload(
+                e,
+                canonical,
+                shape.clone(),
+                is_embedding,
+            )?;
             let (tag, transform) = if e.kquant.is_some() {
                 ("kquant  ", "kquant_blocks")
             } else if e.values.is_some() {
@@ -4645,6 +5015,160 @@ fn convert_generic(
                 base_format::TensorProvenance {
                     src: vec![src_name.clone()],
                     transform: Some(transform.to_string()),
+                    ..Default::default()
+                },
+            );
+            pb.inc(1);
+            continue;
+        }
+
+        // Stacked n-gram table (Qwen3.8-Flash-Next; class `embedding`):
+        // written shard by shard, never as one f32 image (51B values).
+        // Carried at bf16: bf16 shards' bytes concatenated, bit-exact; f16 /
+        // f32 shards under `--target bf16` take the lossless carry a whole
+        // table gets (`pack_carry_shards`: f16, bf16 or f32, one for all
+        // shards); under a profile's bf16 rule they are rounded per shard,
+        // as a whole table is (`pack_tensor`, the loop below).
+        // Otherwise every shard is packed at the table's resolved dtype
+        // and the packed regions are concatenated: the canonical quant
+        // layouts are row-major per group and a shard holds whole rows, so
+        // this is the pack of the whole table. Its 160-wide rows take the
+        // `@32` embedding cell (`pack_for_target_rows` halves the group
+        // size until it divides the row; a profile rule must say `@32`).
+        if let Some(parts) = ngram.stacks.get(src_name) {
+            let in_features = Some(shape[1] as usize);
+            let want = match &ctx.profile {
+                Some(p) => p.resolve_or_err(canonical)?.dtype,
+                None => match target {
+                    TargetScheme::Bf16 => TensorDtype::Bf16,
+                    TargetScheme::BaseQ2 => TensorDtype::BaseQ2,
+                    TargetScheme::BaseQ3 => TensorDtype::BaseQ3,
+                    TargetScheme::BaseQ4 => TensorDtype::BaseQ4,
+                    TargetScheme::BaseQ5 => TensorDtype::BaseQ5,
+                    TargetScheme::BaseQ6 => TensorDtype::BaseQ6,
+                    TargetScheme::BaseQ8 => TensorDtype::BaseQ8,
+                    other => {
+                        bail!("{canonical}: a sharded n-gram table cannot be packed at {other:?}")
+                    }
+                },
+            };
+            let bf16_bytes = if want == TensorDtype::Bf16 {
+                ngram.raw_concat(src_name)
+            } else {
+                None
+            };
+            let (data, dtype, scale_off, bias_off, group_size, scale_dtype) = if let Some(data) =
+                bf16_bytes
+            {
+                anyhow::ensure!(
+                    data.len() as u64 == shape.iter().product::<u64>() * 2,
+                    "{src_name}: concatenated shard bytes do not match the stacked shape"
+                );
+                (data, TensorDtype::Bf16, None, None, None, None)
+            } else if want == TensorDtype::Bf16 && ctx.profile.is_none() {
+                let (data, dt) = pack_carry_shards(parts.iter().map(|p| {
+                    provider
+                        .to_f32(p)
+                        .with_context(|| format!("reading n-gram shard {p}"))
+                }))?;
+                let elem = match dt {
+                    TensorDtype::F32 => 4,
+                    _ => 2,
+                };
+                anyhow::ensure!(
+                    data.len() as u64 == shape.iter().product::<u64>() * elem,
+                    "{src_name}: carried shard values do not match the stacked shape"
+                );
+                (data, dt, None, None, None, None)
+            } else {
+                let mut pw: Vec<u8> = Vec::new();
+                let mut sc: Vec<u8> = Vec::new();
+                let mut bs: Vec<u8> = Vec::new();
+                let mut layout: Option<(TensorDtype, u32, Option<base_format::ScaleDtype>)> = None;
+                for p in parts {
+                    let f32s = provider
+                        .to_f32(p)
+                        .with_context(|| format!("reading n-gram shard {p}"))?;
+                    let (packed, dt) = if ctx.profile.is_some() {
+                        ctx.pack_tensor(canonical, &f32s, in_features)?
+                    } else {
+                        pack_for_target_rows(&f32s, target, in_features, canonical)?
+                    };
+                    let this = (dt, packed.group_size, packed.scale_dtype);
+                    match &layout {
+                        None => layout = Some(this),
+                        Some(l) if *l == this => {}
+                        Some(l) => bail!(
+                            "{canonical}: n-gram shard {p} packed as {this:?}, earlier shards as {l:?}"
+                        ),
+                    }
+                    pw.extend_from_slice(&packed.packed_weights);
+                    sc.extend_from_slice(&packed.scales);
+                    bs.extend_from_slice(&packed.biases);
+                }
+                let (dt, gs, sdt) = layout.expect("a stacked table has at least one shard");
+                let mut data = pw;
+                let scale_off = (!sc.is_empty()).then_some(data.len() as u64);
+                data.extend_from_slice(&sc);
+                let bias_off = (!bs.is_empty()).then_some(data.len() as u64);
+                data.extend_from_slice(&bs);
+                (
+                    data,
+                    dt,
+                    scale_off.map(|o| (o, sc.len() as u64)),
+                    bias_off.map(|o| (o, bs.len() as u64)),
+                    (gs > 0).then_some(gs),
+                    sdt,
+                )
+            };
+            let entry = base_format::TensorEntry {
+                name: canonical.clone(),
+                dtype,
+                shape,
+                offset: 0,
+                length: data.len() as u64,
+                scale_offset: scale_off.map(|(o, _)| o),
+                scale_length: scale_off.map(|(_, l)| l),
+                bias_offset: bias_off.map(|(o, _)| o),
+                bias_length: bias_off.map(|(_, l)| l),
+                awq_scale_offset: None,
+                awq_scale_length: None,
+                group_size,
+                layout: None,
+                residency: Some(base_format::ResidencyHint::Hot),
+                compute_region: ComputeRegion::Gpu,
+                scale_dtype,
+                symmetric: false,
+                flags: TensorFlags::empty(),
+                checksum_xxh64: None,
+                source_ggml_type: None,
+                algo: None,
+                awq_alpha: None,
+            };
+            eprintln!(
+                "  ngram    {canonical}  {:?} [{}] from {} shards ({:.1} GB)",
+                entry.dtype,
+                entry
+                    .shape
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                parts.len(),
+                data.len() as f64 / 1e9
+            );
+            writer.add_tensor(TensorPayload { entry, data });
+            let pattern = parts[0]
+                .rsplit_once(".shard_")
+                .map(|(pre, _)| format!("{pre}.shard_{{e}}.weight"))
+                .unwrap_or_else(|| parts[0].clone());
+            prov_tensors.insert(
+                canonical.clone(),
+                base_format::TensorProvenance {
+                    stack: Some(base_format::StackRef {
+                        pattern,
+                        count: parts.len() as u32,
+                    }),
                     ..Default::default()
                 },
             );
@@ -4679,7 +5203,12 @@ fn convert_generic(
         // See GGUF path above for rationale on the f16/GPU route. The GDN
         // conv1d (the mapper's `other`) also routes here (f16 on GPU).
         let is_norm_like = !is_sidecar && (shape.len() == 1 || is_gdn_f16(canonical));
-        let is_embedding = canonical == "embed_tokens.weight" || canonical == "lm_head.weight";
+        // The mapper's class (§4.8), never the name: an `embedding` is
+        // read by the lookup (hot in the GPU region, its rows packed at
+        // the cell that divides them), an `expert_stack` / `linear` by the
+        // shared GEMMs, and an `other` tensor by a model-specific kernel.
+        let class = class_of(canonical, &shape, is_spec);
+        let is_embedding = hot_placement(canonical, class);
         // GLM MLA k_b/v_b projections and router weights are raw-f16
         // consumers and must never enter the quantized transplant path.
         // Under the mirror policy the same holds for every tensor the
@@ -4726,6 +5255,16 @@ fn convert_generic(
         } else {
             None
         };
+        // §4.8: an `other` tensor has no quant cells. Under a bare
+        // `--target`, or a profile whose only rule for it is a catch-all,
+        // it stays as stored (the narrowest lossless dtype, like the mirror
+        // carry); a rule that names it or its role still decides. The
+        // name-keyed precision pins above (SSM / GDN / sidecar / forced
+        // f16) and a transplant keep their precedence.
+        let other_as_stored = class == base_arch::decl::TensorClass::Other
+            && shape.len() >= 2
+            && passthrough.is_none()
+            && profile_rule_is_catch_all(ctx.profile.as_ref(), canonical);
         let transplant_dtype = if allow_nvfp4_passthrough {
             TensorDtype::Nvfp4
         } else {
@@ -4917,7 +5456,7 @@ fn convert_generic(
                 awq_alpha: None,
             };
             (entry, bytes)
-        } else if src_unquantized {
+        } else if src_unquantized || other_as_stored {
             // Mirror policy, the 2-D case: the checkpoint keeps this
             // tensor unquantized (Nemotron's bf16 MoE router is the
             // canonical example), so requantizing it would make the
@@ -4925,6 +5464,8 @@ fn convert_generic(
             // narrowest dtype that represents every value losslessly.
             // The runtime serves f16/bf16/f32 2-D weights natively
             // (f16 zero-copy; bf16/f32 converted to f16 at load).
+            // An `other` tensor under a target / catch-all rule takes the
+            // same path: it has no quant cell to pack at.
             n_carried += 1;
             let (bytes, dtype) = if f16_lossless(f32s_for()) {
                 (
@@ -5145,7 +5686,7 @@ fn convert_generic(
         // checkpoint without a hand-maintained name table.
         let mut rec = base_format::TensorProvenance {
             transplanted,
-            carried: src_unquantized,
+            carried: src_unquantized || other_as_stored,
             transform: value_transform(canonical)
                 .map(|vt| vt_label(vt).to_string())
                 .or(prov_transform.map(str::to_string)),
@@ -5918,7 +6459,7 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
     // experts on the MoE variants). It is the bundle's speculator: routed
     // into the speculator sub-bundle (kept f16, skipped by a runtime that
     // does not speculate) under `mtp.<canonical>`.
-    if arch.starts_with("qwen35") {
+    if arch.starts_with("qwen35") || arch == "qwen4_exp" {
         if name == "mtp" {
             return None;
         }
@@ -6007,13 +6548,25 @@ fn to_canonical_name(name: &str, arch: &str) -> Option<Canonical> {
     // MTP can also arrive wrapped (`model.mtp.*`, or `model.language_model.
     // mtp.*` on VL-style checkpoints); the bare-prefix route at the top of
     // this function runs before wrapper stripping and misses those.
-    if arch.starts_with("qwen35") {
+    if arch.starts_with("qwen35") || arch == "qwen4_exp" {
         if stripped == "mtp" {
             return None;
         }
         if let Some(rest) = stripped.strip_prefix("mtp.") {
             return mtp_speculator_name(rest, arch);
         }
+    }
+    // Qwen3.8-Flash-Next: the PLE n-gram embedding's three i64 hash tables
+    // (layer multipliers, per-head vocab sizes, per-head offsets) have no
+    // .base dtype; the mapper re-derives them from the config exactly as the
+    // modeling code does and records them in the header config, so the
+    // tensors are dropped (declared in provenance.dropped).
+    if arch == "qwen4_exp"
+        && (stripped.ends_with(".ple_embedding.layer_multipliers")
+            || stripped.ends_with(".ple_embedding.ngram_heads_offsets")
+            || stripped.ends_with(".ple_embedding.ngram_heads_vocab_sizes"))
+    {
+        return None;
     }
 
     // GLM 5.2 (glm_dsa) MLX/HF checkpoints — dedicated rename table so the
@@ -6919,6 +7472,162 @@ fn pack_carry(weights: &[f32]) -> (base_quant::Packed, base_format::TensorDtype)
     }
 }
 
+/// `pack_carry` over a table that arrives in row shards (the stacked n-gram
+/// table): ONE dtype for the whole table — the narrowest that holds every
+/// value of every shard bit-exactly (f16, else bf16, else f32) — so the bytes
+/// equal `pack_carry` of the concatenated values. Shards are read one at a
+/// time; when a later shard leaves the current dtype's grid, the rows already
+/// packed are re-encoded into the wider one (exact: they lie on both grids)
+/// IN PLACE — f16 -> bf16 element by element, a 2-byte dtype -> f32 widened
+/// back to front within the one buffer — so the peak stays the table being
+/// written plus one shard, never a second image of the packed prefix.
+fn pack_carry_shards<I>(shards: I) -> Result<(Vec<u8>, base_format::TensorDtype)>
+where
+    I: IntoIterator<Item = Result<Vec<f32>>>,
+{
+    use base_format::TensorDtype;
+    fn half_to_f32(b: [u8; 2], dt: TensorDtype) -> f32 {
+        match dt {
+            TensorDtype::F16 => half::f16::from_le_bytes(b).to_f32(),
+            _ => half::bf16::from_le_bytes(b).to_f32(),
+        }
+    }
+    // Re-encode `out` (all `from`) as `to`, a wider-or-equal grid every value
+    // already lies on. The only promotions are f16 -> bf16 and f16 / bf16 ->
+    // f32 (fits_* only ever turn false).
+    fn promote(out: &mut Vec<u8>, from: TensorDtype, to: TensorDtype) {
+        if to == TensorDtype::F32 {
+            let n = out.len() / 2;
+            out.resize(n * 4, 0);
+            // Back to front: element i moves from [2i, 2i+2) to [4i, 4i+4),
+            // which only overlaps elements >= i, already moved.
+            for i in (0..n).rev() {
+                let v = half_to_f32([out[2 * i], out[2 * i + 1]], from);
+                out[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        } else {
+            for c in out.chunks_exact_mut(2) {
+                let v = half_to_f32([c[0], c[1]], from);
+                c.copy_from_slice(&half::bf16::from_f32(v).to_le_bytes());
+            }
+        }
+    }
+    fn encode(out: &mut Vec<u8>, vals: &[f32], dt: TensorDtype) {
+        for &v in vals {
+            match dt {
+                TensorDtype::F16 => out.extend_from_slice(&half::f16::from_f32(v).to_le_bytes()),
+                TensorDtype::Bf16 => out.extend_from_slice(&half::bf16::from_f32(v).to_le_bytes()),
+                _ => out.extend_from_slice(&v.to_le_bytes()),
+            }
+        }
+    }
+    let (mut fits_f16, mut fits_bf16) = (true, true);
+    let mut dt = TensorDtype::F16;
+    let mut out: Vec<u8> = Vec::new();
+    for shard in shards {
+        let vals = shard?;
+        fits_f16 = fits_f16 && f16_lossless(&vals);
+        fits_bf16 = fits_bf16 && bf16_lossless(&vals);
+        let want = if fits_f16 {
+            TensorDtype::F16
+        } else if fits_bf16 {
+            TensorDtype::Bf16
+        } else {
+            TensorDtype::F32
+        };
+        if want != dt {
+            promote(&mut out, dt, want);
+            dt = want;
+        }
+        encode(&mut out, &vals, dt);
+    }
+    Ok((out, dt))
+}
+
+/// `pack_carry_shards` must stay bounded by the table it writes: a late shard
+/// that widens the dtype must not materialize the packed prefix again (as
+/// f32 or otherwise). Peak live bytes on this thread are tracked by a
+/// counting allocator (realloc counted as old + new, its worst case).
+#[cfg(test)]
+mod pack_carry_shards_memory {
+    use super::pack_carry_shards;
+    use base_format::TensorDtype;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    struct Counting;
+    thread_local! {
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+    }
+    fn bump(d: isize) {
+        let _ = LIVE.try_with(|l| {
+            l.set(l.get() + d);
+            let _ = PEAK.try_with(|p| p.set(p.get().max(l.get())));
+        });
+    }
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc(l) };
+            if !p.is_null() {
+                bump(l.size() as isize);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unsafe { System.dealloc(p, l) };
+            bump(-(l.size() as isize));
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            let q = unsafe { System.realloc(p, l, new) };
+            if !q.is_null() {
+                bump(new as isize);
+                bump(-(l.size() as isize));
+            }
+            q
+        }
+    }
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    /// Peak bytes above the starting level while packing `shards` shards of
+    /// `len` values (1.0, the last one `last`), and the result's dtype / size.
+    fn peak_for(shards: usize, len: usize, last: f32) -> (usize, TensorDtype, usize) {
+        let base = LIVE.with(|l| l.get());
+        PEAK.with(|p| p.set(base));
+        let (data, dt) = pack_carry_shards(
+            (0..shards).map(|i| Ok(vec![if i + 1 == shards { last } else { 1.0f32 }; len])),
+        )
+        .unwrap();
+        let peak = PEAK.with(|p| p.get()) - base;
+        eprintln!("{dt:?}: {} B table, peak {peak} B", data.len());
+        (peak as usize, dt, data.len())
+    }
+
+    #[test]
+    fn a_late_promotion_does_not_copy_the_packed_prefix() {
+        const SHARDS: usize = 16;
+        const LEN: usize = 256 * 1024;
+        let shard_f32 = LEN * 4;
+        // Bound: the final table, the growth of its buffer (amortized
+        // doubling and the widening realloc, counted as old + new), and one
+        // shard's f32 values in flight.
+        let bound = |table: usize| table + table / 2 + 2 * shard_f32 + 64 * 1024;
+        // Never promoted: f16 throughout.
+        let (peak, dt, size) = peak_for(SHARDS, LEN, 1.0);
+        assert_eq!((dt, size), (TensorDtype::F16, SHARDS * LEN * 2));
+        assert!(peak <= bound(size), "f16: peak {peak} > {}", bound(size));
+        // Promoted to bf16 by the last shard: same size, in place.
+        let (peak, dt, size) = peak_for(SHARDS, LEN, 65536.0);
+        assert_eq!((dt, size), (TensorDtype::Bf16, SHARDS * LEN * 2));
+        assert!(peak <= bound(size), "bf16: peak {peak} > {}", bound(size));
+        // Promoted to f32 by the last shard: widened within one buffer.
+        let (peak, dt, size) = peak_for(SHARDS, LEN, f32::from_bits(0x3f80_0001));
+        assert_eq!((dt, size), (TensorDtype::F32, SHARDS * LEN * 4));
+        assert!(peak <= bound(size), "f32: peak {peak} > {}", bound(size));
+    }
+}
+
 /// Profile-driven per-tensor quant context.
 ///
 /// Holds the loaded profile + optional AWQ sidecar; produces
@@ -7334,47 +8043,32 @@ impl FoldPlan {
     }
 }
 
-const ATTN_CONSUMERS: [&str; 7] = [
-    "self_attn.q_proj.weight",
-    "self_attn.k_proj.weight",
-    "self_attn.v_proj.weight",
-    "linear_attn.in_proj_qkv.weight",
-    "linear_attn.in_proj_z.weight",
-    "linear_attn.in_proj_a.weight",
-    "linear_attn.in_proj_b.weight",
-];
-const MLP_CONSUMERS: [&str; 2] = ["mlp.gate_proj.weight", "mlp.up_proj.weight"];
-/// 2-D tensors in a block that share the norm output's width but do NOT
-/// consume it (their input comes from elsewhere in the block).
-const KNOWN_NON_CONSUMERS: [&str; 4] = [
-    "self_attn.o_proj.weight",
-    "linear_attn.out_proj.weight",
-    "mlp.down_proj.weight",
-    // MoE router (Gemma 4 `router.proj`): reads its own weightless-norm
-    // mix of the residual, never the post-attention norm's output.
-    "mlp.router.weight",
-];
-
-/// Fused 3-D MoE expert tensors (`[E, N, K]`, rows of expert e at
-/// `[e·N, (e+1)·N)` of the flat `[E·N, K]` image the packer sees).
-const MOE_GATE_UP: &str = "ffn_gate_up_exps.weight";
-const MOE_DOWN: &str = "ffn_down_exps.weight";
-/// The norm whose output feeds the routed experts (Gemma 4
-/// `pre_feedforward_layernorm_2`); nothing else consumes it.
-const MOE_NORM: &str = "pre_ffw_norm_2.weight";
-
-/// Archs whose attention applies a weightless per-head RMS norm to V
-/// (Gemma 4): a `1/s` folded into v's rows is normalized away, so the
-/// `o` fold would change the function.
-fn v_is_rms_normed(arch: &str) -> bool {
-    arch == "gemma4"
+/// The fold groups the architecture's mapper declares over a checkpoint's
+/// canonical tensors (PIPELINE_V3 §4.8): the only source of folds, for
+/// `basert inventory` and for the fold plan alike. An arch without a
+/// declaring mapper (the synthetic bundle) has none.
+fn declared_fold_groups(
+    arch: &str,
+    tensors: &[(String, Vec<u64>)],
+    config: &base_arch::ArchConfig,
+) -> Vec<base_arch::decl::FoldGroup> {
+    match base_arch::declaring_mapper(arch) {
+        Some(m) => m.fold_groups(tensors, config),
+        None => Vec::new(),
+    }
 }
 
-/// Split `layers.N.rest` → (N, rest).
-fn layer_split(canonical: &str) -> Option<(usize, &str)> {
-    let rest = canonical.strip_prefix("layers.")?;
-    let (idx, tail) = rest.split_once('.')?;
-    Some((idx.parse().ok()?, tail))
+/// Tie a per-channel statistic across the repeats of a `period`-wide
+/// gain: a gamma fold whose norm gain is narrower than its consumer's
+/// input (Qwen3.5's Gated-DeltaNet output norm — one `head_dim` gain
+/// applied to every head) needs one `s` per gain entry, so every channel
+/// takes the max over the heads that share it.
+fn periodic_tile_max(v: &[f32], period: usize) -> Vec<f32> {
+    let mut m = vec![0f32; period];
+    for (i, &x) in v.iter().enumerate() {
+        m[i % period] = m[i % period].max(x);
+    }
+    (0..v.len()).map(|i| m[i % period]).collect()
 }
 
 /// Build the fold plan: which tensors get AWQ, with which shared scale
@@ -7474,6 +8168,7 @@ fn build_awq_fold_plan(
     config: &base_arch::ArchConfig,
     arch: &str,
 ) -> Result<FoldPlan> {
+    use base_arch::decl::{FoldKind, FoldTile, UpstreamRows};
     use base_format::TensorDtype;
     use base_quant::QuantAlgo;
     use std::collections::{BTreeMap, HashMap};
@@ -7496,14 +8191,26 @@ fn build_awq_fold_plan(
         by_canon.insert(canon.as_str(), (src.as_str(), provider.source_shape(src)?));
     }
 
+    // The mapper's declared groups (§4.8) — the same list `basert
+    // inventory` reports — and which group each consumer belongs to.
+    let tensors: Vec<(String, Vec<u64>)> = mapped
+        .iter()
+        .map(|(_, c)| (c.clone(), by_canon[c.as_str()].1.clone()))
+        .collect();
+    let declared = declared_fold_groups(arch, &tensors, config);
+    let mut group_of: HashMap<&str, usize> = HashMap::new();
+    for (i, g) in declared.iter().enumerate() {
+        for c in &g.consumers {
+            group_of.entry(c.as_str()).or_insert(i);
+        }
+    }
+
     // AWQ-requested quantized 2-D tensors (and fused 3-D MoE experts),
-    // grouped by fold group.
-    // key: (kind, layer) with kind ∈ {attn, mlp, down, o, head, moe, moe_down}
-    let mut groups: BTreeMap<(&'static str, usize), Vec<String>> = BTreeMap::new();
+    // grouped by their declared fold group, in declaration order.
+    let mut groups: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     for (_, canon) in mapped {
         let (_, shape) = &by_canon[canon.as_str()];
-        let moe_tail = layer_split(canon).filter(|(_, t)| *t == MOE_GATE_UP || *t == MOE_DOWN);
-        if shape.len() != 2 && !(shape.len() == 3 && moe_tail.is_some()) {
+        if shape.len() < 2 {
             continue;
         }
         let Some(resolved) = profile.resolve(canon) else {
@@ -7526,30 +8233,9 @@ fn build_awq_fold_plan(
                 .push((canon.clone(), "rule dtype is not a canonical quant".into()));
             continue;
         }
-        match layer_split(canon) {
-            Some((n, MOE_GATE_UP)) if shape.len() == 3 => {
-                groups.entry(("moe", n)).or_default().push(canon.clone())
-            }
-            Some((n, MOE_DOWN)) if shape.len() == 3 => groups
-                .entry(("moe_down", n))
-                .or_default()
-                .push(canon.clone()),
-            Some((n, tail)) if ATTN_CONSUMERS.contains(&tail) => {
-                groups.entry(("attn", n)).or_default().push(canon.clone())
-            }
-            Some((n, tail)) if MLP_CONSUMERS.contains(&tail) => {
-                groups.entry(("mlp", n)).or_default().push(canon.clone())
-            }
-            Some((n, "mlp.down_proj.weight")) => {
-                groups.entry(("down", n)).or_default().push(canon.clone())
-            }
-            Some((n, "self_attn.o_proj.weight")) => {
-                groups.entry(("o", n)).or_default().push(canon.clone())
-            }
-            None if canon == "lm_head.weight" => {
-                groups.entry(("head", 0)).or_default().push(canon.clone())
-            }
-            _ => plan
+        match group_of.get(canon.as_str()) {
+            Some(&gi) => groups.entry(gi).or_default().push(canon.clone()),
+            None => plan
                 .fallback
                 .push((canon.clone(), "no fold path for this tensor's input".into())),
         }
@@ -7564,14 +8250,36 @@ fn build_awq_fold_plan(
     let mut alpha_hist: BTreeMap<String, usize> = BTreeMap::new();
     let mut disagreements = 0usize;
     let mut raw_members = 0usize;
-    for ((kind, layer), requested) in &groups {
+    let tensor_set = base_arch::decl::TensorSet::new(&tensors);
+    for (gi, requested) in &groups {
+        let g = &declared[*gi];
+        let kind = g.kind;
+        let layer = g.layer.unwrap_or(0);
+        let refuse = |plan: &mut FoldPlan, why: String| {
+            for c in requested {
+                plan.fallback.push((c.clone(), why.clone()));
+            }
+        };
+        if !g.foldable {
+            let why = g
+                .refusal
+                .clone()
+                .unwrap_or_else(|| format!("{kind} fold declared not foldable"));
+            refuse(&mut plan, why);
+            continue;
+        }
         // ── resolve the group's structure ─────────────────────────────
-        if *kind == "moe_down" {
+        // A rows fold whose consumer is a fused 3-D expert stack: one s per
+        // expert, from the expert's own statistics.
+        if g.fold == FoldKind::Rows && by_canon[requested[0].as_str()].1.len() == 3 {
             moe_down_fold(
                 ctx,
                 &mut plan,
-                *layer,
+                kind,
+                layer,
                 &requested[0],
+                &g.upstream,
+                g.upstream_rows,
                 &by_canon,
                 provider,
                 &mut raw_members,
@@ -7582,160 +8290,15 @@ fn build_awq_fold_plan(
             }
             continue;
         }
-        let (norm_name, consumer_tails): (String, &[&str]) = match *kind {
-            "attn" => (format!("layers.{layer}.input_norm.weight"), &ATTN_CONSUMERS),
-            "mlp" => (
-                format!("layers.{layer}.post_attn_norm.weight"),
-                &MLP_CONSUMERS,
-            ),
-            "moe" => (format!("layers.{layer}.{MOE_NORM}"), &[MOE_GATE_UP]),
-            "head" => ("final_norm.weight".to_string(), &["lm_head.weight"]),
-            _ => (String::new(), &[]),
-        };
-        // GQA tiling of the o_proj fold: o's input channel (h, d) comes
-        // from v row (h / rep, d). `None` for every other kind.
-        let mut o_tile: Option<(usize, usize, usize)> = None; // (heads, kv_heads, head_dim)
-        let refuse = |plan: &mut FoldPlan, why: String| {
-            for c in requested {
-                plan.fallback.push((c.clone(), why.clone()));
+        // the group's tiling and in_features, from the shapes (base_arch::decl::fold_tile — the
+        // same derivation `basert inventory` writes as the group's `tile`)
+        let (tile, width) = match base_arch::decl::fold_tile(g, &tensor_set, config) {
+            Ok(x) => x,
+            Err(why) => {
+                refuse(&mut plan, why);
+                continue;
             }
         };
-        let mut consumers: Vec<String> = Vec::new();
-        let width: usize;
-        if *kind == "down" {
-            let down = &requested[0];
-            let up = format!("layers.{layer}.mlp.up_proj.weight");
-            let Some((_, up_shape)) = by_canon.get(up.as_str()) else {
-                refuse(
-                    &mut plan,
-                    format!("{up} missing; cannot fold 1/s into up rows"),
-                );
-                continue;
-            };
-            let down_shape = &by_canon[down.as_str()].1;
-            width = down_shape[1] as usize;
-            if up_shape.len() != 2 || up_shape[0] as usize != width {
-                refuse(
-                    &mut plan,
-                    format!("{up} shape {up_shape:?} does not feed {down} [.., {width}]"),
-                );
-                continue;
-            }
-        } else if *kind == "o" {
-            let o = &requested[0];
-            let v = format!("layers.{layer}.self_attn.v_proj.weight");
-            if v_is_rms_normed(arch) {
-                refuse(
-                    &mut plan,
-                    format!("{arch} RMS-normalizes V per head (no weight); 1/s in {v}'s rows would be normalized away"),
-                );
-                continue;
-            }
-            let Some((_, v_shape)) = by_canon.get(v.as_str()) else {
-                refuse(
-                    &mut plan,
-                    format!("{v} missing; cannot fold 1/s into v rows"),
-                );
-                continue;
-            };
-            let o_shape = &by_canon[o.as_str()].1;
-            width = o_shape[1] as usize;
-            let heads = config.num_attention_heads as usize;
-            let kv = config.num_kv_heads.max(1) as usize;
-            let hd = if config.head_dim > 0 {
-                config.head_dim as usize
-            } else {
-                width / heads.max(1)
-            };
-            if heads == 0
-                || width != heads * hd
-                || v_shape.len() != 2
-                || v_shape[0] as usize != kv * hd
-                || heads % kv != 0
-            {
-                refuse(
-                    &mut plan,
-                    format!(
-                        "{o} [.., {width}] / {v} {v_shape:?} do not match heads={heads} kv={kv} head_dim={hd}"
-                    ),
-                );
-                continue;
-            }
-            o_tile = Some((heads, kv, hd));
-        } else {
-            let Some((_, norm_shape)) = by_canon.get(norm_name.as_str()) else {
-                refuse(
-                    &mut plan,
-                    format!("{norm_name} missing; cannot fold 1/s into the norm"),
-                );
-                continue;
-            };
-            if norm_shape.len() != 1 {
-                refuse(&mut plan, format!("{norm_name} is not 1-D"));
-                continue;
-            }
-            width = norm_shape[0] as usize;
-            if *kind == "head" && config.tie_word_embeddings {
-                refuse(
-                    &mut plan,
-                    "embedding is tied to lm_head; the final norm cannot carry 1/s".into(),
-                );
-                continue;
-            }
-            let prefix = if *kind == "head" {
-                String::new()
-            } else {
-                format!("layers.{layer}.")
-            };
-            let mut unknown: Vec<String> = Vec::new();
-            if *kind == "moe" {
-                // the routed experts are the norm's only consumer
-                let gu = &requested[0];
-                let gu_shape = &by_canon[gu.as_str()].1;
-                if gu_shape[2] as usize != width {
-                    refuse(
-                        &mut plan,
-                        format!("{gu} {gu_shape:?} does not consume {norm_name} [{width}]"),
-                    );
-                    continue;
-                }
-                consumers.push(gu.clone());
-            }
-            for (canon, (_, shape)) in &by_canon {
-                if *kind == "moe" {
-                    break;
-                }
-                let Some(tail) = canon.strip_prefix(prefix.as_str()) else {
-                    continue;
-                };
-                if shape.len() != 2 || shape[1] as usize != width {
-                    continue;
-                }
-                let in_block = match *kind {
-                    "attn" => tail.starts_with("self_attn.") || tail.starts_with("linear_attn."),
-                    "head" => !tail.starts_with("layers."),
-                    _ => tail.starts_with("mlp."),
-                };
-                if !in_block {
-                    continue;
-                }
-                if consumer_tails.contains(&tail) {
-                    consumers.push(canon.to_string());
-                } else if !KNOWN_NON_CONSUMERS.contains(&tail) && tail != "embed_tokens.weight" {
-                    unknown.push(canon.to_string());
-                }
-            }
-            if !unknown.is_empty() {
-                refuse(
-                    &mut plan,
-                    format!(
-                        "unrecognized tensors sharing {norm_name}'s width: {unknown:?} — refusing the fold"
-                    ),
-                );
-                continue;
-            }
-            consumers.sort();
-        }
 
         // ── absmax + weights for the AWQ-marked members ───────────────
         let mut abs_vecs: Vec<&[f32]> = Vec::new();
@@ -7795,9 +8358,18 @@ fn build_awq_fold_plan(
         if !agree {
             disagreements += 1;
         }
-        if let Some((heads, kv, hd)) = o_tile {
-            absmax = gqa_tile_max(&absmax, heads, kv, hd);
-        }
+        let tile_max = |v: &[f32]| -> Vec<f32> {
+            match tile {
+                FoldTile::Gqa {
+                    heads,
+                    kv,
+                    head_dim,
+                } => gqa_tile_max(v, heads, kv, head_dim),
+                FoldTile::Period(period) => periodic_tile_max(v, period),
+                FoldTile::Identity => v.to_vec(),
+            }
+        };
+        absmax = tile_max(&absmax);
         let gm: Vec<base_awq::GroupMember> = members
             .iter()
             .map(|(_, w, r)| base_awq::GroupMember {
@@ -7812,10 +8384,7 @@ fn build_awq_fold_plan(
         // Error weight: E[x²] when every member carries it, else absmax².
         let meansq = if msq_vecs.len() == members.len() {
             let (m, _) = base_awq::merge_absmax(&msq_vecs, 1e-3);
-            Some(match o_tile {
-                Some((heads, kv, hd)) => gqa_tile_max(&m, heads, kv, hd),
-                None => m,
-            })
+            Some(tile_max(&m))
         } else {
             None
         };
@@ -7850,18 +8419,10 @@ fn build_awq_fold_plan(
             };
         plan.reports.push(FoldGroupReport {
             kind,
-            layer: *layer,
+            layer,
             members: members.iter().map(|m| m.0.clone()).collect(),
-            consumers: if matches!(*kind, "down" | "o") {
-                requested.clone()
-            } else {
-                consumers.clone()
-            },
-            upstream: match *kind {
-                "down" => format!("layers.{layer}.mlp.up_proj.weight"),
-                "o" => format!("layers.{layer}.self_attn.v_proj.weight"),
-                _ => norm_name.clone(),
-            },
+            consumers: g.consumers.clone(),
+            upstream: g.upstream.clone(),
             alpha: awq.alpha,
             mse: awq.mse,
             curve,
@@ -7874,34 +8435,46 @@ fn build_awq_fold_plan(
         });
 
         // ── record the fold ───────────────────────────────────────────
-        if *kind == "down" {
-            let down = &requested[0];
-            let up = format!("layers.{layer}.mlp.up_proj.weight");
-            plan.col_scale.insert(down.clone(), awq.scales.clone());
-            plan.row_scale
-                .insert(up.clone(), awq.inverse_scales.clone());
-            fold_companion_bias(&mut plan, &by_canon, &up, &awq.inverse_scales)?;
-        } else if let Some((heads, kv, hd)) = o_tile {
-            let o = &requested[0];
-            let v = format!("layers.{layer}.self_attn.v_proj.weight");
-            // 1/s per v row: the (tied) value of its query-head group
-            let rep = heads / kv;
-            let mut inv_v = vec![1f32; kv * hd];
-            for g in 0..kv {
-                for d in 0..hd {
-                    inv_v[g * hd + d] = awq.inverse_scales[(g * rep) * hd + d];
+        match g.fold {
+            FoldKind::Rows => {
+                let consumer = &g.consumers[0];
+                plan.col_scale.insert(consumer.clone(), awq.scales.clone());
+                let inv = match tile {
+                    // 1/s per v row: the (tied) value of its query-head group
+                    FoldTile::Gqa {
+                        heads,
+                        kv,
+                        head_dim: hd,
+                    } => {
+                        let rep = heads / kv;
+                        let mut inv_v = vec![1f32; kv * hd];
+                        for grp in 0..kv {
+                            for d in 0..hd {
+                                inv_v[grp * hd + d] = awq.inverse_scales[(grp * rep) * hd + d];
+                            }
+                        }
+                        inv_v
+                    }
+                    _ => awq.inverse_scales.clone(),
+                };
+                debug_assert_eq!(g.upstream_rows, UpstreamRows::All);
+                // the upstream's `.bias` (Qwen2-style v_proj) takes 1/s too
+                fold_companion_bias(&mut plan, &by_canon, &g.upstream, &inv)?;
+                plan.row_scale.insert(g.upstream.clone(), inv);
+            }
+            FoldKind::Gamma => {
+                for c in &g.consumers {
+                    plan.col_scale.insert(c.clone(), awq.scales.clone());
                 }
+                // a tiled s is periodic: the gain takes one period
+                let inv = match tile {
+                    FoldTile::Period(period) => awq.inverse_scales[..period].to_vec(),
+                    _ => awq.inverse_scales.clone(),
+                };
+                // the norm's `.bias` (same length as its gain) takes 1/s too
+                fold_companion_bias(&mut plan, &by_canon, &g.upstream, &inv)?;
+                plan.gamma_scale.insert(g.upstream.clone(), inv);
             }
-            plan.col_scale.insert(o.clone(), awq.scales.clone());
-            fold_companion_bias(&mut plan, &by_canon, &v, &inv_v)?;
-            plan.row_scale.insert(v, inv_v);
-        } else {
-            for c in &consumers {
-                plan.col_scale.insert(c.clone(), awq.scales.clone());
-            }
-            plan.gamma_scale
-                .insert(norm_name.clone(), awq.inverse_scales.clone());
-            fold_companion_bias(&mut plan, &by_canon, &norm_name, &awq.inverse_scales)?;
         }
         for (canon, _, _) in &members {
             plan.alpha.insert(canon.clone(), awq.alpha);
@@ -7941,30 +8514,37 @@ fn build_awq_fold_plan(
     Ok(plan)
 }
 
-/// The `moe_down` fold of one layer's fused experts: expert e's down
-/// slab `[D, F]` gets its columns scaled by `s_e` and the up half of its
-/// gate_up slab (rows `[F, 2F)` of `[2F, D]`) by `1/s_e` — down's input
-/// is `act(gate·x) ⊙ (up·x)`, linear in up, so every expert computes the
-/// same function. `s_e` comes from the expert's OWN statistics (the
-/// sidecar's `per_expert_*`); experts that saw no calibration row keep
-/// `s_e = 1`. One alpha serves the layer: the searched curve is the sum
-/// of the per-expert curves, each weighted by the expert's activation
-/// energy (routed rows × mean E[x²]), i.e. the expected output error.
+/// The `moe_down` fold of one layer's experts: expert e's down slab
+/// `[D, F]` gets its columns scaled by `s_e` and its up rows by `1/s_e` —
+/// the second half (rows `[F, 2F)` of `[2F, D]`) of a fused gate_up slab,
+/// every row of a split up slab `[F, D]`, as the declared group's
+/// `upstream_rows` says — down's input is `act(gate·x) ⊙ (up·x)`, linear
+/// in up, so every expert computes the same function. `s_e` comes from
+/// the expert's OWN statistics (the sidecar's `per_expert_*`); experts
+/// that saw no calibration row keep `s_e = 1`. One alpha serves the
+/// layer: the searched curve is the sum of the per-expert curves, each
+/// weighted by the expert's activation energy (routed rows × mean E[x²]),
+/// i.e. the expected output error.
+#[allow(clippy::too_many_arguments)]
 fn moe_down_fold(
     ctx: &QuantContext,
     plan: &mut FoldPlan,
+    kind: &'static str,
     layer: usize,
     down: &String,
+    up: &str,
+    upstream_rows: base_arch::decl::UpstreamRows,
     by_canon: &std::collections::HashMap<&str, (&str, Vec<u64>)>,
     provider: &dyn TensorProvider,
     raw_members: &mut usize,
 ) -> Result<()> {
+    use base_arch::decl::UpstreamRows;
     let sidecar = ctx
         .awq_profile
         .as_ref()
         .expect("fold plan runs with a sidecar");
     let profile = ctx.profile.as_ref().expect("fold plan runs with a profile");
-    let gu = format!("layers.{layer}.{MOE_GATE_UP}");
+    let gu = up.to_string();
     let mut refuse = |why: String| plan.fallback.push((down.clone(), why));
     let (src, down_shape) = &by_canon[down.as_str()];
     let (e_n, d, f) = (
@@ -7978,13 +8558,18 @@ fn moe_down_fold(
         ));
         return Ok(());
     };
+    // rows per expert of the upstream slab, and where its up rows start
+    let (up_n, up_off) = match upstream_rows {
+        UpstreamRows::SecondHalf => (2 * f, f),
+        UpstreamRows::All => (f, 0),
+    };
     if gu_shape.len() != 3
         || gu_shape[0] as usize != e_n
-        || gu_shape[1] as usize != 2 * f
+        || gu_shape[1] as usize != up_n
         || gu_shape[2] as usize != d
     {
         refuse(format!(
-            "{gu} {gu_shape:?} does not feed {down} {down_shape:?} as [E, 2F, D]"
+            "{gu} {gu_shape:?} does not feed {down} {down_shape:?} as [E, {up_n}, D]"
         ));
         return Ok(());
     }
@@ -8083,17 +8668,17 @@ fn moe_down_fold(
     };
     // per-expert s_e at the chosen alpha; silent experts stay at 1
     let mut col = vec![1f32; e_n * f];
-    let mut row = vec![1f32; e_n * 2 * f];
+    let mut row = vec![1f32; e_n * up_n];
     for &e in &active {
         let p = base_awq::AwqConfig::plan_for_alpha(&absmax[e], alpha);
         col[e * f..(e + 1) * f].copy_from_slice(&p.scales);
-        row[e * 2 * f + f..(e + 1) * 2 * f].copy_from_slice(&p.inverse_scales);
+        row[e * up_n + up_off..e * up_n + up_off + f].copy_from_slice(&p.inverse_scales);
     }
     plan.col_scale.insert(down.clone(), col);
     plan.row_scale.insert(gu.clone(), row);
     plan.alpha.insert(down.clone(), alpha);
     plan.reports.push(FoldGroupReport {
-        kind: "moe_down",
+        kind,
         layer,
         members: vec![down.clone()],
         consumers: vec![down.clone()],
@@ -8197,6 +8782,19 @@ struct HfSource {
     config: base_arch::ArchConfig,
     canonical_arch: &'static str,
     model_type: String,
+    /// The architecture's mapper: the declaring authority for classes
+    /// and folds (§4.8).
+    mapper: &'static dyn base_arch::HfMapper,
+}
+
+/// The checkpoint's tensors outside the main LM bundle, mapped as
+/// `convert_hf` routes them: `(source name, canonical name)`.
+#[derive(Default)]
+struct HfSections {
+    /// `header.mmproj.tensors` — a vision / audio tower and its projector.
+    mmproj: Vec<(String, String)>,
+    /// `header.speculator.tensors` — the MTP head, under `mtp.<name>`.
+    speculator: Vec<(String, String)>,
 }
 
 fn open_hf_source(input: &std::path::Path) -> Result<HfSource> {
@@ -8215,34 +8813,73 @@ fn open_hf_source(input: &std::path::Path) -> Result<HfSource> {
         config,
         canonical_arch: mapper.canonical_arch(),
         model_type,
+        mapper,
     })
 }
 
+/// How many tap column blocks a drafter's fused `fc` splits into (the
+/// `FcSplitProvider`'s expectation): EAGLE-3 is always three, a block
+/// drafter names them in `target_layer_ids`, anything else has no taps.
+fn expected_fc_taps(canonical_arch: &str, config: &base_arch::ArchConfig) -> Option<usize> {
+    if base_arch::dflash::is_eagle3_arch(canonical_arch) {
+        Some(3)
+    } else if base_arch::dflash::is_block_drafter_arch(canonical_arch) {
+        config
+            .extra_config
+            .get("target_layer_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+    } else {
+        None
+    }
+}
+
 /// Run `f` over the checkpoint's tensors mapped exactly as `convert_hf`
-/// maps them (expert stacking, fused-projection splitting, canonical
-/// renames): `mapped` is `(source name, canonical name)` for every tensor
-/// that lands in the main bundle, `provider` reads them as f32.
+/// maps them — the same provider chain in the same order (expert
+/// stacking, n-gram shard stacking, fused qkv / gate_up splitting, the
+/// GLM kv_b split, the fc column split) and the same canonical renames,
+/// so the names are the bundle header's names: `mapped` is `(source
+/// name, canonical name)` for every tensor that lands in the main bundle
+/// — the tied head copy `convert` synthesizes (`plan_tied_lm_head`)
+/// included, listed under its embedding's source — `sections` holds the
+/// mmproj and speculator tensors, and `provider` reads them as f32.
 fn with_hf_mapped<R>(
     input: &std::path::Path,
-    f: impl FnOnce(&HfSource, &dyn TensorProvider, &[(String, String)]) -> Result<R>,
+    f: impl FnOnce(&HfSource, &dyn TensorProvider, &[(String, String)], &HfSections) -> Result<R>,
 ) -> Result<R> {
     let src = open_hf_source(input)?;
     if src.canonical_arch == "whisper" {
         bail!("whisper checkpoints have no canonical-quant mapping");
     }
+    let arch = src.canonical_arch;
     let base = HfTensorProvider { hf: &src.hf };
     let names: Vec<String> = src.hf.tensor_names().map(|s| s.to_string()).collect();
     let stacking = StackingProvider::build(&base, &names);
     let names = stacking.rewritten_names();
-    let splitting = SplittingProvider::build(&stacking, &names, &src.config)?;
+    let ngram = NgramStackingProvider::build(&stacking, &names, &src.config)?;
+    let names = ngram.rewritten_names();
+    let splitting = SplittingProvider::build(&ngram, &names, &src.config)?;
     let names = splitting.rewritten_names();
+    let kvb = GlmKvbSplitProvider::build(&splitting, &names, &src.config, arch);
+    let names = kvb.rewritten_names();
+    let fcs = FcSplitProvider::build(&kvb, &names, arch, expected_fc_taps(arch, &src.config))?;
+    let names = fcs.rewritten_names();
     let mut mapped: Vec<(String, String)> = Vec::new();
+    let mut sections = HfSections::default();
     for n in &names {
-        if let Some(Canonical::Main(c)) = to_canonical_name(n, src.canonical_arch) {
-            mapped.push((n.clone(), c));
+        match to_canonical_name(n, arch) {
+            Some(Canonical::Main(c)) => mapped.push((n.clone(), c)),
+            Some(Canonical::Mmproj(c)) => sections.mmproj.push((n.clone(), c)),
+            Some(Canonical::Speculator(c)) => sections.speculator.push((n.clone(), c)),
+            None => {}
         }
     }
-    f(&src, &splitting, &mapped)
+    if let TiedHeadPlan::Synthesize { src: embed_src } =
+        plan_tied_lm_head(&mapped, src.config.tie_word_embeddings, arch, true)
+    {
+        mapped.push((embed_src, "lm_head.weight".to_string()));
+    }
+    f(&src, &fcs, &mapped, &sections)
 }
 
 fn parse_cell(spec: &str) -> Result<(u32, u32)> {
@@ -8328,7 +8965,7 @@ fn cmd_awq_search(args: AwqSearchArgs) -> Result<()> {
         awq_skip_fingerprint: false,
         overlay: None,
     };
-    let report = with_hf_mapped(&args.input, |src, provider, mapped| {
+    let report = with_hf_mapped(&args.input, |src, provider, mapped, _sections| {
         let fp = hf_inventory_fingerprint(&src.hf);
         if !args.no_fingerprint_check {
             ctx.awq_profile
@@ -8378,100 +9015,154 @@ fn cmd_awq_search(args: AwqSearchArgs) -> Result<()> {
     Ok(())
 }
 
+/// `basert inventory <hf-dir>`: the checkpoint's tensors as `convert`
+/// would map them, each with its §4.8 class, and the AWQ fold groups —
+/// both exactly as the architecture's mapper declares them (schema 3).
+///
+/// ```text
+/// schema: 3
+/// tensors[]:      {source, canonical, shape, dtype, class, section
+///                  [, extension]}
+///   class:        "linear" | "expert_stack" | "embedding" | "other"
+///   extension:    {class, helper, needs} on an `other` tensor the mapper
+///                 would declare `class` if `helper` could serve it: a §4.8
+///                 extension request (the add record carries it, the bound
+///                 does not price it, finish writes TODO_dispatch)
+///   section:      "main" | "mmproj" | "speculator" (every bundle section
+///                 is listed; the walks never fetch mmproj / speculator
+///                 tensors, which the add record marks `unread`)
+/// fold_groups[]:  {layer, kind, consumers, upstream, fold, foldable, tile}
+///   tile:         how one s per upstream channel lands on the consumers'
+///                 input columns, as the fold plan derives it from the
+///                 shapes (base_arch::decl::fold_tile): null (one channel
+///                 per column), {"gqa": [heads, kv, head_dim]} (an o_proj:
+///                 column (h, d) takes v row (h / (heads/kv), d)) or
+///                 {"period": n} (an n-wide gain in front of a wider input,
+///                 every repeat takes the whole s). The fold probe applies
+///                 it; nothing downstream infers a tiling from the kind.
+///   refusal:      why `foldable` is false — the mapper's declaration, or
+///                 shapes that do not fold as declared (then the plan's
+///                 RTN fallback reason)
+///   fold "gamma": + gamma_shift (0|1): the model uses the stored gain g
+///                 as (1+g) — the converter bakes the shift in before it
+///                 scales, so a probe stores (1+g)/s − 1 (1) or g/s (0)
+///   fold "rows":  + upstream_rows ("all" | "second_half"): the rows of
+///                 `upstream` that absorb 1/s — every row of a plain
+///                 up_proj / v_proj / split up stack, the second half of
+///                 each expert's [E, 2F, K] fused gate_up slab
+/// ```
+///
+/// The tied head copy `convert` synthesizes is listed like any tensor
+/// (`lm_head.weight`, class `linear`, source = the embedding's); where the
+/// runtime never reads a head (Gemma 3 / 4) the one table is `embedding`.
+/// Every fold consumer is `linear` or `expert_stack` — the inventory
+/// refuses a mapper that declares otherwise, as the add check would.
 fn cmd_inventory(args: InventoryArgs) -> Result<()> {
-    use std::collections::BTreeMap;
-    let report = with_hf_mapped(&args.input, |src, provider, mapped| {
-        let mut tensors: Vec<serde_json::Value> = Vec::new();
-        let mut by_canon: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
-        for (s, c) in mapped {
-            let shape = provider.source_shape(s)?;
-            let dtype = src
-                .hf
+    use base_arch::decl::FoldKind;
+    let report = with_hf_mapped(&args.input, |src, provider, mapped, sections| {
+        let mapper = src.mapper;
+        let dtype_of = |s: &str| {
+            src.hf
                 .tensor_info(s)
                 .map(|i| format!("{:?}", i.dtype).to_uppercase())
-                .unwrap_or_else(|| "virtual".into());
+                .unwrap_or_else(|| "virtual".into())
+        };
+        let mut tensors: Vec<serde_json::Value> = Vec::new();
+        let mut main: Vec<(String, Vec<u64>)> = Vec::new();
+        let mut classes: std::collections::BTreeMap<&str, base_arch::decl::TensorClass> =
+            std::collections::BTreeMap::new();
+        for (s, c) in mapped {
+            let shape = provider.source_shape(s)?;
+            let class = mapper.tensor_class(c, &shape);
+            let mut t = serde_json::json!({
+                "source": s, "canonical": c, "shape": shape, "dtype": dtype_of(s),
+                "class": class.as_str(), "section": "main",
+            });
+            if let Some(ext) = mapper.dispatch_extension(c, &shape) {
+                // §4.8: a request is for an `other` tensor and names a quantizable class
+                if class != base_arch::decl::TensorClass::Other {
+                    bail!(
+                        "{} mapper declares an extension request on {c}, which is class {} — a request is for an `other` tensor",
+                        src.canonical_arch, class.as_str()
+                    );
+                }
+                let Some(helper) = ext.class.helper() else {
+                    bail!("{} mapper declares an extension request on {c} with class `other` — name the class the helper would serve", src.canonical_arch);
+                };
+                t["extension"] = serde_json::json!({"class": ext.class.as_str(), "helper": helper, "needs": ext.needs});
+            }
+            tensors.push(t);
+            classes.insert(c.as_str(), class);
+            main.push((c.clone(), shape));
+        }
+        for (s, c) in &sections.mmproj {
+            let shape = provider.source_shape(s)?;
             tensors.push(serde_json::json!({
-                "source": s, "canonical": c, "shape": shape, "dtype": dtype,
+                "source": s, "canonical": c, "shape": shape, "dtype": dtype_of(s),
+                "class": mapper.mmproj_class(c, &shape).as_str(), "section": "mmproj",
             }));
-            by_canon.insert(c.as_str(), shape);
         }
-        // The fold groups `build_awq_fold_plan` would form, independent of
-        // any profile: every 2-D consumer of a block's norm output, and
-        // down_proj fed by up_proj's rows.
-        let mut groups: BTreeMap<(usize, &'static str), (Vec<String>, String)> = BTreeMap::new();
-        for (c, shape) in &by_canon {
-            let Some((n, tail)) = layer_split(c) else {
-                continue;
-            };
-            // fused 3-D MoE experts: gate_up after pre_ffw_norm_2 (one
-            // shared s), down fed by the experts' own up rows (s per expert)
-            if shape.len() == 3 && tail == MOE_GATE_UP {
-                groups
-                    .entry((n, "moe"))
-                    .or_insert_with(|| (Vec::new(), format!("layers.{n}.{MOE_NORM}")))
-                    .0
-                    .push(c.to_string());
-                continue;
-            }
-            if shape.len() == 3 && tail == MOE_DOWN {
-                groups
-                    .entry((n, "moe_down"))
-                    .or_insert_with(|| (Vec::new(), format!("layers.{n}.{MOE_GATE_UP}")))
-                    .0
-                    .push(c.to_string());
-                continue;
-            }
-            if shape.len() != 2 {
-                continue;
-            }
-            if ATTN_CONSUMERS.contains(&tail) {
-                groups
-                    .entry((n, "attn"))
-                    .or_insert_with(|| (Vec::new(), format!("layers.{n}.input_norm.weight")))
-                    .0
-                    .push(c.to_string());
-            } else if MLP_CONSUMERS.contains(&tail) {
-                groups
-                    .entry((n, "mlp"))
-                    .or_insert_with(|| (Vec::new(), format!("layers.{n}.post_attn_norm.weight")))
-                    .0
-                    .push(c.to_string());
-            } else if tail == "mlp.down_proj.weight" {
-                groups
-                    .entry((n, "down"))
-                    .or_insert_with(|| (Vec::new(), format!("layers.{n}.mlp.up_proj.weight")))
-                    .0
-                    .push(c.to_string());
-            } else if tail == "self_attn.o_proj.weight" {
-                groups
-                    .entry((n, "o"))
-                    .or_insert_with(|| (Vec::new(), format!("layers.{n}.self_attn.v_proj.weight")))
-                    .0
-                    .push(c.to_string());
+        for (s, c) in &sections.speculator {
+            let shape = provider.source_shape(s)?;
+            tensors.push(serde_json::json!({
+                "source": s, "canonical": c, "shape": shape, "dtype": dtype_of(s),
+                "class": mapper.speculator_class(c, &shape).as_str(), "section": "speculator",
+            }));
+        }
+        let groups = mapper.fold_groups(&main, &src.config);
+        for g in &groups {
+            for c in &g.consumers {
+                match classes.get(c.as_str()) {
+                    Some(k) if k.may_consume_fold() => {}
+                    Some(k) => bail!(
+                        "{} mapper declares fold {}/layer {:?} with consumer {c} of class {} — a fold may list only linear / expert_stack consumers (§4.8)",
+                        src.canonical_arch, g.kind, g.layer, k.as_str()
+                    ),
+                    None => bail!(
+                        "{} mapper declares fold {}/layer {:?} with consumer {c}, which the checkpoint does not carry",
+                        src.canonical_arch, g.kind, g.layer
+                    ),
+                }
             }
         }
-        if by_canon.contains_key("lm_head.weight") && !src.config.tie_word_embeddings {
-            groups
-                .entry((usize::MAX, "head"))
-                .or_insert_with(|| (Vec::new(), "final_norm.weight".to_string()))
-                .0
-                .push("lm_head.weight".to_string());
-        }
+        // the group's tiling as the fold plan derives it (§4.8: the probe reads it, nothing downstream
+        // infers it); shapes that do not fold as declared make the group unfoldable with the plan's reason
+        let tensor_set = base_arch::decl::TensorSet::new(&main);
         let fold_groups: Vec<serde_json::Value> = groups
             .iter()
-            .map(|((n, kind), (members, upstream))| {
-                let foldable = by_canon.contains_key(upstream.as_str())
-                    && !(*kind == "o" && v_is_rms_normed(src.canonical_arch));
-                serde_json::json!({
-                    "layer": if *n == usize::MAX { serde_json::Value::Null } else { serde_json::json!(n) },
-                    "kind": kind, "consumers": members,
-                    "upstream": upstream,
-                    "fold": if matches!(*kind, "down" | "o" | "moe_down") { "rows" } else { "gamma" },
+            .map(|g| {
+                let (tile, foldable, refusal) = if !g.foldable {
+                    (serde_json::Value::Null, false, g.refusal.clone())
+                } else {
+                    match base_arch::decl::fold_tile(g, &tensor_set, &src.config) {
+                        Ok((t, _)) => (t.to_json(), true, None),
+                        Err(why) => (serde_json::Value::Null, false, Some(why)),
+                    }
+                };
+                let mut v = serde_json::json!({
+                    "layer": g.layer,
+                    "kind": g.kind, "consumers": g.consumers,
+                    "upstream": g.upstream,
+                    "fold": g.fold.as_str(),
                     "foldable": foldable,
-                })
+                    "tile": tile,
+                });
+                if let Some(why) = refusal {
+                    v["refusal"] = serde_json::json!(why);
+                }
+                match g.fold {
+                    FoldKind::Gamma => {
+                        v["gamma_shift"] = serde_json::json!(u8::from(g.gamma_shift));
+                    }
+                    FoldKind::Rows => {
+                        v["upstream_rows"] = serde_json::json!(g.upstream_rows.as_str());
+                    }
+                }
+                v
             })
             .collect();
         Ok(serde_json::json!({
+            "schema": 3,
             "model_type": src.model_type,
             "arch": src.canonical_arch,
             "fingerprint": hf_inventory_fingerprint(&src.hf),
@@ -9737,6 +10428,7 @@ mod gguf_passthrough_tests {
                 &info(256, 4, ty),
                 &bytes,
                 "layers.0.self_attn.q_proj.weight".into(),
+                false,
             );
             assert_eq!(data, bytes, "payload must be byte-identical to the source");
             assert_eq!(entry.dtype, want_dtype);
@@ -9825,16 +10517,25 @@ mod gguf_passthrough_tests {
         }
     }
 
-    /// embed/lm_head keep the hot GPU-region routing the re-quantizing
-    /// path gives them.
+    /// An `embedding`-class tensor keeps the hot GPU-region routing the
+    /// re-quantizing path gives it; anything else goes warm.
     #[test]
     fn passthrough_keeps_embedding_routing() {
         use base_format::ComputeRegion;
-        for name in ["embed_tokens.weight", "lm_head.weight"] {
-            let (entry, _) =
-                kquant_passthrough_entry(&info(256, 4, GgmlType::Q6K), &[0u8; 8], name.into());
-            assert_eq!(entry.compute_region, ComputeRegion::Gpu, "{name}");
-        }
+        let (entry, _) = kquant_passthrough_entry(
+            &info(256, 4, GgmlType::Q6K),
+            &[0u8; 8],
+            "embed_tokens.weight".into(),
+            true,
+        );
+        assert_eq!(entry.compute_region, ComputeRegion::Gpu);
+        let (entry, _) = kquant_passthrough_entry(
+            &info(256, 4, GgmlType::Q6K),
+            &[0u8; 8],
+            "layers.0.mlp.up_proj.weight".into(),
+            false,
+        );
+        assert_eq!(entry.compute_region, ComputeRegion::Accelerator);
     }
 }
 
@@ -10312,5 +11013,161 @@ mod moe_fold_tests {
             .fallback
             .iter()
             .any(|(t, w)| t == down_n && w.contains("per_expert_absmax")));
+    }
+
+    // ── declared folds (§4.8): the plan follows the mapper, not the names ──
+
+    /// The Gated-DeltaNet `gdn_out` fold: a `head_dim`-wide gated-norm gain
+    /// in front of `out_proj`'s `n_heads·head_dim` columns. `s` is tied
+    /// across heads (periodic), the gain takes one period of `1/s`, and
+    /// every column's `s · (1/s)` is 1 — the fold is exact.
+    #[test]
+    fn gdn_out_fold_tiles_the_gain_across_heads() {
+        // heads·hd = 128: a multiple of the profile's group size (64)
+        let (hd, heads, d) = (16usize, 8usize, 16usize);
+        let norm_n = "layers.0.linear_attn.norm.weight";
+        let out_n = "layers.0.linear_attn.out_proj.weight";
+        let mut seed = 3u64;
+        let mut src = HashMap::new();
+        src.insert(
+            norm_n.to_string(),
+            (
+                vec![hd as u64],
+                randv(hd, &mut seed, 0.5).iter().map(|v| 1.0 + v).collect(),
+            ),
+        );
+        src.insert(
+            out_n.to_string(),
+            (
+                vec![d as u64, (heads * hd) as u64],
+                randv(d * heads * hd, &mut seed, 0.3),
+            ),
+        );
+        let mut sc = base_awq::AwqProfile::default();
+        let mut absmax: Vec<f32> = (0..heads * hd).map(|i| 0.1 + (i % 7) as f32).collect();
+        absmax[hd + 3] = 40.0; // an outlier in head 1 ties head 0..3's channel 3
+        sc.per_tensor_absmax.insert(out_n.into(), absmax);
+        let ctx = awq_ctx(&[out_n], sc);
+        let mapped: Vec<(String, String)> = src.keys().map(|k| (k.clone(), k.clone())).collect();
+        let plan = build_awq_fold_plan(
+            &ctx,
+            &mapped,
+            &VecProvider(src),
+            &base_arch::ArchConfig::default(),
+            "qwen35",
+        )
+        .unwrap();
+        assert_eq!(plan.reports.len(), 1, "{:?}", plan.fallback);
+        let r = &plan.reports[0];
+        assert_eq!((r.kind, r.upstream.as_str()), ("gdn_out", norm_n));
+        let col = &plan.col_scale[out_n];
+        let inv = &plan.gamma_scale[norm_n];
+        assert_eq!((col.len(), inv.len()), (heads * hd, hd));
+        for (i, c) in col.iter().enumerate() {
+            assert!((c - col[i % hd]).abs() < 1e-6, "s is periodic in head_dim");
+            assert!(
+                (c * inv[i % hd] - 1.0).abs() < 1e-5,
+                "s · 1/s = 1 at column {i}"
+            );
+        }
+        assert!(
+            plan.alpha[out_n] > 0.0,
+            "the outlier channel should pick alpha > 0"
+        );
+    }
+
+    /// Split expert stacks (HF per-expert checkpoints stacked by the
+    /// converter): the `moe_down` fold's upstream is the `up` stack and
+    /// EVERY row of each expert's slab absorbs `1/s_e` (`upstream_rows:
+    /// all`), where the fused layout scales the second half only.
+    #[test]
+    fn moe_down_over_a_split_up_stack_scales_every_up_row() {
+        let gate_n = "layers.0.ffn_gate_exps.weight";
+        let up_n = "layers.0.ffn_up_exps.weight";
+        let down_n = "layers.0.ffn_down_exps.weight";
+        let mut seed = 11u64;
+        let mut src = HashMap::new();
+        for n in [gate_n, up_n] {
+            src.insert(
+                n.to_string(),
+                (
+                    vec![E as u64, F as u64, D as u64],
+                    randv(E * F * D, &mut seed, 0.3),
+                ),
+            );
+        }
+        src.insert(
+            down_n.to_string(),
+            (
+                vec![E as u64, D as u64, F as u64],
+                randv(E * D * F, &mut seed, 0.3),
+            ),
+        );
+        let mut sc = base_awq::AwqProfile::default();
+        let pos = |n: usize, seed: &mut u64| -> Vec<f32> {
+            (0..n).map(|_| 0.05 + rng(seed).abs() * 4.0).collect()
+        };
+        let pa = vec![pos(F, &mut seed), pos(F, &mut seed), pos(F, &mut seed)];
+        sc.per_tensor_absmax.insert(down_n.into(), pa[0].clone());
+        sc.per_expert_absmax.insert(down_n.into(), pa);
+        sc.per_expert_rows.insert(down_n.into(), vec![7, 5, 3]);
+        let ctx = awq_ctx(&[down_n], sc);
+        let mapped: Vec<(String, String)> = src.keys().map(|k| (k.clone(), k.clone())).collect();
+        let plan = build_awq_fold_plan(
+            &ctx,
+            &mapped,
+            &VecProvider(src),
+            &base_arch::ArchConfig::default(),
+            "qwen3_moe",
+        )
+        .unwrap();
+        assert_eq!(plan.reports.len(), 1, "{:?}", plan.fallback);
+        assert_eq!(plan.reports[0].upstream, up_n);
+        let col = &plan.col_scale[down_n];
+        let row = &plan.row_scale[up_n];
+        assert_eq!((col.len(), row.len()), (E * F, E * F));
+        for e in 0..E {
+            for j in 0..F {
+                assert!(
+                    (col[e * F + j] * row[e * F + j] - 1.0).abs() < 1e-5,
+                    "expert {e} row {j}"
+                );
+            }
+        }
+        assert!(
+            !plan.row_scale.contains_key(gate_n),
+            "the gate stack is untouched"
+        );
+    }
+
+    /// The n-gram table is packed shard by shard: the canonical quant
+    /// layouts are row-major per group, so concatenating the shards' packed
+    /// regions is the pack of the whole table (160-wide rows → `@32`).
+    #[test]
+    fn shard_wise_packing_equals_whole_table_packing() {
+        let (rows, k) = (24usize, 160usize);
+        let mut seed = 5u64;
+        let all = randv(rows * k, &mut seed, 1.0);
+        let (whole, dt) =
+            pack_for_target_rows(&all, TargetScheme::BaseQ4, Some(k), "ngram").unwrap();
+        assert_eq!(
+            (dt, whole.group_size),
+            (base_format::TensorDtype::BaseQ4, 32)
+        );
+        let (mut pw, mut sc, mut bs) = (Vec::new(), Vec::new(), Vec::new());
+        for shard in all.chunks(7 * k).chain(std::iter::empty()) {
+            let (p, d) =
+                pack_for_target_rows(shard, TargetScheme::BaseQ4, Some(k), "shard").unwrap();
+            assert_eq!(
+                (d, p.group_size, p.scale_dtype),
+                (dt, whole.group_size, whole.scale_dtype)
+            );
+            pw.extend_from_slice(&p.packed_weights);
+            sc.extend_from_slice(&p.scales);
+            bs.extend_from_slice(&p.biases);
+        }
+        assert_eq!(pw, whole.packed_weights);
+        assert_eq!(sc, whole.scales);
+        assert_eq!(bs, whole.biases);
     }
 }

@@ -3,6 +3,7 @@
 //! Qwen shares Llama's tensor naming convention; only the config metadata
 //! key prefix differs (`qwen2.*` / `qwen3.*`).
 
+use crate::decl::{FoldGroup, TensorClass};
 use crate::llama::map_llama_style;
 use crate::{ArchConfig, GgufMapper};
 use anyhow::{Context, Result};
@@ -130,6 +131,12 @@ impl crate::HfMapper for Qwen35HfMapper {
     fn mlx_norm_shift(&self, _canonical: &str) -> f32 {
         QWEN35_MLX_NORM_SHIFT
     }
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> TensorClass {
+        qwen_decl::class(canonical, shape, QwenBlocks::GDN)
+    }
+    fn fold_groups(&self, tensors: &[(String, Vec<u64>)], cfg: &ArchConfig) -> Vec<FoldGroup> {
+        qwen_decl::fold_groups(tensors, cfg, &|n| self.norm_shift(n), QwenBlocks::GDN)
+    }
 }
 
 impl crate::HfMapper for Qwen35MoeHfMapper {
@@ -193,6 +200,403 @@ impl crate::HfMapper for Qwen35MoeHfMapper {
         config.norm_topk_prob = bool_v("norm_topk_prob").unwrap_or(true);
         Ok(config)
     }
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> TensorClass {
+        qwen_decl::class(canonical, shape, QwenBlocks::GDN_MOE)
+    }
+    fn fold_groups(&self, tensors: &[(String, Vec<u64>)], cfg: &ArchConfig) -> Vec<FoldGroup> {
+        qwen_decl::fold_groups(tensors, cfg, &|n| self.norm_shift(n), QwenBlocks::GDN_MOE)
+    }
+}
+
+/// Qwen3.8-Flash-Next (`Qwen4ExpForConditionalGeneration`, model_type
+/// `qwen4_exp`, text tower `qwen4_exp_text`): the Qwen3.5-MoE hybrid
+/// (Gated-DeltaNet + periodic gated full attention, 512-expert top-10 MoE
+/// with a gated shared expert) plus three new pieces the runtime reads from
+/// the header config: hyper-connections (`hc_count` residual streams mixed
+/// by a low-rank gated residual per block), one per-layer n-gram embedding
+/// (`ple_*` / `ngram_*`) and the QSA sparse-attention indexer (`indexer_*`).
+/// The n-gram hash tables (layer multipliers, per-head vocab sizes and
+/// offsets) are derived here exactly as the modeling code derives them
+/// (splitmix64 from `seed`, the first primes after `ngram_vocab_size_base`)
+/// — the checkpoint's i64 copies are dropped at convert (an i64 tensor has
+/// no .base dtype) and these values were checked equal to them.
+pub struct Qwen4ExpHfMapper;
+
+fn qwen4_splitmix64(mut v: u64) -> u64 {
+    v = v.wrapping_add(0x9E3779B97F4A7C15);
+    v = (v ^ (v >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    v = (v ^ (v >> 27)).wrapping_mul(0x94D049BB133111EB);
+    v ^ (v >> 31)
+}
+
+fn qwen4_is_prime(v: u64) -> bool {
+    if v < 2 {
+        return false;
+    }
+    if v % 2 == 0 {
+        return v == 2;
+    }
+    let mut d = 3u64;
+    while d * d <= v {
+        if v % d == 0 {
+            return false;
+        }
+        d += 2;
+    }
+    true
+}
+
+/// (layer multipliers [ngram_size], per-head vocab sizes, per-head offsets,
+/// padded table rows) for the PLE layer `ple_layer_index`.
+pub fn qwen4_ngram_tables(
+    vocab_size: u64,
+    ngram_size: u64,
+    heads_per_ngram: u64,
+    vocab_base: u64,
+    divisible_by: u64,
+    seed: u64,
+    ple_layer_index: u64,
+) -> (Vec<u64>, Vec<u64>, Vec<u64>, u64) {
+    let max_long: u64 = (1u64 << 63) - 1;
+    let multiplier_max = max_long / vocab_size.max(1);
+    let half_bound = (multiplier_max / 2).max(1);
+    let base_seed = seed.wrapping_add(10007u64.wrapping_mul(ple_layer_index));
+    let mut mults = Vec::new();
+    for i in 0..ngram_size {
+        let v = base_seed.wrapping_add(0x9E3779B97F4A7C15u64.wrapping_mul(i + 1));
+        mults.push(2 * (qwen4_splitmix64(v) % half_bound) + 1);
+    }
+    let ngram_heads = (ngram_size - 1) * heads_per_ngram;
+    let mut sizes = Vec::new();
+    let mut offsets = Vec::new();
+    let mut total = 0u64;
+    for h in 0..ngram_heads {
+        let global = ple_layer_index * ngram_heads + h;
+        // the (global+1)-th prime strictly after vocab_base - 1
+        let mut p = vocab_base - 1;
+        for _ in 0..(global + 1) {
+            p += 1;
+            while !qwen4_is_prime(p) {
+                p += 1;
+            }
+        }
+        sizes.push(p);
+        offsets.push(total);
+        total += p;
+    }
+    let padded = total.div_ceil(divisible_by) * divisible_by;
+    (mults, sizes, offsets, padded)
+}
+
+impl crate::HfMapper for Qwen4ExpHfMapper {
+    fn canonical_arch(&self) -> &'static str {
+        "qwen4_exp"
+    }
+    fn norm_shift(&self, canonical: &str) -> f32 {
+        // Every Qwen4ExpTextRMSNorm is zero-centered (1 + weight): the
+        // hyper-connection norms (`hc_norm`), the attention q/k norms, the
+        // indexer q/k layernorms, the three PLE norms (`norm_key` /
+        // `norm_query` / `norm_conv`) and the MTP head's pre-fc norms. The
+        // Gated-DeltaNet output norm (`linear_attn.norm`) is a plain-weight
+        // RMSNormGated, as on Qwen3.5.
+        if canonical.ends_with(".norm_key.weight")
+            || canonical.ends_with(".norm_query.weight")
+            || canonical.ends_with(".norm_conv.weight")
+        {
+            1.0
+        } else {
+            qwen35_norm_shift(canonical)
+        }
+    }
+    fn mlx_norm_shift(&self, _canonical: &str) -> f32 {
+        QWEN35_MLX_NORM_SHIFT
+    }
+    fn config_from_hf(&self, c: &serde_json::Value) -> Result<crate::ArchConfig> {
+        use serde_json::json;
+        let mut config = Qwen35MoeHfMapper.config_from_hf(c)?;
+        let tc = c.get("text_config").unwrap_or(c);
+        let u64_v = |k: &str| tc.get(k).and_then(|v| v.as_u64());
+        let hc_count = u64_v("hc_count").unwrap_or(1);
+        let hc_lowrank = u64_v("hc_lowrank").unwrap_or(0);
+        let ple_ids: Vec<u64> = tc
+            .get("ple_layer_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
+            .unwrap_or_default();
+        let ngram_size = u64_v("ngram_size").unwrap_or(3);
+        let heads_per_ngram = u64_v("heads_per_ngram").unwrap_or(8);
+        let vocab_base = u64_v("ngram_vocab_size_base").unwrap_or(20_000_000);
+        let divisible_by = u64_v("make_ngram_vocab_size_divisible_by").unwrap_or(128);
+        let seed = u64_v("seed").unwrap_or(1234);
+        let x = &mut config.extra_config;
+        x.insert("hc_count".into(), json!(hc_count));
+        x.insert("hc_lowrank".into(), json!(hc_lowrank));
+        x.insert(
+            "output_gate_type".into(),
+            json!(tc.get("output_gate_type").cloned().unwrap_or(json!("silu"))),
+        );
+        // Indexer (QSA) geometry.
+        for k in [
+            "indexer_n_heads",
+            "indexer_kv_heads",
+            "indexer_head_dim",
+            "indexer_budget",
+            "indexer_compress_ratio",
+        ] {
+            if let Some(v) = u64_v(k) {
+                x.insert(k.into(), json!(v));
+            }
+        }
+        // The text config's own eos (the PLE n-gram history resets on it).
+        if let Some(e) = tc.get("eos_token_id") {
+            let eos = if e.is_array() {
+                e.as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_u64())
+            } else {
+                e.as_u64()
+            };
+            if let Some(eos) = eos {
+                x.insert("ple_eos_token_id".into(), json!(eos));
+            }
+        }
+        if !ple_ids.is_empty() {
+            x.insert("ple_layer_ids".into(), json!(ple_ids));
+            x.insert(
+                "ple_embed_dim".into(),
+                json!(u64_v("ple_embed_dim").unwrap_or(config.hidden_size as u64)),
+            );
+            x.insert(
+                "ple_conv_kernel_size".into(),
+                json!(u64_v("ple_conv_kernel_size").unwrap_or(4)),
+            );
+            x.insert("ngram_size".into(), json!(ngram_size));
+            x.insert("heads_per_ngram".into(), json!(heads_per_ngram));
+            x.insert("ngram_vocab_size_base".into(), json!(vocab_base));
+            x.insert(
+                "split_ngram_parts".into(),
+                json!(u64_v("split_ngram_parts").unwrap_or(128)),
+            );
+            // One table set per PLE layer, in ple_layer_ids order.
+            let mut mults_all = Vec::new();
+            let mut sizes_all = Vec::new();
+            let mut offs_all = Vec::new();
+            let mut padded_all = Vec::new();
+            for (i, _) in ple_ids.iter().enumerate() {
+                let (m, s, o, p) = qwen4_ngram_tables(
+                    config.vocab_size as u64,
+                    ngram_size,
+                    heads_per_ngram,
+                    vocab_base,
+                    divisible_by,
+                    seed,
+                    i as u64,
+                );
+                mults_all.push(json!(m));
+                sizes_all.push(json!(s));
+                offs_all.push(json!(o));
+                padded_all.push(json!(p));
+            }
+            x.insert("ngram_layer_multipliers".into(), json!(mults_all));
+            x.insert("ngram_head_vocab_sizes".into(), json!(sizes_all));
+            x.insert("ngram_head_offsets".into(), json!(offs_all));
+            x.insert("ngram_padded_vocab".into(), json!(padded_all));
+        }
+        Ok(config)
+    }
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> TensorClass {
+        qwen_decl::class(canonical, shape, QwenBlocks::FLASH_NEXT)
+    }
+    fn fold_groups(&self, tensors: &[(String, Vec<u64>)], cfg: &ArchConfig) -> Vec<FoldGroup> {
+        qwen_decl::fold_groups(
+            tensors,
+            cfg,
+            &|n| self.norm_shift(n),
+            QwenBlocks::FLASH_NEXT,
+        )
+    }
+}
+
+/// Which blocks a Qwen family has, for the shared declaration below.
+#[derive(Copy, Clone)]
+pub struct QwenBlocks {
+    /// Gated-DeltaNet linear-attention blocks (Qwen3.5+).
+    pub gdn: bool,
+    /// Routed experts with a gated shared expert.
+    pub moe: bool,
+    /// Qwen3.8-Flash-Next: hyper-connections (no plain norm in front of a
+    /// block), the PLE n-gram embedding, the QSA indexer.
+    pub flash_next: bool,
+}
+
+impl QwenBlocks {
+    pub const DENSE: QwenBlocks = QwenBlocks {
+        gdn: false,
+        moe: false,
+        flash_next: false,
+    };
+    pub const MOE: QwenBlocks = QwenBlocks {
+        gdn: false,
+        moe: true,
+        flash_next: false,
+    };
+    pub const GDN: QwenBlocks = QwenBlocks {
+        gdn: true,
+        moe: false,
+        flash_next: false,
+    };
+    pub const GDN_MOE: QwenBlocks = QwenBlocks {
+        gdn: true,
+        moe: true,
+        flash_next: false,
+    };
+    pub const FLASH_NEXT: QwenBlocks = QwenBlocks {
+        gdn: true,
+        moe: true,
+        flash_next: true,
+    };
+}
+
+/// §4.8 classes and fold groups of the Qwen families.
+pub mod qwen_decl {
+    use super::QwenBlocks;
+    use crate::decl::{dense, moe, tail, Declare, FoldGroup, TensorClass, TensorSet};
+    use crate::ArchConfig;
+
+    /// Gated-DeltaNet GEMMs, `in_proj_a` / `in_proj_b` (the per-head decay
+    /// and beta gates, `[n_heads, dim]`) included: small, but the encoder
+    /// reads them through `dispatch_gemm` (prefill and multi-row decode),
+    /// so they are `linear` whatever their size and the block's `attn`
+    /// fold may list them. The conv, the gated norm, `A_log` and `dt_bias`
+    /// are the recurrence's own: `other`.
+    pub const GDN_LINEARS: [&str; 5] = [
+        "linear_attn.in_proj_qkv.weight",
+        "linear_attn.in_proj_z.weight",
+        "linear_attn.in_proj_a.weight",
+        "linear_attn.in_proj_b.weight",
+        "linear_attn.out_proj.weight",
+    ];
+    /// The gated shared expert's SwiGLU; `mlp.shared_expert_gate` (the
+    /// scalar sigmoid gate) and `mlp.gate` (the router) are `other`.
+    pub const SHEXP_LINEARS: [&str; 3] = [
+        "mlp.shared_expert.gate_proj.weight",
+        "mlp.shared_expert.up_proj.weight",
+        "mlp.shared_expert.down_proj.weight",
+    ];
+    /// Flash-Next: the PLE key / value projections and the hyper-connection
+    /// `W_down` (`input_mix_weight_down`, `[hc_lowrank, hc·dim]`) / `W_up`
+    /// (`input_mix_weight_up`, `[hc·dim, hc_lowrank]`) are ordinary GEMMs
+    /// (§14.2 item 1); `block_inject_weight` (`W_inj`, `[hc, dim]`), the
+    /// `hc_norm` gains and the indexer projection are `other`.
+    pub const FLASH_NEXT_LINEAR_SUFFIXES: [&str; 4] = [
+        "ple.key_proj.weight",
+        "ple.value_proj.weight",
+        "input_mix_weight_down.weight",
+        "input_mix_weight_up.weight",
+    ];
+    pub const NGRAM_TABLE_SUFFIX: &str = "ple.ple_embedding.ngram_embedding.weight";
+
+    pub fn class(canonical: &str, shape: &[u64], blocks: QwenBlocks) -> TensorClass {
+        if blocks.flash_next && canonical.ends_with(NGRAM_TABLE_SUFFIX) {
+            return TensorClass::Embedding;
+        }
+        if blocks.moe && moe::is_stack(canonical, shape) {
+            return TensorClass::ExpertStack;
+        }
+        let t = tail(canonical);
+        if blocks.gdn && GDN_LINEARS.contains(&t) {
+            return TensorClass::Linear;
+        }
+        if blocks.moe && SHEXP_LINEARS.contains(&t) {
+            return TensorClass::Linear;
+        }
+        if blocks.flash_next && FLASH_NEXT_LINEAR_SUFFIXES.iter().any(|s| t.ends_with(s)) {
+            return TensorClass::Linear;
+        }
+        dense::class(canonical, shape)
+    }
+
+    /// `gdn_out`: the Gated-DeltaNet output norm (`RMSNormGated`, gain of
+    /// `head_dim`, applied per head after the normalization and the
+    /// elementwise `silu(z)` gate) absorbs `1/s`, `out_proj` takes `s` on
+    /// its `n_heads·head_dim` columns — `s` is tied across heads (the fold
+    /// plan tiles it with the gain's period).
+    pub fn gdn_out(d: &mut Declare, layer: usize) {
+        let p = format!("layers.{layer}.linear_attn.");
+        d.gamma(
+            "gdn_out",
+            Some(layer),
+            format!("{p}norm.weight"),
+            &[format!("{p}out_proj.weight")],
+        );
+    }
+
+    pub fn fold_groups(
+        tensors: &[(String, Vec<u64>)],
+        cfg: &ArchConfig,
+        norm_shift: &dyn Fn(&str) -> f32,
+        blocks: QwenBlocks,
+    ) -> Vec<FoldGroup> {
+        let set = TensorSet::new(tensors);
+        let mut d = Declare::new(&set, norm_shift);
+        for layer in set.layers() {
+            if blocks.flash_next {
+                // Hyper-connections: a block's input is the gated mix of
+                // the residual streams' `hc_norm` outputs, which also feed
+                // `W_inj`, the indexer, the router and `shared_expert_gate`
+                // — `other` consumers, so the input-side groups (q/k/v,
+                // in_proj_qkv/z/a/b, gate_up) declare no fold (§14.7 c).
+                // Only the output-side folds remain.
+                let p = format!("layers.{layer}.self_attn.");
+                d.rows(
+                    "o",
+                    Some(layer),
+                    format!("{p}v_proj.weight"),
+                    format!("{p}o_proj.weight"),
+                    crate::decl::UpstreamRows::All,
+                );
+            } else {
+                // A full-attention block: `attn` (q/k/v) and `o`.
+                dense::attn_groups(&mut d, layer);
+                // A Gated-DeltaNet block: the same `input_norm` feeds the
+                // four GDN projections, all `linear` — one `attn` group.
+                let p = format!("layers.{layer}.");
+                d.gamma(
+                    "attn",
+                    Some(layer),
+                    format!("{p}input_norm.weight"),
+                    &[
+                        format!("{p}linear_attn.in_proj_qkv.weight"),
+                        format!("{p}linear_attn.in_proj_z.weight"),
+                        format!("{p}linear_attn.in_proj_a.weight"),
+                        format!("{p}linear_attn.in_proj_b.weight"),
+                    ],
+                );
+                dense::mlp_groups(&mut d, layer);
+            }
+            if blocks.gdn {
+                gdn_out(&mut d, layer);
+            }
+            if blocks.moe {
+                // No input-side `moe` group: `post_attn_norm` also feeds the
+                // router and `shared_expert_gate` (`other`).
+                moe::down_group(
+                    &mut d,
+                    layer,
+                    "ffn_gate_up_exps.weight",
+                    "ffn_up_exps.weight",
+                    "ffn_down_exps.weight",
+                );
+                dense::shared_expert_down(&mut d, layer);
+            }
+        }
+        if !blocks.flash_next {
+            // Flash-Next has no `final_norm`: the head reads the final
+            // hyper-connection mixer's output.
+            dense::head_group(&mut d, cfg);
+        }
+        d.finish()
+    }
 }
 
 impl crate::HfMapper for QwenHfMapper {
@@ -202,11 +606,23 @@ impl crate::HfMapper for QwenHfMapper {
     fn config_from_hf(&self, c: &serde_json::Value) -> Result<crate::ArchConfig> {
         crate::llama::hf_generic_config(c)
     }
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> TensorClass {
+        qwen_decl::class(canonical, shape, QwenBlocks::DENSE)
+    }
+    fn fold_groups(&self, tensors: &[(String, Vec<u64>)], cfg: &ArchConfig) -> Vec<FoldGroup> {
+        qwen_decl::fold_groups(tensors, cfg, &|n| self.norm_shift(n), QwenBlocks::DENSE)
+    }
 }
 
 impl crate::HfMapper for QwenMoeHfMapper {
     fn canonical_arch(&self) -> &'static str {
         "qwen3_moe"
+    }
+    fn tensor_class(&self, canonical: &str, shape: &[u64]) -> TensorClass {
+        qwen_decl::class(canonical, shape, QwenBlocks::MOE)
+    }
+    fn fold_groups(&self, tensors: &[(String, Vec<u64>)], cfg: &ArchConfig) -> Vec<FoldGroup> {
+        qwen_decl::fold_groups(tensors, cfg, &|n| self.norm_shift(n), QwenBlocks::MOE)
     }
     fn config_from_hf(&self, c: &serde_json::Value) -> Result<crate::ArchConfig> {
         // Qwen3-MoE: keep `intermediate_size` as the dense shared-FFN

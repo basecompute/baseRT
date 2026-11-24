@@ -64,7 +64,7 @@ extern "C" {
 
 #define BASERT_VERSION_MAJOR 0
 #define BASERT_VERSION_MINOR 5
-#define BASERT_VERSION_PATCH 3
+#define BASERT_VERSION_PATCH 4
 
 /// Compile-time version, packed as `(MAJOR<<16) | (MINOR<<8) | PATCH`.
 /// Useful for `#if BASERT_VERSION >= 0x000200` feature checks.
@@ -356,8 +356,11 @@ size_t baseRT_get_config_into(baseRT_model_t model, void *out, size_t out_size);
 
 /// sizeof(BaseRTModelConfig) as compiled into the library. Language
 /// bindings that mirror the struct by hand (Python/Rust/Node) compare
-/// this against their mirror's size at load time so layout drift fails
-/// loudly instead of decoding garbage fields.
+/// this against their mirror's size so layout drift fails loudly instead
+/// of decoding garbage fields. The exact match is only required where a
+/// binding must fall back to the by-value baseRT_get_config(); with
+/// baseRT_get_config_into() available, a library of another size is the
+/// supported mixed-version case described above.
 size_t baseRT_model_config_sizeof(void);
 
 /// Get total GPU memory used by model (bytes).
