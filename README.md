@@ -173,6 +173,34 @@ runs Superfluid, installing it on first use.
 
 Full flag reference: [CLI reference](docs/cli/reference.md).
 
+## Updates
+
+basert updates itself. Once a day, a command run in a terminal looks for a newer release in the background, so nothing waits on it. A release is taken as soon as it is out and a superfluid release serves its engine. The command after that updates to it:
+
+- **An install the install script made** (`~/.basert`) updates in the foreground, with a progress bar, then runs the command on the new release:
+
+  ```text
+  Updating basert 0.5.4 → 0.5.5 · release notes: https://github.com/basecompute/baseRT/releases/tag/v0.5.5
+  basert 0.5.5 is in use · `basert self use 0.5.4` goes back · `basert self auto-update off` turns automatic updates off
+  ```
+
+  When it cannot (offline, another `basert self` under way, a failed download, Ctrl-C), it says `couldn't update basert to 0.5.5: …; staying on 0.5.4` and tries again after the next day's look. A server already running keeps the engine it started with.
+- **superfluid follows the engine.** The superfluid `basert serve` runs moves to the newest release that serves the new engine in the same update. When basert is already the newest, a newer superfluid that serves its engine is installed the same way. A superfluid a server runs from is never replaced while it runs.
+- **A Homebrew, global npm, pipx, uv or cargo install** that is yours runs that manager's update in the background, once per release, logging to `auto-update.log` in basert's state directory.
+- **A pip install, a project's npm dependency, an install another user owns, or a pinned Homebrew formula** gets a line once a day with the command that updates it.
+
+| Switch | What it turns off | For |
+|---|---|---|
+| `basert self auto-update off` (`on` again; no argument says which and why) | automatic updates | every command, from now on |
+| `BASERT_NO_UPDATE=1` | the look, updates and the line | a shell, a service, a script |
+| `--no-update` on any command | the look, updates and the line | that one run |
+
+Nothing updates without a terminal (an app such as Superfluid Desktop, a service), with `CI` set, as root, or for a command that only reports (`--help`, `--version`, `list`, `inspect`, `verify`, anything with `--json`).
+
+**The wait.** `basert self auto-update wait 3` takes a release only once it has been out three days (`0`, the default, takes it as soon as it is out). `BASERT_UPDATE_WAIT_DAYS=<days>` sets it for one shell or service.
+
+**By hand.** `basert self update` installs the newest release now, `basert self check` says what is out, `basert self list` shows the releases installed side by side under `~/.basert/versions/`, and `basert self use <version>` goes back to one; automatic updates then leave it in use until a newer release is out.
+
 ## What's in this repo
 
 | Path | Contents |

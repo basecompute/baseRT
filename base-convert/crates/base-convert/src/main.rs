@@ -40,10 +40,15 @@ Convert & author:
 
 Keep up to date:
   self        Update basert (`basert self update`), or switch between installed versions
+              basert updates itself when a newer release is out; `basert self auto-update off`
+              turns that off, `basert self auto-update wait <days>` waits that long after a
+              release (default 0; BASERT_UPDATE_WAIT_DAYS for a shell). BASERT_NO_UPDATE=1
+              (a shell) or --no-update (one run) skips the daily look, updates and the notice
 
 Options:
   -h, --help     Print help
   -V, --version  Print version
+  --no-update    Don't look for, install or announce a newer basert on this run (any command)
 
 Model variants — pick which quant build to run:
   <id>:<variant>   e.g. basert serve basecompute/Gemma-4-E2B-it:default-q8
@@ -598,7 +603,9 @@ fn main() -> Result<()> {
     // Banner on the launcher's own help / no-args surface only — hub
     // subcommands (convert/pull/list/...) stay quiet, and the runtime tools
     // print their own banner (tools/basert_banner.h).
-    let raw_arg1 = std::env::args().nth(1);
+    // `--no-update` is any command's: taken out before the command sees it.
+    let (argv, no_update) = selfupdate::strip_no_update(std::env::args_os().collect());
+    let raw_arg1 = argv.get(1).map(|a| a.to_string_lossy().into_owned());
     if raw_arg1.is_none()
         || matches!(
             raw_arg1.as_deref(),
@@ -607,8 +614,8 @@ fn main() -> Result<()> {
     {
         print_banner();
     }
-    selfupdate::at_launch(raw_arg1.as_deref());
-    let args = Args::parse();
+    selfupdate::at_launch(argv.get(1..).unwrap_or_default(), no_update);
+    let args = Args::parse_from(&argv);
     match args.cmd {
         Cmd::Convert(a) => cmd_convert(a),
         Cmd::ConvertLora(a) => lora::cmd_convert_lora(a),

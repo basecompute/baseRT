@@ -37,9 +37,11 @@
 //! the tested release's tarball and checksum, read instead of GitHub.
 
 use std::fs;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -50,7 +52,7 @@ use sha2::{Digest, Sha256};
 /// <https://github.com/basecompute/superfluid/releases>: installed instead
 /// of the newest when the release listing cannot be read or names no release
 /// for this engine, and the release a `$BASERT_SUPERFLUID_SOURCE` holds.
-pub const RELEASE: &str = "v0.1.6";
+pub const RELEASE: &str = "v0.2.1";
 
 /// `BASERT_ABI_VERSION` of the engine shipped beside this basert, which a
 /// superfluid release names when it serves it (`superfluid-basert-abi-<N>.txt`).
@@ -92,6 +94,11 @@ pub enum Action {
     /// Install the newest superfluid release that serves this engine where
     /// `basert serve` looks for it (nothing to do when it is already there).
     Install {
+        /// This release (e.g. v0.1.6) instead of the newest, an older one
+        /// too: what goes back after an update. Automatic updates then leave
+        /// it in place until a release newer than the one it replaced is out.
+        #[arg(value_name = "RELEASE")]
+        release: Option<String>,
         /// Install again even when that release, or a newer one, is there.
         #[arg(long)]
         force: bool,
@@ -105,16 +112,21 @@ pub enum Action {
 
 pub fn cmd(args: SuperfluidArgs) -> Result<()> {
     match args.action {
-        Action::Install { force } => {
+        Action::Install { release, force } => {
             let source = Source::locate();
-            let release = wanted(&source, &mut |line| eprintln!("{line}"));
+            // A release named is the user's choice: an older one too.
+            let named = release.is_some();
+            let release = match release {
+                Some(tag) => named_release(&source, &tag)?,
+                None => wanted(&source, &mut |line| eprintln!("{line}")),
+            };
             let tag = &release.tag;
             let dest = match Install::locate()? {
                 Some(i) if !force && i.installed_release().as_deref() == Some(tag.as_str()) => {
                     println!("superfluid {tag} is installed at {}", i.root.display());
                     return Ok(());
                 }
-                Some(i) if !force && newer(i.installed_release().as_deref(), tag) => {
+                Some(i) if !force && !named && newer(i.installed_release().as_deref(), tag) => {
                     println!(
                         "superfluid {} is installed at {}, newer than {tag}: nothing is downgraded (--force installs {tag})",
                         i.installed_release().unwrap_or_default(),
@@ -471,11 +483,83 @@ impl Install {
         Ok(Some(Held(file)))
     }
 
+    /// [`Install::take_turn`] without waiting: another install under way is
+    /// an error.
+    pub fn take_turn_now(&self) -> Result<Option<Held>> {
+        let Some(file) = self.lock("install") else {
+            return Ok(None);
+        };
+        if !flock(&file, libc::LOCK_EX | libc::LOCK_NB)? {
+            bail!(
+                "another basert is installing superfluid into {}",
+                self.root.display()
+            );
+        }
+        Ok(Some(Held(file)))
+    }
+
     /// Held by a start from asking this install until its server stops: no
     /// install swaps it in between. Waits only while one swaps.
     pub fn hold(&self) -> Option<Held> {
         let file = self.lock("use")?;
         flock(&file, libc::LOCK_SH).ok()?.then_some(Held(file))
+    }
+
+    /// Whether a start holds this install (see [`Install::hold`]): a server
+    /// `basert serve` started runs from it, wherever its programs are.
+    pub fn in_use(&self) -> bool {
+        let Some(file) = self.lock("use") else {
+            return false;
+        };
+        // Taken and let go at once: a start waits only for that.
+        !flock(&file, libc::LOCK_EX | libc::LOCK_NB).unwrap_or(true)
+    }
+
+    /// Whether basert installed this one (its `installed-by` file says so),
+    /// rather than the user or superfluid's own install script.
+    pub fn owned_by_basert(&self) -> bool {
+        fs::read_to_string(self.root.join(INSTALLED_BY)).is_ok_and(|l| l.trim() == OWNED_BY)
+    }
+
+    /// The file beside this install naming the release it held before an
+    /// older one took its place (see [`Install::held_back`]).
+    fn held_back_file(&self) -> Option<PathBuf> {
+        let name = self.root.file_name()?.to_string_lossy();
+        Some(
+            self.parent()
+                .join(format!(".{}.held-back", name.trim_start_matches('.'))),
+        )
+    }
+
+    /// The release installed here before an older one was put in its place,
+    /// while that older one is: automatic updates go no further than it.
+    pub fn held_back(&self) -> Option<String> {
+        let tag = fs::read_to_string(self.held_back_file()?).ok()?;
+        let tag = tag.trim();
+        release_key(tag).map(|_| tag.to_string())
+    }
+
+    /// After `now` took the place of `was`: going back holds automatic
+    /// updates back to `was` (or what held them before); going to or past
+    /// what held them lets them go on.
+    fn note_held_back(&self, was: Option<&str>, now: &str) {
+        let Some(at) = self.held_back_file() else {
+            return;
+        };
+        let held = self.held_back();
+        let newest = [was, held.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|t| release_key(t).is_some())
+            .max_by_key(|t| release_key(t));
+        match newest {
+            Some(h) if newer(Some(h), now) => {
+                let _ = fs::write(&at, format!("{h}\n"));
+            }
+            _ => {
+                let _ = fs::remove_file(&at);
+            }
+        }
     }
 
     /// That no server runs from this install (one `basert serve` started
@@ -549,11 +633,16 @@ impl Install {
         let tarball = stage.path().join(format!("{name}.tar.gz"));
         let checksum = stage.path().join(format!("{name}.tar.gz.sha256"));
 
-        say(&format!(
-            "downloading superfluid {tag} ({name}.tar.gz) from {}",
-            source.describe(release, &format!("{name}.tar.gz"))
-        ));
-        source.fetch(release, &format!("{name}.tar.gz"), &tarball)?;
+        // On a terminal a progress bar names it; elsewhere, a line.
+        let bar = format!("superfluid {tag}");
+        let bar = progress_shown().then_some(bar.as_str());
+        if bar.is_none() {
+            say(&format!(
+                "downloading superfluid {tag} ({name}.tar.gz) from {}",
+                source.describe(release, &format!("{name}.tar.gz"))
+            ));
+        }
+        source.fetch_as(release, &format!("{name}.tar.gz"), &tarball, bar)?;
         source.fetch(release, &format!("{name}.tar.gz.sha256"), &checksum)?;
         check_sha256(&tarball, &checksum)?;
 
@@ -618,6 +707,7 @@ impl Install {
         if had_old {
             let _ = fs::remove_dir_all(&old);
         }
+        self.note_held_back(staged.replacing.as_deref(), tag);
         say(&format!(
             "installed superfluid {tag} at {}",
             self.root.display()
@@ -646,7 +736,7 @@ pub struct Staged {
 pub struct Held(fs::File);
 
 /// `flock(op)` on `file`: false when `LOCK_NB` is asked and another holds it.
-fn flock(file: &fs::File, op: libc::c_int) -> std::io::Result<bool> {
+pub(crate) fn flock(file: &fs::File, op: libc::c_int) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
     loop {
         // SAFETY: flock on a descriptor this process holds open.
@@ -895,6 +985,17 @@ impl Source {
     }
 
     fn fetch(&self, release: &Release, file: &str, dest: &Path) -> Result<()> {
+        self.fetch_as(release, file, dest, None)
+    }
+
+    /// [`Source::fetch`], with a progress bar named `bar` when there is one.
+    fn fetch_as(
+        &self,
+        release: &Release,
+        file: &str,
+        dest: &Path,
+        bar: Option<&str>,
+    ) -> Result<()> {
         match self {
             Source::Dir(dir) => {
                 let from = dir.join(file);
@@ -902,29 +1003,177 @@ impl Source {
                     .with_context(|| format!("copying {}", from.display()))
                     .map(|_| ())
             }
-            Source::GitHub => download(&release.url(file), dest),
+            Source::GitHub => download_as(&release.url(file), dest, bar, None),
         }
     }
+}
+
+static PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Whether downloads show a progress bar on a terminal (`basert self` and
+/// automatic updates turn it on; a `basert serve` start says a line).
+pub(crate) fn show_progress(on: bool) {
+    PROGRESS.store(on, Ordering::Relaxed);
+}
+
+/// Whether a download now shows a progress bar: they are on, on a terminal.
+pub(crate) fn progress_shown() -> bool {
+    PROGRESS.load(Ordering::Relaxed) && std::io::stderr().is_terminal()
 }
 
 /// `url` into the file `dest`. A listing in a file (a mirror's, the tests')
 /// may name its assets by path instead.
 pub(crate) fn download(url: &str, dest: &Path) -> Result<()> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
+    download_as(url, dest, None, None)
+}
+
+/// [`download`], with a progress bar on stderr named `bar` when there is one,
+/// out of `size` bytes (else the length the server or the file gives). A
+/// Ctrl-C an automatic update caught stops it at once, even with the server
+/// gone quiet: the request and the reads run in a thread of their own, into
+/// `<dest>.part`, which becomes `dest` only once all of it came.
+pub(crate) fn download_as(
+    url: &str,
+    dest: &Path,
+    bar: Option<&str>,
+    size: Option<u64>,
+) -> Result<()> {
+    let local = !url.starts_with("https://") && !url.starts_with("http://");
+    if local && bar.is_none() {
         return fs::copy(url, dest)
             .with_context(|| format!("copying {url}"))
             .map(|_| ());
     }
-    // GitHub answers an asset with a redirect to its storage, which the
-    // agent follows.
-    let response = agent(Duration::from_secs(600))
-        .get(url)
-        .call()
-        .with_context(|| format!("downloading {url}"))?;
-    let mut body = response.into_body().into_reader();
-    let mut out = fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
-    std::io::copy(&mut body, &mut out).with_context(|| format!("reading {url}"))?;
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    let part = dest.with_file_name(name);
+    // Opened here, not in the thread: a thread left behind writes, at most,
+    // to a file no longer there, and never renames it.
+    let out = fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    {
+        let (url, part, stop) = (url.to_string(), part.clone(), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let done = fetch_into(&url, local, out, &part, &stop, &tx);
+            let _ = tx.send(Fetched::Done(done));
+        });
+    }
+    let gone = |e: anyhow::Error| {
+        stop.store(true, Ordering::SeqCst);
+        let _ = fs::remove_file(&part);
+        e
+    };
+    let mut shown = None;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Fetched::Length(length)) => {
+                shown = bar.map(|name| progress_bar(name, size.or(length)));
+            }
+            Ok(Fetched::Read(n)) => {
+                if let Some(shown) = &shown {
+                    shown.inc(n);
+                }
+            }
+            Ok(Fetched::Done(done)) => {
+                done.map_err(gone)?;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(gone(anyhow::anyhow!("the download of {url} stopped")));
+            }
+        }
+        if crate::selfupdate::interrupted() {
+            return Err(gone(anyhow::anyhow!("interrupted")));
+        }
+    }
+    fs::rename(&part, dest)
+        .with_context(|| format!("moving {} to {}", part.display(), dest.display()))
+        .map_err(gone)?;
+    if let Some(shown) = shown {
+        shown.finish();
+    }
     Ok(())
+}
+
+/// What the thread of a [`download_as`] tells it.
+enum Fetched {
+    /// The length the server or the file gives, once it answered.
+    Length(Option<u64>),
+    /// Bytes written.
+    Read(u64),
+    Done(Result<()>),
+}
+
+/// The blocking half of [`download_as`]: `url` (a file when `local`) into
+/// `out`, the file at `part`, saying how it goes on `tx`; it writes nothing
+/// more once `stop` is set.
+fn fetch_into(
+    url: &str,
+    local: bool,
+    mut out: fs::File,
+    part: &Path,
+    stop: &AtomicBool,
+    tx: &mpsc::Sender<Fetched>,
+) -> Result<()> {
+    let (mut body, length): (Box<dyn Read>, Option<u64>) = match local {
+        true => {
+            let file = fs::File::open(url).with_context(|| format!("copying {url}"))?;
+            let length = file.metadata().ok().map(|m| m.len());
+            (Box::new(file), length)
+        }
+        false => {
+            // GitHub answers an asset with a redirect to its storage, which
+            // the agent follows.
+            let response = agent(Duration::from_secs(600))
+                .get(url)
+                .call()
+                .with_context(|| format!("downloading {url}"))?;
+            let length = response.body().content_length();
+            (Box::new(response.into_body().into_reader()), length)
+        }
+    };
+    let _ = tx.send(Fetched::Length(length));
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            bail!("interrupted");
+        }
+        let n = match body.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {url}")),
+        };
+        if stop.load(Ordering::SeqCst) {
+            bail!("interrupted");
+        }
+        out.write_all(&buf[..n])
+            .with_context(|| format!("writing {}", part.display()))?;
+        let _ = tx.send(Fetched::Read(n as u64));
+    }
+}
+
+/// A download's progress bar on stderr, named `name`, out of `total` bytes
+/// when that is known.
+fn progress_bar(name: &str, total: Option<u64>) -> indicatif::ProgressBar {
+    use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+    let (bar, template) = match total {
+        Some(total) => (
+            ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr()),
+            "  {msg:<18} [{bar:30}] {bytes:>10} / {total_bytes:<10} {bytes_per_sec:>12}  {eta}",
+        ),
+        None => (
+            ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr()),
+            "  {msg:<18} {spinner} {bytes:>10} {bytes_per_sec:>12}",
+        ),
+    };
+    if let Ok(style) = ProgressStyle::with_template(template) {
+        bar.set_style(style.progress_chars("=> "));
+    }
+    bar.set_message(name.to_string());
+    bar
 }
 
 impl Source {
@@ -969,6 +1218,31 @@ pub fn wanted(source: &Source, say: &mut dyn FnMut(&str)) -> Release {
     })
 }
 
+/// The release `tag` (`v0.1.6`, or `0.1.6`) from `source`, for `basert
+/// superfluid install <release>`: from GitHub, as the listing names it, when
+/// it serves this engine.
+fn named_release(source: &Source, tag: &str) -> Result<Release> {
+    let tag = format!("v{}", tag.trim_start_matches('v'));
+    if release_key(&tag).is_none() {
+        bail!("{tag} is not a superfluid release (e.g. v0.1.6)");
+    }
+    if let Source::Dir(_) = source {
+        return Ok(Release {
+            tag,
+            urls: Vec::new(),
+        });
+    }
+    let target = target()?;
+    let is_it = |r: &serde_json::Value| {
+        r["tag_name"].as_str().map(|t| t.trim_start_matches('v')) == Some(&tag[1..])
+    };
+    newest_where(&releases()?, target, ENGINE_ABI, &is_it).with_context(|| {
+        format!(
+            "the superfluid releases name no {tag} that serves engine ABI {ENGINE_ABI} on {target}"
+        )
+    })
+}
+
 /// superfluid's release listing, or the one `$BASERT_SUPERFLUID_RELEASES` names.
 pub(crate) fn releases() -> Result<serde_json::Value> {
     let named = std::env::var(RELEASES_ENV).ok().filter(|v| !v.is_empty());
@@ -985,12 +1259,17 @@ pub fn newest_for(abi: u32) -> Result<Option<Release>> {
 /// A release listing in GitHub's form, from a URL or a file.
 pub(crate) fn read_listing(at: &str) -> Result<serde_json::Value> {
     let text = if at.starts_with("https://") || at.starts_with("http://") {
-        agent(Duration::from_secs(60))
-            .get(at)
-            .header("Accept", "application/vnd.github+json")
-            .call()
-            .and_then(|r| r.into_body().read_to_string())
-            .with_context(|| format!("reading the release listing {at}"))?
+        // In a thread of its own, so that a Ctrl-C an automatic update caught
+        // need not wait for a server gone quiet.
+        let url = at.to_string();
+        crate::selfupdate::interruptible(move || {
+            agent(Duration::from_secs(60))
+                .get(&url)
+                .header("Accept", "application/vnd.github+json")
+                .call()
+                .and_then(|r| r.into_body().read_to_string())
+                .with_context(|| format!("reading the release listing {url}"))
+        })?
     } else {
         fs::read_to_string(at).with_context(|| format!("reading the release listing {at}"))?
     };
@@ -1011,15 +1290,45 @@ pub fn newest_where(
     abi: u32,
     keep: &dyn Fn(&serde_json::Value) -> bool,
 ) -> Option<Release> {
+    choosable(listing, target, abi)
+        .into_iter()
+        .filter(|(entry, ..)| keep(entry))
+        .max_by(|a, b| a.1.cmp(&b.1))
+        .map(|(_, _, release)| release)
+}
+
+/// The releases [`newest_in`] chooses from, newest first, each with when the
+/// listing says it was published (`published_at`, empty when it says not).
+pub fn serving(listing: &serde_json::Value, target: &str, abi: u32) -> Vec<(Release, String)> {
+    let mut found = choosable(listing, target, abi);
+    found.sort_by(|a, b| b.1.cmp(&a.1));
+    found
+        .into_iter()
+        .map(|(entry, _, release)| {
+            let published = entry["published_at"].as_str().unwrap_or_default();
+            (release, published.to_string())
+        })
+        .collect()
+}
+
+/// The entries of a listing that are neither drafts nor pre-releases and
+/// publish, for `target`, the tarball, its checksum and the marker of engine
+/// ABI `abi`, each with its release number and what to fetch.
+fn choosable<'a>(
+    listing: &'a serde_json::Value,
+    target: &str,
+    abi: u32,
+) -> Vec<(&'a serde_json::Value, Vec<u64>, Release)> {
     let tarball = format!("superfluid-{target}.tar.gz");
     let checksum = format!("{tarball}.sha256");
     let marker = format!("superfluid-basert-abi-{abi}.txt");
-    listing
-        .as_array()?
+    let Some(entries) = listing.as_array() else {
+        return Vec::new();
+    };
+    entries
         .iter()
         .filter(|r| !r["draft"].as_bool().unwrap_or(false))
         .filter(|r| !r["prerelease"].as_bool().unwrap_or(false))
-        .filter(|r| keep(r))
         .filter_map(|r| {
             let tag = r["tag_name"].as_str()?;
             let assets = r["assets"].as_array()?;
@@ -1030,6 +1339,7 @@ pub fn newest_where(
             };
             named(&marker)?;
             Some((
+                r,
                 release_key(tag)?,
                 Release {
                     tag: tag.to_string(),
@@ -1037,8 +1347,7 @@ pub fn newest_where(
                 },
             ))
         })
-        .max_by(|a, b| a.0.cmp(&b.0))
-        .map(|(_, release)| release)
+        .collect()
 }
 
 /// `v0.1.3` as `[0, 1, 3]`; `None` for a tag that is not a release number.
@@ -1421,6 +1730,62 @@ mod tests {
                 "superfluid"
             ]
         );
+    }
+
+    #[test]
+    fn going_back_to_an_older_release_holds_automatic_updates_until_a_newer_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let assets = release(tmp.path(), "0.1.3", true);
+        let install = Install {
+            root: tmp.path().join("sf").join("superfluid"),
+            origin: Origin::UserData,
+        };
+        let put = |tag: &str| {
+            let release = Release {
+                tag: tag.to_string(),
+                urls: Vec::new(),
+            };
+            install
+                .install(&Source::Dir(assets.clone()), &release, &mut |_| {})
+                .unwrap();
+        };
+        put("v0.1.9");
+        assert_eq!(install.held_back(), None);
+        assert!(install.owned_by_basert());
+        put("v0.1.3");
+        assert_eq!(install.held_back().as_deref(), Some("v0.1.9"));
+        // Further back: still held to the newest it left.
+        put("v0.1.2");
+        assert_eq!(install.held_back().as_deref(), Some("v0.1.9"));
+        // Forward to it, or past it: let go.
+        put("v0.1.10");
+        assert_eq!(install.held_back(), None);
+        // The file is beside the install, which it replaces whole.
+        assert!(install.replaceable(None).is_ok());
+        fs::write(install.root.join(INSTALLED_BY), "someone: else\n").unwrap();
+        assert!(!install.owned_by_basert());
+    }
+
+    #[test]
+    fn an_install_a_start_holds_is_in_use_until_it_lets_go() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = install_at(tmp.path().join("superfluid"));
+        // A child another test forks holds the lock's file until it execs:
+        // let go is waited for a moment.
+        let free = || {
+            (0..50).any(|_| {
+                let free = !install.in_use();
+                if !free {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                free
+            })
+        };
+        assert!(free());
+        let held = install.hold().unwrap();
+        assert!(install.in_use());
+        drop(held);
+        assert!(free());
     }
 
     #[test]

@@ -6,7 +6,7 @@ long_description = (here / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="baseRT",
-    version="0.5.4",
+    version="0.5.5",
     description="Python bindings for the BaseRT LLM inference engine",
     long_description=long_description,
     long_description_content_type="text/markdown",
