@@ -51,9 +51,12 @@ From 0.5.5, a command run in a terminal may first update basert (an install
 the script made, then running on the new release) or the Superfluid it runs,
 to a newer release the day's look found. A Homebrew, global npm, pipx, uv or
 cargo install is updated by its manager in the background once the command is
-done; for pip, a line names the command. `--no-update` on any command skips
-that for one run, `BASERT_NO_UPDATE=1` for a shell, and
-`basert self auto-update off` for every command. Commands that only tell
+done; for pip, a line names the command. A release is taken as soon as it is
+out; `basert self auto-update wait <days>` waits that many days after it
+first. `--no-update` on any command turns off the day's look, the update and
+the line saying a release is out for one run, `BASERT_NO_UPDATE=1` for a
+shell, and `basert self auto-update off` turns off the update for every
+command (the line stays). Commands that only tell
 something (`self`, `--help`, `--version`, `list`, `inspect`, `verify`,
 `superfluid`, anything with `--json`) never update. See
 [Updating](../getting-started/installation.md#updating).

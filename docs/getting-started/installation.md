@@ -126,9 +126,9 @@ Notes:
 
 From 0.5.5, basert updates itself. Once a day, a command run in a terminal
 looks for a newer release, in a process of its own so that the command does
-not wait on it. A release is taken once it is three days old, so that early
-reports land first, and only when a Superfluid release that old serves its
-engine. The next command updates to it.
+not wait on it. A release is taken as soon as it is out, and only when a
+Superfluid release that is out serves its engine (or once both have been out
+the [wait](#the-wait), when one is set). The next command updates to it.
 
 An install the script made updates in the foreground, with a progress bar for
 the engine and for Superfluid, then runs the command on the new release:
@@ -180,7 +180,8 @@ than Superfluid.
 - **Homebrew, a global npm, pipx, uv or cargo.** When the install is yours
   (no root needed to change it) and (except for cargo) no server runs on its
   engine, basert runs that manager's update in the background once the
-  command is done, once per release and pinned to that release, and prints
+  command is done, once per release and pinned to that release (the newest
+  one out, by the [wait](#the-wait)), and prints
   one line:
   `Updating basert 0.5.4 → 0.5.5 with Homebrew in the background (log: …)`.
   While a server runs on its engine, it gets the line below instead (except
@@ -203,40 +204,66 @@ than Superfluid.
 ### Turning automatic updates off
 
 Each of these updates, and each line naming a command, links the release
-notes and says how to turn automatic updates off. Three switches do:
+notes and, while automatic updates are on, says how to turn them off. These
+switches do:
 
-| Switch | Turns them off for |
-| --- | --- |
-| `basert self auto-update off` | every command, from now on (`on` turns them back on; with no argument it says which, and why when off) |
-| `BASERT_NO_UPDATE=1` | a shell, a service, a script |
-| `--no-update` on any command | that one run |
+| Switch | What it turns off | For |
+| --- | --- | --- |
+| `basert self auto-update off` | updates; the once-a-day line saying a newer release is out stays | every command, from now on (`on` turns them back on; with no argument it says which, why when off, and the wait) |
+| `BASERT_NO_UPDATE=1` (or `BASERT_NO_UPDATE_CHECK=1`) | the daily look, updates and the line | a shell, a service, a script |
+| `--no-update` on any command | the daily look, updates and the line | that one run |
 
-With these, the once-a-day line saying a newer release is out stays.
-`BASERT_NO_UPDATE_CHECK=1` turns automatic updates off too, and the daily
-look and the line with them. `basert self auto-update off` writes
+These mean what `superfluid self auto-update off`, `SUPERFLUID_NO_UPDATE=1`
+and Superfluid's `--no-update` mean. `basert self auto-update off` writes
 `"autoUpdate": false` to `settings.json` in basert's config directory
 (`~/Library/Application Support/baseRT` on macOS, `~/.config/baseRT` on
-Linux; `BASERT_CONFIG_DIR` instead). A `settings.json` that cannot be read,
-or whose `autoUpdate` is neither `true` nor `false`, leaves automatic updates
-off, and `basert self auto-update` says why.
+Linux; `BASERT_CONFIG_DIR` instead).
 
 Nothing updates without a terminal on stderr (an app such as Superfluid
 Desktop, a service), with `CI` set, as root (`sudo basert …`), or for a
 command that only tells something (`basert self …`, `--help`, `--version`,
 `list`, `inspect`, `verify`, `superfluid`, anything with `--json`).
 
+### The wait
+
+By default a release is taken as soon as it is out. To let a release be out a
+while first, so that early reports land before it reaches this machine:
+
+```sh
+basert self auto-update wait 3   # automatic updates wait 3 days after a release
+basert self auto-update wait 0   # automatic updates install a release as soon as it is out
+basert self auto-update          # automatic updates: on · a release installs once it has been out 3 days
+```
+
+The wait is `updateWaitDays` in the same `settings.json`, a whole number of
+days from 0 to 365, counted from a release's publication. Automatic updates,
+a package manager's update in the background (and the release it is pinned
+to), basert's own Superfluid and the line saying a newer release is out all go
+by it, and a basert release counts as out only once a Superfluid release that
+serves its engine has been out as long. `BASERT_UPDATE_WAIT_DAYS=<days>` sets
+the wait for a shell or a service instead (a value that is not such a number
+is ignored, and the setting is used), and `basert self auto-update` says so:
+`automatic updates: on · a release installs once it has been out 7 days (BASERT_UPDATE_WAIT_DAYS is set)`.
+
+A `settings.json` that cannot be read, whose `autoUpdate` is neither `true`
+nor `false`, or whose `updateWaitDays` is not a whole number from 0 to 365,
+leaves automatic updates off, and `basert self auto-update` says why (a newer
+release is then announced as soon as it is out). `basert self auto-update wait
+<days>` mends the wait; a file that is not JSON is never written over.
+
 ### By hand, and going back
 
 ```sh
-basert self check            # is a newer release out?
+basert self check            # is a newer release out? (and what an automatic update takes)
 basert self update           # install the newest now, with the Superfluid it needs
 basert self update --dry-run # say what would change, change nothing
 basert self update --version 0.5.4   # go to a specific release, older ones too
 ```
 
-`basert self update` goes to the newest release at once, three days old or
-not. For an install the script made, releases sit side by side under
-`~/.basert/versions/`:
+`basert self update` goes to the newest release at once, whatever the wait;
+`basert self check` names it and, when the wait holds it back, what an
+automatic update takes instead. For an install the script made, releases sit
+side by side under `~/.basert/versions/`:
 
 ```sh
 basert self list             # versions installed, and which is in use
@@ -365,9 +392,10 @@ basert superfluid status
 | `BASERT_HF_READ_TIMEOUT_SECS` | How long a download may stall before it is retried | `60` |
 | `BASERT_HF_MAX_RETRIES` | Retries per chunk (`0` fails on the first error) | `5` |
 | `BASERT_HF_XET` | Use Xet's CAS path for large files (deduplicated, but cannot resume) | unset |
-| `BASERT_NO_UPDATE` | Set to `1` to turn automatic updates off; the daily line saying a newer release is out stays (see [Updating](#updating)) | unset |
-| `BASERT_NO_UPDATE_CHECK` | Set to `1` to stop the daily look for a newer release: no automatic update and no line | unset |
-| `BASERT_CONFIG_DIR` | Where basert keeps `settings.json` (the `autoUpdate` setting) | `~/Library/Application Support/baseRT` (macOS), `~/.config/baseRT` (Linux) |
+| `BASERT_NO_UPDATE` | Set to `1` to turn off the daily look for a newer release, automatic updates and the line saying one is out, as `SUPERFLUID_NO_UPDATE` does for Superfluid (see [Updating](#turning-automatic-updates-off)) | unset |
+| `BASERT_NO_UPDATE_CHECK` | The same as `BASERT_NO_UPDATE` | unset |
+| `BASERT_UPDATE_WAIT_DAYS` | A whole number of days from 0 to 365: how long after a release is published automatic updates, and the line saying it is out, wait for it, over `updateWaitDays` in `settings.json`; any other value is ignored (see [The wait](#the-wait)) | the setting (`0`: as soon as it is out) |
+| `BASERT_CONFIG_DIR` | Where basert keeps `settings.json` (the `autoUpdate` and `updateWaitDays` settings) | `~/Library/Application Support/baseRT` (macOS), `~/.config/baseRT` (Linux) |
 | `BASERT_SUPERFLUID_AUTO_INSTALL` | `0` forbids `basert serve` to download Superfluid; `1` downloads without asking | ask in a terminal |
 | `BASERT_SUPERFLUID_DIR` | A directory of its own to run and install Superfluid in | see [above](#superfluid-the-server) |
 

@@ -43,7 +43,8 @@ keeps its state in basert's state directory (see [State](#state)), not in
 
 From 0.5.5, basert keeps the Superfluid it installed up to date by itself. A
 `basert` command run in a terminal brings it to the newest release that serves
-the engine, three days after that release is out, in the foreground and with a
+the engine, as soon as that release is out (or once it has been out the days
+`basert self auto-update wait <days>` sets), in the foreground and with a
 link to the release notes; when basert updates itself, Superfluid comes along
 in the same update. A Superfluid a server runs from is not replaced until no
 server uses it. `basert self auto-update off`, `BASERT_NO_UPDATE=1` or

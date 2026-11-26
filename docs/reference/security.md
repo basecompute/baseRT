@@ -60,9 +60,13 @@ key policies, the request log and putting a server on a network.
   automatic update reads them again, downloads the baseRT bundle and the
   Superfluid release that serves its engine from those repositories' GitHub
   releases, and checks their SHA-256. A Homebrew, npm, pipx, uv or cargo
-  install is updated by that manager, from its own registry.
-  `basert self auto-update off`, `BASERT_NO_UPDATE=1` or `--no-update` turn
-  the updates off; `BASERT_NO_UPDATE_CHECK=1` turns off the daily read as
+  install is updated by that manager, from its own registry. By default an
+  update takes a release as soon as it is out;
+  `basert self auto-update wait <days>` (or `BASERT_UPDATE_WAIT_DAYS`) has it
+  wait until a release has been out that many days, so that a bad release can
+  be reported and pulled before it reaches the machine.
+  `basert self auto-update off` turns the updates off; `BASERT_NO_UPDATE=1`
+  (or `BASERT_NO_UPDATE_CHECK=1`) or `--no-update` turn off the daily read as
   well. Nothing is read or updated without a terminal on stderr (an app, a
   service). See [Updating](../getting-started/installation.md#updating).
 

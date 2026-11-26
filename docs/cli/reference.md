@@ -4,8 +4,9 @@ Every `basert` command and its flags, as of BaseRT 0.5.1, with the automatic
 updates of 0.5.5. Run `basert <command> --help` for the authoritative,
 version-specific list.
 
-Any command also takes `--no-update` (from 0.5.5): don't update basert or
-Superfluid automatically on this run. See
+Any command also takes `--no-update` (from 0.5.5): don't look for a newer
+release, update basert or Superfluid automatically, or say a release is out,
+on this run. See
 [Updating](../getting-started/installation.md#updating).
 
 ---
@@ -166,10 +167,11 @@ release is out; see [Updating](../getting-started/installation.md#updating).
 | Command | Purpose |
 | --- | --- |
 | `basert self update` | Install the newest release for this machine and make it the one in use, with the Superfluid it needs. |
-| `basert self check` | Say whether a newer release exists, without installing it. |
+| `basert self check` | Say whether a newer release exists, without installing it, and, when the wait holds it back, what an automatic update would take. |
 | `basert self list` | The versions installed here, and which is in use. |
 | `basert self use <version>` | Make an installed version the one in use (the one it replaces stays). Automatic updates then leave it in use until a release newer than the one it replaced is out. |
-| `basert self auto-update [on\|off]` | Say whether automatic updates are on (and, when off, which switch turned them off); `on` or `off` turns them on or off for every command (`autoUpdate` in `settings.json` in basert's config directory, or `$BASERT_CONFIG_DIR`). |
+| `basert self auto-update [on\|off]` | Say whether automatic updates are on (and, when off, which switch turned them off) and the wait; `on` or `off` turns them on or off for every command (`autoUpdate` in `settings.json` in basert's config directory, or `$BASERT_CONFIG_DIR`). |
+| `basert self auto-update wait <days>` | Have a release count as out, for automatic updates and the line saying one is, only that many days (0 to 365) after it is published (`updateWaitDays` in `settings.json`; 0, the default, takes a release as soon as it is out). `BASERT_UPDATE_WAIT_DAYS` sets it for a shell instead. `basert self update` takes the newest release at once, whatever the wait. |
 | `basert self install --from <dir>` | Place an unpacked release bundle and make it the one in use (what the install script runs). |
 
 `basert self update` flags:

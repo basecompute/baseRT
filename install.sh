@@ -509,9 +509,10 @@ if [ -n "$placer" ]; then
   # From 0.5.5 basert updates itself; an older release named by BASERT_VERSION does not.
   if "$INSTALL_DIR/basert" self auto-update --help >/dev/null 2>&1; then
     echo "  Updates: basert updates itself, with the superfluid it needs: a command run"
-    echo "  in a terminal installs a newer release once it is three days old."
-    echo "    basert self auto-update off   # turn that off (--no-update skips one run)"
-    echo "    basert self update            # the newest release, now"
+    echo "  in a terminal installs a newer release as soon as it is out."
+    echo "    basert self auto-update wait 3   # wait 3 days after a release first"
+    echo "    basert self auto-update off      # turn that off (--no-update skips one run)"
+    echo "    basert self update               # the newest release, now"
   else
     echo "  Later: basert self update   # the newest release, and the superfluid it needs"
   fi

@@ -80,9 +80,10 @@ This installs the prebuilt engine for your platform and the `basert` CLI to
 `~/.basert` and adds it to your `PATH`. Restart your shell afterward (or
 `export PATH="$HOME/.basert:$PATH"`). basert keeps itself and Superfluid up
 to date: from 0.5.5, a command run in a terminal updates to a newer release
-once it is three days old, with a link to its release notes
-(`basert self auto-update off` turns that off, `basert self update` updates
-now). See [Updating](docs/getting-started/installation.md#updating).
+as soon as it is out, with a link to its release notes
+(`basert self auto-update wait <days>` waits that many days after a release
+first, `basert self auto-update off` turns that off, `basert self update`
+updates now). See [Updating](docs/getting-started/installation.md#updating).
 
 Or use a package manager:
 
@@ -174,7 +175,8 @@ runs Superfluid, installing it on first use.
 | `basert computearena` | Run a ComputeArena benchmark and save a signed report |
 | `basert superfluid install [<release>]` / `status` | Install or check the server `basert serve` runs, or (from 0.5.5) go back to an earlier release |
 | `basert self update` / `check` / `list` / `use` | Update basert now, or switch between installed versions |
-| `basert self auto-update [on\|off]` | Say whether automatic updates are on, or turn them on or off (`--no-update` skips them for one run) |
+| `basert self auto-update [on\|off]` | Say whether automatic updates are on (and the wait), or turn them on or off (`--no-update` turns them, and the line saying a release is out, off for one run) |
+| `basert self auto-update wait <days>` | Wait that many days after a release before an automatic update takes it (default 0: as soon as it is out) |
 
 Full flag reference: [CLI reference](docs/cli/reference.md).
 
