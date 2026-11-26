@@ -30,6 +30,10 @@ import zipfile
 from pathlib import Path
 
 
+# What these tests run of basert never updates it, nor looks for an update.
+os.environ.setdefault("BASERT_NO_UPDATE", "1")
+os.environ.setdefault("BASERT_NO_UPDATE_CHECK", "1")
+
 ROOT = Path(__file__).resolve().parents[2]
 STAGE = ROOT / "packaging" / "stage-engine.sh"
 BASERT_JS = ROOT / "packaging" / "npm" / "basert.js"
@@ -753,6 +757,8 @@ esac
             "HOME": str(self.tmp / "home"),
             "BASERT_INSTALL_DIR": str(self.dest),
             "BASERT_NO_MODIFY_PATH": "1",
+            "BASERT_NO_UPDATE": "1",
+            "BASERT_NO_UPDATE_CHECK": "1",
             "BASERT_INSTALL_TEST_ROOT": str(self.root),
             "STUB_OS": os_name,
             "STUB_ARCH": arch,

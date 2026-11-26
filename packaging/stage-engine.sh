@@ -6,8 +6,10 @@
 #   packaging/stage-engine.sh basert-engine-macos-arm64-0.4.1.tar.gz out/engine ['<manager>: <command>']
 #
 # The third argument, when given, is written beside the launcher as
-# `installed-by`: `basert self update` then leaves the copy to that package
-# manager and names the command, and the notice of a newer release names it too.
+# `installed-by`: basert then updates the copy with that package manager
+# (`basert self update` runs its command after asking, and automatic updates
+# run it in the background; for pip the command is only named), and the
+# notice of a newer release names it too.
 #
 # Keeping the release layout matters: the `basert` launcher finds the
 # `basert-*` runtime tools next to itself, and those find their kernel files

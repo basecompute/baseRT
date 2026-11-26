@@ -83,6 +83,25 @@ basert complete <model> --prompt <text>              # one-shot completion
 basert bench    <model>                              # throughput benchmark
 ```
 
+## Updates
+
+```
+basert self check                # is a newer release out?
+basert self update               # update now
+basert self auto-update [on|off] # automatic updates: say which (and the wait), or turn them on or off
+basert self auto-update wait 3   # wait 3 days after a release (default 0: as soon as it is out)
+```
+
+basert updates itself. Once a release is out (or has been out the wait:
+`updateWaitDays` in `settings.json`, `BASERT_UPDATE_WAIT_DAYS` for a shell),
+the next `basert` command run on a terminal updates it. A
+`cargo install basert-cli` copy is updated in the background once that
+command is done, with `cargo install basert-cli --version <that version>`
+(a build from source, a few minutes), its output in `auto-update.log` in
+basert's state directory. `basert self auto-update off` turns this off and
+leaves a daily line naming the release; `BASERT_NO_UPDATE=1` or `--no-update`
+(one run) turn off the daily look, the update and the line.
+
 ## Converter subcommands
 
 ```

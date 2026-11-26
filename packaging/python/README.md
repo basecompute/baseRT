@@ -24,6 +24,21 @@ basert chat Qwen/Qwen3-4B      # chat in the terminal
 basert serve Qwen/Qwen3-4B --api-key "$(uuidgen)" --port 8080   # OpenAI-compatible API
 ```
 
+### Updates
+
+basert does not change a Python environment itself: it may be a project's,
+pinned by a lock file. Once a release is out, a `basert` command run on a
+terminal prints, once a day, the command that updates it
+(`python -m pip install --upgrade basert` with that environment's python)
+and a link to the release notes. A pipx or uv tool install is updated in the
+background, pinned to that release (`pipx install --force basert==<version>`
+or `uv tool install basert==<version>`); `basert self update` runs
+`pipx upgrade basert` or `uv tool upgrade basert` after asking.
+`basert self auto-update wait <days>` (or `BASERT_UPDATE_WAIT_DAYS`) waits that
+many days after a release first (default 0). `basert self auto-update off`
+turns automatic updates off and leaves the line; `BASERT_NO_UPDATE=1` or
+`--no-update` (one run) turn off the daily look and the line as well.
+
 ## Python
 
 ```python

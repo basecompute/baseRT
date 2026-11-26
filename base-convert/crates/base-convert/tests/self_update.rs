@@ -21,8 +21,13 @@ use tempfile::TempDir;
 const HERE: &str = env!("CARGO_PKG_VERSION");
 
 fn next_version() -> String {
+    version_after(1)
+}
+
+/// The version `n` patches after the one under test.
+fn version_after(n: u64) -> String {
     let mut parts: Vec<u64> = HERE.split('.').map(|p| p.parse().unwrap()).collect();
-    *parts.last_mut().unwrap() += 1;
+    *parts.last_mut().unwrap() += n;
     parts
         .iter()
         .map(u64::to_string)
@@ -34,6 +39,7 @@ fn platform() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "macos-arm64",
         ("linux", "aarch64") => "linux-arm64-cuda",
+        ("linux", "x86_64") => "linux-x64-rocm",
         other => panic!("no basert release for {other:?}"),
     }
 }
@@ -159,12 +165,18 @@ impl Fixture {
 
     /// A basert release `version` for this platform whose engine states `abi`.
     fn release(&mut self, version: &str, abi: u32) {
+        self.release_at(version, abi, "2026-01-01T00:00:00Z");
+    }
+
+    /// [`Fixture::release`], published at `published`. Its launcher says
+    /// what it was asked to run, and the version an update came from.
+    fn release_at(&mut self, version: &str, abi: u32, published: &str) {
         let tree = self.path(&format!("build-{version}"));
         fs::create_dir_all(&tree).unwrap();
         engine_files(&tree, version, abi);
         executable(
             &tree.join("basert"),
-            &format!("#!/bin/sh\n[ \"$1\" = --version ] && echo \"basert {version}\" && exit 0\necho \"basert {version}: $*\"\n"),
+            &format!("#!/bin/sh\n[ \"$1\" = --version ] && echo \"basert {version}\" && exit 0\necho \"basert {version}: $*${{BASERT_UPDATED_FROM:+ (updated from $BASERT_UPDATED_FROM)}}\"\n"),
         );
         let assets = self.path(&format!("assets-{version}"));
         fs::create_dir_all(&assets).unwrap();
@@ -185,7 +197,7 @@ impl Fixture {
         fs::write(&marker, format!("{abi}\n")).unwrap();
         self.releases.push(serde_json::json!({
             "tag_name": format!("v{version}"),
-            "published_at": "2026-01-01T00:00:00Z",
+            "published_at": published,
             "draft": false,
             "prerelease": false,
             "assets": listed_assets(&[&tarball, &checksum, &marker]),
@@ -269,6 +281,9 @@ impl Fixture {
             .env("BASERT_RELEASES", &listing)
             .env("BASERT_SUPERFLUID_RELEASES", &sf_listing)
             .env("BASERT_NO_UPDATE_CHECK", "1")
+            .env("BASERT_NO_UPDATE", "1")
+            .env("BASERT_CONFIG_DIR", self.path("config"))
+            .env_remove("BASERT_UPDATED_FROM")
             // `basert serve` speculates by default, which reads the catalog:
             // the bundled one, not the Hub's.
             .env("BASERT_CATALOG_OFFLINE", "1")
@@ -1652,4 +1667,974 @@ fn a_server_on_the_engine_basert_lib_names_keeps_its_version() {
     assert_eq!(second, 0, "{out2}{err2}");
     assert_eq!(f.current().as_deref(), Some("0.0.1"));
     assert!(kept, "{}", engine.display());
+}
+
+// --- automatic updates ----------------------------------------------------------
+
+/// A pseudo-terminal: its controller, which this test reads, and the
+/// terminal a command writes to.
+fn pty() -> (fs::File, fs::File) {
+    use std::os::fd::FromRawFd;
+    // ptsname's buffer is shared by the threads tests run on.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    // SAFETY: each call is checked; the name ptsname returns is copied at once.
+    unsafe {
+        // Both close on exec: the processes other tests start meanwhile take
+        // no copy of the terminal, whose last copy closing ends the read of
+        // what it showed. (The command's stderr is its own copy, made at
+        // its start.) macOS's posix_openpt takes no O_CLOEXEC.
+        let controller = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(controller >= 0, "posix_openpt");
+        assert_eq!(
+            libc::fcntl(controller, libc::F_SETFD, libc::FD_CLOEXEC),
+            0,
+            "close on exec"
+        );
+        assert_eq!(libc::grantpt(controller), 0, "grantpt");
+        assert_eq!(libc::unlockpt(controller), 0, "unlockpt");
+        let name = std::ffi::CStr::from_ptr(libc::ptsname(controller)).to_owned();
+        let terminal = libc::open(
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        );
+        assert!(terminal >= 0, "opening {name:?}");
+        let size = libc::winsize {
+            ws_row: 40,
+            ws_col: 160,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        libc::ioctl(terminal, libc::TIOCSWINSZ, &size);
+        (
+            fs::File::from_raw_fd(controller),
+            fs::File::from_raw_fd(terminal),
+        )
+    }
+}
+
+/// What a terminal showed, as lines: escape sequences out, and each redraw
+/// of a progress bar a line of its own.
+fn shown(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let mut plain = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        plain.push(if c == '\r' { '\n' } else { c });
+    }
+    plain
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `command` run with a terminal for its stderr and nothing on stdin: its
+/// exit code, its stdout, and what the terminal showed.
+fn on_terminal(mut command: Command) -> (i32, String, String) {
+    use std::io::Read;
+    let (mut controller, terminal) = pty();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(terminal));
+    let child = command.spawn().unwrap();
+    // The terminal's last copy here: the controller reads to its end once
+    // the command (and what it started on it) is done.
+    drop(command);
+    let reader = std::thread::spawn(move || {
+        let (mut raw, mut buf) = (Vec::new(), [0u8; 4096]);
+        while let Ok(n) = controller.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+        raw
+    });
+    let out = child.wait_with_output().unwrap();
+    let raw = reader.join().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        shown(&raw),
+    )
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+const DAY: u64 = 24 * 60 * 60;
+
+impl Fixture {
+    /// The day's look done already: it found basert `newest`, out long ago.
+    fn looked(&self, newest: &str) {
+        self.looked_with(newest, None);
+    }
+
+    /// [`Fixture::looked`], and the newest superfluid that serves this engine.
+    fn looked_with(&self, newest: &str, superfluid: Option<&str>) {
+        self.looked_out(newest, superfluid, 0);
+    }
+
+    /// [`Fixture::looked_with`], both out since `out_at`.
+    fn looked_out(&self, newest: &str, superfluid: Option<&str>, out_at: u64) {
+        let state = self.path("state");
+        fs::create_dir_all(&state).unwrap();
+        let superfluids: Vec<_> = superfluid
+            .map(|tag| serde_json::json!({ "version": tag, "out_at": out_at }))
+            .into_iter()
+            .collect();
+        fs::write(
+            state.join("update-check.json"),
+            serde_json::json!({
+                "checked_at": now_secs(),
+                "releases": [{ "version": newest, "out_at": out_at }],
+                "superfluid_releases": superfluids,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// `launcher <args>` with automatic updates as a user has them: none of
+    /// the switches that turn them off, the way CI and the fixture set them.
+    fn as_a_user(&self, launcher: &Path, args: &[&str]) -> Command {
+        let mut command = self.command(launcher, args, &[]);
+        command
+            .env_remove("BASERT_NO_UPDATE_CHECK")
+            .env_remove("BASERT_NO_UPDATE")
+            .env_remove("CI")
+            .env("TERM", "xterm-256color");
+        command
+    }
+
+    fn keygen_args(&self, name: &str) -> Vec<String> {
+        vec![
+            "keygen".into(),
+            "--out".into(),
+            self.path("keys").display().to_string(),
+            "--name".into(),
+            name.into(),
+        ]
+    }
+}
+
+fn strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+#[test]
+fn an_automatic_update_takes_the_newest_settled_release_brings_superfluid_and_runs_the_command_on_it(
+) {
+    let mut f = Fixture::in_place();
+    let next = next_version();
+    let too_new = version_after(2);
+    let unserved = version_after(3);
+    f.release(HERE, 1);
+    f.release(&next, 1);
+    // Published in the future: not out yet.
+    f.release_at(&too_new, 1, "2099-01-01T00:00:00Z");
+    // Its engine states an ABI no superfluid release serves.
+    f.release(&unserved, 2);
+    f.superfluid_release("v0.1.4", 1);
+    f.looked(&next);
+
+    let args = f.keygen_args("k");
+    let (code, out, term) = on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&args)));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        term.contains(&format!(
+            "Updating basert {HERE} → {next} · release notes: \
+             https://github.com/basecompute/baseRT/releases/tag/v{next}"
+        )),
+        "{term}"
+    );
+    // Progress bars for the engine and for superfluid, which comes with it.
+    assert!(
+        term.lines()
+            .any(|l| l.contains(&format!("basert {next}")) && l.contains("[")),
+        "{term}"
+    );
+    assert!(
+        term.lines()
+            .any(|l| l.contains("superfluid v0.1.4") && l.contains("[")),
+        "{term}"
+    );
+    assert!(!term.contains("downloading"), "{term}");
+    assert!(
+        term.contains(&format!(
+            "basert {next} is in use · `basert self use {HERE}` goes back · \
+             `basert self auto-update off` turns automatic updates off"
+        )),
+        "{term}"
+    );
+    assert_eq!(f.current().as_deref(), Some(next.as_str()));
+    assert_eq!(f.superfluid_release_installed(), "v0.1.4");
+    // The command ran again, on the new release, which knows where it came from.
+    assert_eq!(
+        out.trim(),
+        format!("basert {next}: {} (updated from {HERE})", args.join(" "))
+    );
+    assert!(!f.path("keys").exists(), "{term}");
+
+    // Back to the version before: automatic updates leave it there.
+    let old = f.version_dir(HERE).join("basert");
+    let (code, _, err) = f.run(&old, &["use", HERE]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains(&format!(
+            "automatic updates leave {HERE} in use until a release newer than {next} is out"
+        )),
+        "{err}"
+    );
+    let (code, out, term) = on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&args)));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(!term.contains("Updating"), "{term}");
+    assert_eq!(f.current().as_deref(), Some(HERE));
+    assert!(f.path("keys").join("k.pub").is_file(), "{term}");
+}
+
+#[test]
+fn a_failed_automatic_update_says_so_runs_the_command_here_and_waits_for_the_next_look() {
+    let mut f = Fixture::in_place();
+    let next = next_version();
+    f.release(&next, 1);
+    f.looked(&next);
+    // Another `basert self` holds the layout (this test's pid stands in for it).
+    fs::create_dir_all(f.root.join("versions")).unwrap();
+    fs::write(
+        f.root.join("versions").join(".lock"),
+        format!("{}\n", std::process::id()),
+    )
+    .unwrap();
+
+    let args = f.keygen_args("k");
+    let (code, out, term) = on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&args)));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        term.contains(&format!(
+            "couldn't update basert to {next}: another `basert self` (pid {}) is changing",
+            std::process::id()
+        )),
+        "{term}"
+    );
+    assert!(term.contains(&format!("; staying on {HERE}")), "{term}");
+    // The command ran here.
+    assert!(f.path("keys").join("k.pub").is_file(), "{term}");
+    assert!(f.current().is_none());
+
+    // Not tried again before the next look, nor said again that day.
+    fs::remove_file(f.root.join("versions").join(".lock")).unwrap();
+    let args = f.keygen_args("k2");
+    let (code, out, term) = on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&args)));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        !term.contains("Updating") && !term.contains("couldn't"),
+        "{term}"
+    );
+    assert!(f.path("keys").join("k2.pub").is_file(), "{term}");
+
+    // Offline: the listing cannot be read.
+    f.looked(&next);
+    let mut command = f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("k3")));
+    command.env("BASERT_RELEASES", f.path("nowhere.json"));
+    let (code, out, term) = on_terminal(command);
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        term.contains(&format!(
+            "couldn't update basert to {next}: reading the release listing"
+        )),
+        "{term}"
+    );
+    assert!(f.path("keys").join("k3.pub").is_file(), "{term}");
+    assert!(f.current().is_none());
+}
+
+#[test]
+fn the_setting_leaves_a_notice_and_no_update_leaves_nothing() {
+    let mut f = Fixture::in_place();
+    let next = next_version();
+    f.release(&next, 1);
+    let notice = format!(
+        "basert {next} is available (this is {HERE}): `basert self update` installs it · \
+         release notes: https://github.com/basecompute/baseRT/releases/tag/v{next}"
+    );
+
+    // `--no-update`, on any command, anywhere before a `--`: taken out
+    // before the command reads its arguments, and no update, look or line.
+    f.looked(&next);
+    let mut args = f.keygen_args("a");
+    args.insert(1, "--no-update".into());
+    let (code, out, term) = on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&args)));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(f.path("keys").join("a.pub").is_file(), "{term}");
+    assert!(
+        !term.contains("Updating") && !term.contains("available"),
+        "{term}"
+    );
+
+    // BASERT_NO_UPDATE the same, as SUPERFLUID_NO_UPDATE for superfluid.
+    f.looked(&next);
+    let mut command = f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("b")));
+    command.env("BASERT_NO_UPDATE", "1");
+    let (code, out, term) = on_terminal(command);
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        !term.contains("Updating") && !term.contains("available"),
+        "{term}"
+    );
+
+    // The setting.
+    let status = |f: &Fixture, env: &[(&str, &str)]| {
+        let mut command = f.as_a_user(&f.root.join("basert"), &["self", "auto-update"]);
+        command.envs(env.iter().copied());
+        let out = command.output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        status(&f, &[]),
+        "automatic updates: on · a release installs as soon as it is out"
+    );
+    let (code, out, err) = f.launch(&f.root.join("basert"), &["self", "auto-update", "off"]);
+    assert_eq!(code, 0, "{err}");
+    // The fixture's own BASERT_NO_UPDATE is what this run says.
+    assert_eq!(
+        out.trim(),
+        "automatic updates: off (BASERT_NO_UPDATE is set) · a release installs as soon as \
+         it is out"
+    );
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.path("config").join("settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(settings, serde_json::json!({ "autoUpdate": false }));
+    assert_eq!(
+        status(&f, &[]),
+        "automatic updates: off (basert self auto-update off) · a release installs as soon \
+         as it is out"
+    );
+    assert_eq!(
+        status(&f, &[("BASERT_NO_UPDATE", "1")]),
+        "automatic updates: off (BASERT_NO_UPDATE is set) · a release installs as soon as \
+         it is out"
+    );
+    // Off: the line stays, with nothing to turn off.
+    f.looked(&next);
+    let (code, out, term) =
+        on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("c"))));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(!term.contains("Updating"), "{term}");
+    assert!(term.contains(&notice), "{term}");
+    assert!(!term.contains("turn off"), "{term}");
+    assert!(f.current().is_none());
+
+    // On again, but in CI, or a command that only tells something: no update.
+    let (code, _, err) = f.launch(&f.root.join("basert"), &["self", "auto-update", "on"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        status(&f, &[]),
+        "automatic updates: on · a release installs as soon as it is out"
+    );
+    f.looked(&next);
+    let mut command = f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("d")));
+    command.env("CI", "true");
+    let (code, out, term) = on_terminal(command);
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(!term.contains("Updating"), "{term}");
+    f.looked(&next);
+    let (_, _, term) = on_terminal(f.as_a_user(
+        &f.root.join("basert"),
+        &["inspect", f.path("none.base").to_str().unwrap()],
+    ));
+    assert!(!term.contains("Updating"), "{term}");
+    // Without a terminal (an app, a service): nothing, not even the notice.
+    f.looked(&next);
+    let out = f
+        .as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("e")))
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("Updating") && !err.contains("available"),
+        "{err}"
+    );
+    assert!(f.current().is_none());
+}
+
+#[test]
+fn a_release_is_neither_installed_nor_announced_until_it_has_been_out_the_wait() {
+    let mut f = Fixture::in_place();
+    let next = next_version();
+    f.release(HERE, 1);
+    f.release(&next, 1);
+    // Published a moment ago.
+    let too_new = version_after(2);
+    f.release_at(&too_new, 1, "2099-01-01T00:00:00Z");
+    f.superfluid_release("v0.1.4", 1);
+
+    let (code, out, err) = f.launch(
+        &f.root.join("basert"),
+        &["self", "auto-update", "wait", "3"],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), "automatic updates wait 3 days after a release");
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.path("config").join("settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(settings, serde_json::json!({ "updateWaitDays": 3 }));
+    let (code, _, err) = f.launch(
+        &f.root.join("basert"),
+        &["self", "auto-update", "wait", "366"],
+    );
+    assert_eq!(code, 2, "{err}");
+    let status = |env: &[(&str, &str)]| {
+        let mut command = f.as_a_user(&f.root.join("basert"), &["self", "auto-update"]);
+        command.envs(env.iter().copied());
+        let out = command.output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        status(&[]),
+        "automatic updates: on · a release installs once it has been out 3 days"
+    );
+    assert_eq!(
+        status(&[("BASERT_UPDATE_WAIT_DAYS", "0")]),
+        "automatic updates: on · a release installs as soon as it is out \
+         (BASERT_UPDATE_WAIT_DAYS is set)"
+    );
+    assert_eq!(
+        status(&[("BASERT_UPDATE_WAIT_DAYS", "soon")]),
+        "automatic updates: on · a release installs once it has been out 3 days \
+         (BASERT_UPDATE_WAIT_DAYS=soon is not a whole number of days from 0 to 365, so the \
+         setting is used)"
+    );
+
+    // `self check` names the newest, and what an automatic update takes.
+    let (code, out, err) = f.run(&f.root.join("basert"), &["check"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains(&format!(
+            "the newest release is {too_new} (published 2099-01-01)"
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "an automatic update takes {next} (automatic updates wait 3 days after a release)"
+        )),
+        "{out}"
+    );
+
+    // Found by the day's look a day after it came out: under the wait, no
+    // update and no line.
+    f.looked_out(&next, None, now_secs() - DAY);
+    let (code, out, term) =
+        on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("a"))));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        !term.contains("Updating") && !term.contains("available"),
+        "{term}"
+    );
+    assert!(f.current().is_none());
+
+    // A shell that waits for nothing takes it at once.
+    let mut command = f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("b")));
+    command.env("BASERT_UPDATE_WAIT_DAYS", "0");
+    let (code, out, term) = on_terminal(command);
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        term.contains(&format!("Updating basert {HERE} → {next}")),
+        "{term}"
+    );
+    assert_eq!(f.current().as_deref(), Some(next.as_str()));
+}
+
+/// The fixture's brew (see [`package_copy`]) offering basert `version`, and
+/// logging, with what it is asked, whether Homebrew updates itself first.
+fn homebrew_offers(f: &Fixture, version: &str) {
+    executable(
+        &f.path("brew/bin/brew"),
+        &format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = info ]; then echo '{{\"formulae\":[{{\"versions\":{{\"stable\":\"{version}\"}}}}]}}'; exit 0; fi\n\
+             echo \"$*|${{PATH%%:*}}|$HOMEBREW_NO_AUTO_UPDATE\" >> {}\n",
+            f.path("manager.log").display()
+        ),
+    );
+}
+
+/// The manager's log once it is there (it runs once the command is done).
+fn wait_for_manager(f: &Fixture) -> String {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while manager_log(f).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    manager_log(f)
+}
+
+#[test]
+fn a_homebrew_formula_of_another_release_than_the_one_chosen_is_not_upgraded() {
+    let mut f = Fixture::in_place();
+    let next = next_version();
+    f.release(&next, 1);
+    let exe = package_copy(
+        &f,
+        "brew/Cellar/basert/0.4.3/libexec",
+        Some("Homebrew: brew upgrade basert"),
+        "brew/bin/brew",
+    );
+    // Its tap has a release out today, still in its first days.
+    homebrew_offers(&f, &version_after(2));
+    f.looked(&next);
+    let (code, out, term) = on_terminal(f.as_a_user(&exe, &strs(&f.keygen_args("a"))));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(term.contains("with Homebrew in the background"), "{term}");
+    let log = f.path("state").join("auto-update.log");
+    let said = format!(
+        "Homebrew's basert is {}, not {next}: `brew upgrade basert` is left to you",
+        version_after(2)
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !fs::read_to_string(&log).unwrap_or_default().contains(&said) && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        fs::read_to_string(&log).unwrap().contains(&said),
+        "{}",
+        fs::read_to_string(&log).unwrap()
+    );
+    assert_eq!(manager_log(&f), "");
+}
+
+#[test]
+fn a_global_npm_copy_is_updated_in_the_background_to_the_release_chosen() {
+    let mut f = Fixture::in_place();
+    let next = next_version();
+    f.release(&next, 1);
+    let exe = package_copy(
+        &f,
+        "node/lib/node_modules/@basecompute/basert-darwin-arm64/engine",
+        Some("npm: npm install --global @basecompute/basert@latest"),
+        "node/bin/npm",
+    );
+    f.looked(&next);
+    let (code, out, term) = on_terminal(f.as_a_user(&exe, &strs(&f.keygen_args("a"))));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        term.contains(&format!(
+            "Updating basert {HERE} → {next} with npm in the background"
+        )),
+        "{term}"
+    );
+    let bin = fs::canonicalize(f.path("node/bin")).unwrap();
+    // Not the registry's latest, which may be in its first days: the release
+    // the look chose.
+    assert_eq!(
+        wait_for_manager(&f).trim(),
+        format!(
+            "install --global @basecompute/basert@{next}|{}",
+            bin.display()
+        ),
+        "{}",
+        fs::read_to_string(f.path("state").join("auto-update.log")).unwrap_or_default()
+    );
+}
+
+#[test]
+fn turning_automatic_updates_off_while_a_managers_update_waits_cancels_it() {
+    let mut f = Fixture::in_place();
+    let next = next_version();
+    f.release(&next, 1);
+    let exe = package_copy(
+        &f,
+        "node/lib/node_modules/@basecompute/basert-darwin-arm64/engine",
+        Some("npm: npm install --global @basecompute/basert@latest"),
+        "node/bin/npm",
+    );
+    // A launch queued npm's update and is still running its command.
+    let state = f.path("state");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("update-check.json"),
+        serde_json::json!({
+            "checked_at": now_secs(),
+            "releases": [{ "version": next, "out_at": 0 }],
+            "started": next,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut launch = Command::new("sleep").arg("60").spawn().unwrap();
+    let log = state.join("auto-update.log");
+    let npm = f.path("node/bin/npm").display().to_string();
+    let pinned = format!("@basecompute/basert@{next}");
+    let pid = launch.id().to_string();
+    let dir = exe.parent().unwrap().display().to_string();
+    let mut waiter = f.command(
+        &exe,
+        &[
+            "self",
+            "run-manager",
+            "--after",
+            &pid,
+            "--dir",
+            &dir,
+            "--release",
+            &next,
+            "--manager",
+            "npm",
+            "--",
+            &npm,
+            "install",
+            "--global",
+            &pinned,
+        ],
+        &[],
+    );
+    // As start_detached runs it.
+    waiter
+        .env_remove("BASERT_NO_UPDATE")
+        .env_remove("CI")
+        .stdout(fs::File::create(&log).unwrap())
+        .stderr(Stdio::null());
+    let mut waiter = waiter.spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        waiter.try_wait().unwrap().is_none(),
+        "it waits for the launch"
+    );
+
+    let (code, _, err) = f.launch(&exe, &["self", "auto-update", "off"]);
+    assert_eq!(code, 0, "{err}");
+    launch.kill().unwrap();
+    launch.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = waiter.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the waiter did not finish");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let said = fs::read_to_string(&log).unwrap();
+    assert!(status.success(), "{said}");
+    assert_eq!(manager_log(&f), "", "{said}");
+    assert!(
+        said.contains(&format!(
+            "automatic updates are off (basert self auto-update off): basert {next} is not \
+             installed"
+        )),
+        "{said}"
+    );
+    let check: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(state.join("update-check.json")).unwrap())
+            .unwrap();
+    assert_eq!(check["started"], serde_json::Value::Null, "{check}");
+    assert_eq!(
+        check["releases"][0]["version"],
+        serde_json::json!(next),
+        "{check}"
+    );
+}
+
+#[test]
+fn a_homebrew_copy_is_updated_in_the_background_once_and_a_pip_copy_is_told() {
+    let mut f = Fixture::in_place();
+    let next = next_version();
+    f.release(&next, 1);
+    let exe = package_copy(
+        &f,
+        "brew/Cellar/basert/0.4.3/libexec",
+        Some("Homebrew: brew upgrade basert"),
+        "brew/bin/brew",
+    );
+    homebrew_offers(&f, &next);
+    f.looked(&next);
+    let (code, out, term) = on_terminal(f.as_a_user(&exe, &strs(&f.keygen_args("a"))));
+    assert_eq!(code, 0, "{out}{term}");
+    let log = f.path("state").join("auto-update.log");
+    assert!(
+        term.contains(&format!(
+            "Updating basert {HERE} → {next} with Homebrew in the background (log: {}) · \
+             release notes: https://github.com/basecompute/baseRT/releases/tag/v{next} · \
+             turn off: basert self auto-update off",
+            log.display()
+        )),
+        "{term}"
+    );
+    // The command ran on this copy, and brew once it was done.
+    assert!(f.path("keys").join("a.pub").is_file(), "{term}");
+    wait_for_manager(&f);
+    // Without updating Homebrew first: what it said it offers is what comes.
+    assert!(
+        manager_log(&f).starts_with("upgrade basert|") && manager_log(&f).ends_with("|1\n"),
+        "{}",
+        manager_log(&f)
+    );
+    assert!(fs::read_to_string(&log)
+        .unwrap()
+        .contains(&format!("basert {HERE} -> {next}: ")));
+
+    // Once per release.
+    let (code, out, term) = on_terminal(f.as_a_user(&exe, &strs(&f.keygen_args("b"))));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(!term.contains("Updating"), "{term}");
+    assert_eq!(manager_log(&f).lines().count(), 1);
+
+    // pip's environment is not basert's to change: the notice names its command.
+    let pip = package_copy(
+        &f,
+        "venv/lib/python3.12/site-packages/baseRT/_engine",
+        Some("pip: pip install --upgrade basert"),
+        "venv/bin/python",
+    );
+    f.looked(&next);
+    let (code, out, term) = on_terminal(f.as_a_user(&pip, &strs(&f.keygen_args("c"))));
+    assert_eq!(code, 0, "{out}{term}");
+    let python = fs::canonicalize(f.path("venv/bin/python")).unwrap();
+    assert!(
+        term.contains(&format!(
+            "basert {next} is available (this is {HERE}): `{} -m pip install --upgrade basert` \
+             installs it · release notes: https://github.com/basecompute/baseRT/releases/tag/v{next} \
+             · turn off: basert self auto-update off",
+            python.display()
+        )),
+        "{term}"
+    );
+    assert_eq!(manager_log(&f).lines().count(), 1);
+}
+
+#[test]
+fn an_install_this_user_cannot_change_is_told_of_a_newer_release_not_updated() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::in_place();
+    let next = next_version();
+    f.release(&next, 1);
+    f.looked(&next);
+    // A root another user owns, or one this user cannot write: the same here.
+    fs::set_permissions(&f.root, fs::Permissions::from_mode(0o555)).unwrap();
+    let (code, out, term) =
+        on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("a"))));
+    fs::set_permissions(&f.root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        !term.contains("Updating") && !term.contains("couldn't"),
+        "{term}"
+    );
+    assert!(
+        term.contains(&format!(
+            "basert {next} is available (this is {HERE}): `basert self update` installs it"
+        )),
+        "{term}"
+    );
+    assert!(f.current().is_none());
+}
+
+// --- superfluid, basert being the newest ------------------------------------------
+
+/// The fixture with basert the newest release, and superfluid v0.1.4 (which
+/// serves this engine) out and found by the day's look; v0.1.3 is installed.
+fn newer_superfluid_only() -> Fixture {
+    let mut f = Fixture::in_place();
+    f.release(HERE, 1);
+    f.superfluid_release("v0.1.4", 1);
+    f.looked_with(HERE, Some("v0.1.4"));
+    f
+}
+
+#[test]
+fn a_newer_superfluid_comes_by_itself_when_basert_is_the_newest_and_goes_back_when_asked() {
+    let f = newer_superfluid_only();
+    let args = f.keygen_args("k");
+    let (code, out, term) = on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&args)));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        term.contains(
+            "Updating superfluid v0.1.3 → v0.1.4 · release notes: \
+             https://github.com/basecompute/superfluid/releases/tag/v0.1.4"
+        ),
+        "{term}"
+    );
+    assert!(
+        term.lines()
+            .any(|l| l.contains("superfluid v0.1.4") && l.contains("[")),
+        "{term}"
+    );
+    assert!(!term.contains("downloading"), "{term}");
+    assert!(
+        term.contains(
+            "superfluid v0.1.4 is in use · `basert superfluid install v0.1.3` goes back · \
+             `basert self auto-update off` turns automatic updates off"
+        ),
+        "{term}"
+    );
+    assert_eq!(f.superfluid_release_installed(), "v0.1.4");
+    // The command ran here, on the basert it was: nothing of basert changed.
+    assert!(f.path("keys").join("k.pub").is_file(), "{term}");
+    assert!(fs::symlink_metadata(f.root.join("basert"))
+        .unwrap()
+        .is_file());
+    assert!(f.current().is_none());
+
+    // The way back it named; automatic updates then leave it there.
+    let (code, out, err) = f.launch(&f.root.join("basert"), &["superfluid", "install", "v0.1.3"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert_eq!(f.superfluid_release_installed(), "v0.1.3");
+    f.looked_with(HERE, Some("v0.1.4"));
+    let (code, out, term) =
+        on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("k2"))));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(!term.contains("Updating"), "{term}");
+    assert_eq!(f.superfluid_release_installed(), "v0.1.3");
+}
+
+#[test]
+fn a_newer_superfluid_waits_while_a_server_runs_from_the_one_installed() {
+    let f = newer_superfluid_only();
+    let mut server = stand_in_server(&f, &f.root.join("superfluid/libexec/superfluid"));
+    let (code, out, term) =
+        on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("a"))));
+    let installed = f.superfluid_release_installed();
+    let (code2, out2, term2) =
+        on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("b"))));
+    let _ = server.kill();
+    let _ = server.wait();
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        term.contains("superfluid v0.1.4 is out, but a server runs from ")
+            && term.contains(&format!(
+                "(pid {}): v0.1.3 stays until no server uses it",
+                server.id()
+            )),
+        "{term}"
+    );
+    assert!(
+        !term.contains("Updating") && !term.contains("couldn't"),
+        "{term}"
+    );
+    assert_eq!(installed, "v0.1.3");
+    assert!(f.path("keys").join("a.pub").is_file(), "{term}");
+    // Said once a day; not a failure.
+    assert_eq!(code2, 0, "{out2}{term2}");
+    assert!(!term2.contains("superfluid v0.1.4"), "{term2}");
+
+    // The server gone, the next command updates it.
+    let (code, out, term) =
+        on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("c"))));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(term.contains("superfluid v0.1.4 is in use"), "{term}");
+    assert_eq!(f.superfluid_release_installed(), "v0.1.4");
+}
+
+#[test]
+fn a_failed_automatic_superfluid_update_says_so_and_waits_for_the_next_look() {
+    let f = newer_superfluid_only();
+    // Its download is not the file it publishes.
+    let name = format!("superfluid-{}.tar.gz", superfluid_target());
+    fs::write(
+        f.path("sf-assets-v0.1.4").join(format!("{name}.sha256")),
+        format!("{}  {name}\n", "0".repeat(64)),
+    )
+    .unwrap();
+    let (code, out, term) =
+        on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("a"))));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        term.contains("couldn't update superfluid to v0.1.4: ")
+            && term.contains("; staying on v0.1.3"),
+        "{term}"
+    );
+    assert_eq!(f.superfluid_release_installed(), "v0.1.3");
+    assert!(f.path("keys").join("a.pub").is_file(), "{term}");
+    // Nothing is left beside it.
+    let left: Vec<_> = fs::read_dir(&f.root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with(".superfluid-new"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+
+    // Not tried again before the next look.
+    let (code, out, term) =
+        on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("b"))));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        !term.contains("Updating") && !term.contains("couldn't"),
+        "{term}"
+    );
+}
+
+#[test]
+fn no_update_leaves_a_newer_superfluid_alone_and_ci_to_a_notice() {
+    let f = newer_superfluid_only();
+    let notice = "superfluid v0.1.4, the server `basert serve` runs, is available (installed: \
+                  v0.1.3): `basert self update` installs it";
+    // `--no-update` and BASERT_NO_UPDATE: no update, and no line either.
+    let mut args = f.keygen_args("a");
+    args.insert(1, "--no-update".into());
+    let (code, out, term) = on_terminal(f.as_a_user(&f.root.join("basert"), &strs(&args)));
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        !term.contains("Updating") && !term.contains("available"),
+        "{term}"
+    );
+
+    f.looked_with(HERE, Some("v0.1.4"));
+    let mut command = f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("c")));
+    command.env("BASERT_NO_UPDATE", "1");
+    let (code, out, term) = on_terminal(command);
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        !term.contains("Updating") && !term.contains("available"),
+        "{term}"
+    );
+
+    // CI: the line.
+    f.looked_with(HERE, Some("v0.1.4"));
+    let mut command = f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("b")));
+    command.env("CI", "true");
+    let (code, out, term) = on_terminal(command);
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(!term.contains("Updating"), "{term}");
+    assert!(term.contains(notice), "{term}");
+
+    // A wait the release has not been out: no update, no line.
+    f.looked_out(HERE, Some("v0.1.4"), now_secs() - DAY);
+    let mut command = f.as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("w")));
+    command.env("BASERT_UPDATE_WAIT_DAYS", "2");
+    let (code, out, term) = on_terminal(command);
+    assert_eq!(code, 0, "{out}{term}");
+    assert!(
+        !term.contains("Updating") && !term.contains("available"),
+        "{term}"
+    );
+
+    f.looked_with(HERE, Some("v0.1.4"));
+    let out = f
+        .as_a_user(&f.root.join("basert"), &strs(&f.keygen_args("d")))
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("Updating") && !err.contains("available"),
+        "{err}"
+    );
+    assert_eq!(f.superfluid_release_installed(), "v0.1.3");
 }

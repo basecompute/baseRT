@@ -30,6 +30,19 @@ basert chat Qwen/Qwen3-4B      # chat in the terminal
 basert serve Qwen/Qwen3-4B --api-key "$(uuidgen)" --port 8080   # OpenAI-compatible API
 ```
 
+### Updates
+
+A global install updates itself: once a release is out, the next `basert`
+command run on a terminal starts
+`npm install --global @basecompute/basert@<that version>` in the background
+and says so, with a link to the release notes. A project's dependency, or a
+global folder that needs root to write, is not basert's to update: basert
+prints a line naming the command instead.
+`basert self auto-update wait <days>` (or `BASERT_UPDATE_WAIT_DAYS`) waits that
+many days after a release first (default 0). `basert self auto-update off`
+turns this off and leaves a daily line naming the release; `BASERT_NO_UPDATE=1`
+or `--no-update` (one run) turn off the daily look, the update and the line.
+
 ## Node.js
 
 ```typescript
