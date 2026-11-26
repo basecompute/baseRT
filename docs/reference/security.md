@@ -53,6 +53,18 @@ key policies, the request log and putting a server on a network.
   `BASERT_SUPERFLUID_AUTO_INSTALL=0` forbids that download; install ahead of
   time with `basert superfluid install`.
 - The server itself fetches nothing and runs no update check.
+- From 0.5.5, a `basert` command run in a terminal starts, at most once a
+  day, a background process that reads two release listings from
+  `api.github.com`, without credentials: baseRT's (`basecompute/baseRT`) and
+  Superfluid's (`basecompute/superfluid`). When a newer release is found, an
+  automatic update reads them again, downloads the baseRT bundle and the
+  Superfluid release that serves its engine from those repositories' GitHub
+  releases, and checks their SHA-256. A Homebrew, npm, pipx, uv or cargo
+  install is updated by that manager, from its own registry.
+  `basert self auto-update off`, `BASERT_NO_UPDATE=1` or `--no-update` turn
+  the updates off; `BASERT_NO_UPDATE_CHECK=1` turns off the daily read as
+  well. Nothing is read or updated without a terminal on stderr (an app, a
+  service). See [Updating](../getting-started/installation.md#updating).
 
 ## Model integrity
 

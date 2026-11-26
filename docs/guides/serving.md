@@ -41,13 +41,23 @@ A Superfluid you installed yourself is not run in its place, and the server
 keeps its state in basert's state directory (see [State](#state)), not in
 `~/.superfluid`.
 
+From 0.5.5, basert keeps the Superfluid it installed up to date by itself. A
+`basert` command run in a terminal brings it to the newest release that serves
+the engine, three days after that release is out, in the foreground and with a
+link to the release notes; when basert updates itself, Superfluid comes along
+in the same update. A Superfluid a server runs from is not replaced until no
+server uses it. `basert self auto-update off`, `BASERT_NO_UPDATE=1` or
+`--no-update` turn this off. See
+[Updating](../getting-started/installation.md#superfluid-follows-the-engine).
+
 | Command | Purpose |
 | --- | --- |
 | `basert superfluid install` | Install the newest release that serves this engine ahead of time. Nothing to do when it is already there. |
 | `basert superfluid install --force` | Install again, even when that release or a newer one is there. |
+| `basert superfluid install <release>` | Install that release (e.g. `v0.2.1`) instead, an older one too: how to go back after an update. Automatic updates then leave it in place until a release newer than the one it replaced is out. |
 | `basert superfluid status` | Show the release basert was tested with, what is installed where, and whether it can serve this engine. Exits 0 when an install can serve, 1 when none is installed, 2 when none installed can serve. |
 | `basert serve --version` | Print basert's version and the Superfluid a start would run. |
-| `basert self update` | Update basert, and bring Superfluid to the newest release that serves the new engine. |
+| `basert self update` | Update basert now, and bring Superfluid to the newest release that serves the new engine. |
 
 | Environment variable | Effect |
 | --- | --- |
@@ -69,7 +79,9 @@ line and always adds:
 - A fresh request log at each start (`--sessions-cache`), no KV parking
   (`--no-park`), no terminal monitor (`--no-tui`), and no `x-superfluid-qos`
   header from clients (`--no-http-qos-header`).
-- Superfluid's own update check is off; basert updates it.
+- Superfluid's own update check is off (`SUPERFLUID_NO_UPDATE_CHECK=1`):
+  basert brings it forward automatically, and a running server never updates
+  itself.
 
 `--print-command` prints the command line a start would run, and exits.
 

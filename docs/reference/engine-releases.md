@@ -57,8 +57,10 @@ curl -LsSf https://basecompute.co/install.sh | sh
 ```
 
 `BASERT_VERSION=v0.5.0` installs a specific release instead of the latest.
-Once installed, `basert self update` moves to the newest release and `basert
-self use <version>` goes back to a kept one.
+Once installed, basert updates itself (from 0.5.5, see
+[Updating](../getting-started/installation.md#updating)), `basert self update`
+moves to the newest release now, and `basert self use <version>` goes back to
+a kept one.
 
 To unpack a bundle by hand, for example into a checkout's `build/` directory,
 where the bindings look by default:
@@ -76,9 +78,9 @@ On Linux, use `sha256sum -c` in place of `shasum -a 256 -c`.
 ## Verifying a release
 
 Each `.sha256` file holds the SHA-256 of its tarball in the format `shasum`
-and `sha256sum` check (`<hash>  <file name>`). `basert self update` checks the
-same hash before it switches to a release, and then checks that the new
-launcher runs and reports the expected version.
+and `sha256sum` check (`<hash>  <file name>`). `basert self update` and an
+automatic update check the same hash before they switch to a release, and
+then check that the new launcher runs and reports the expected version.
 
 ## Versioning
 

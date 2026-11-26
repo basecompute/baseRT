@@ -12,8 +12,9 @@ OpenAI-, Anthropic- and Ollama-compatible APIs — all through one CLI, `basert`
 - **Self-contained engine.** One prebuilt bundle per platform: install it
   with one command or your package manager and run.
 - **One CLI for everything.** `basert pull`, `basert chat`, `basert serve`,
-  `basert convert` — model management and runtime in one front-end, and
-  `basert self update` to stay current.
+  `basert convert` — model management and runtime in one front-end. basert
+  keeps itself and Superfluid up to date (`basert self auto-update off` turns
+  that off; `basert self update` updates by hand).
 - **A local API server.** `basert serve` runs
   [Superfluid](https://github.com/basecompute/superfluid), our open-source
   server: OpenAI-, Anthropic- and Ollama-compatible endpoints, tool calls,
@@ -41,7 +42,7 @@ curl -LsSf https://basecompute.co/install.sh | sh   # or: brew / pip / npm, see 
 basert pull basecompute/Qwen3-4B                     # download from the catalog
 basert chat basecompute/Qwen3-4B                     # interactive chat
 basert serve basecompute/Qwen3-4B --api-key "$(uuidgen)"   # API server on 127.0.0.1:8453
-basert self update                                   # the newest release
+basert self update                                   # the newest release now (basert also updates itself)
 ```
 
 ## How the pieces fit

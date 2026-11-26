@@ -124,36 +124,132 @@ Notes:
 
 ## Updating
 
-An install the script made updates itself:
+From 0.5.5, basert updates itself. Once a day, a command run in a terminal
+looks for a newer release, in a process of its own so that the command does
+not wait on it. A release is taken once it is three days old, so that early
+reports land first, and only when a Superfluid release that old serves its
+engine. The next command updates to it.
 
-```sh
-basert self check            # is a newer release out?
-basert self update           # install it, with the Superfluid it needs
-basert self update --dry-run # say what would change, change nothing
-basert self update --version 0.5.0   # go to a specific release, older ones too
+An install the script made updates in the foreground, with a progress bar for
+the engine and for Superfluid, then runs the command on the new release:
+
+```text
+Updating basert 0.5.4 → 0.5.5 · release notes: https://github.com/basecompute/baseRT/releases/tag/v0.5.5
+  basert 0.5.5       [==============================]  41.2 MiB / 41.2 MiB  …
+  superfluid v0.2.2  [==============================]  18.0 MiB / 18.0 MiB  …
+basert 0.5.5 is in use · `basert self use 0.5.4` goes back · `basert self auto-update off` turns automatic updates off
 ```
+
+When it cannot update (offline, another `basert self` command under way, a
+download or check that fails, Ctrl-C), it prints
+`couldn't update basert to 0.5.5: …; staying on 0.5.4`, runs the command on
+the version in use, and tries again after the next day's look. A server
+already running keeps the engine it started with; starting it again uses the
+new one.
 
 Each release is unpacked beside the current one, checked (its SHA-256, and
 that its launcher runs and is that version), and made current in one step, so
 the CLI, the runtime tools and the engine always change together. The version
-it replaces is kept:
+it replaces is kept for going back.
+
+### Superfluid follows the engine
+
+An update brings the Superfluid `basert serve` runs to the newest release
+that serves the new engine; when none serves it yet, basert stays where it
+is. When basert is already the newest, a newer Superfluid that serves its
+engine comes by itself the same way, in the foreground:
+
+```text
+Updating superfluid v0.2.1 → v0.2.2 · release notes: https://github.com/basecompute/superfluid/releases/tag/v0.2.2
+  superfluid v0.2.2  [==============================]  18.0 MiB / 18.0 MiB  …
+superfluid v0.2.2 is in use · `basert superfluid install v0.2.1` goes back · `basert self auto-update off` turns automatic updates off
+```
+
+A Superfluid a server runs from is never replaced: it stays until no server
+uses it, and the next command after that updates it. A Superfluid in a
+`BASERT_SUPERFLUID_DIR` that basert did not install is left alone.
+
+### A package manager's install
+
+- **Homebrew, a global npm, pipx, uv or cargo.** When the install is yours
+  (no root needed to change it) and no server runs on its engine, basert runs
+  that manager's update in the background once the command is done, once per
+  release and pinned to that release, and prints one line:
+  `Updating basert 0.5.4 → 0.5.5 with Homebrew in the background (log: …)`.
+  While a server runs on it, it gets the line below instead.
+  The commands are `brew upgrade basert` (only when the formula is that
+  release), `npm install --global @basecompute/basert@<version>`,
+  `pipx install --force basert==<version>`,
+  `uv tool install basert==<version>` and
+  `cargo install basert-cli --version <version>` (a build from source, a few
+  minutes). Their output goes to `auto-update.log` in basert's state
+  directory (`serve/` beside the model cache, or `BASERT_STATE_DIR`).
+- **pip, a project's npm dependency, an install another user owns or this
+  one cannot write, or a pinned Homebrew formula** is not basert's to change.
+  Once a day a line names the command that updates it, with the release
+  notes. For pip that is `pip install --upgrade basert` (as
+  `python -m pip install --upgrade basert` with that environment's python);
+  basert never runs it, since the environment may be a project's, pinned by a
+  lock file, or the system's.
+
+### Turning automatic updates off
+
+Each of these updates, and each line naming a command, links the release
+notes and says how to turn automatic updates off. Three switches do:
+
+| Switch | Turns them off for |
+| --- | --- |
+| `basert self auto-update off` | every command, from now on (`on` turns them back on; with no argument it says which, and why when off) |
+| `BASERT_NO_UPDATE=1` | a shell, a service, a script |
+| `--no-update` on any command | that one run |
+
+With these, the once-a-day line saying a newer release is out stays.
+`BASERT_NO_UPDATE_CHECK=1` turns automatic updates off too, and the daily
+look and the line with them. `basert self auto-update off` writes
+`"autoUpdate": false` to `settings.json` in basert's config directory
+(`~/Library/Application Support/baseRT` on macOS, `~/.config/baseRT` on
+Linux; `BASERT_CONFIG_DIR` instead). A `settings.json` that cannot be read,
+or whose `autoUpdate` is neither `true` nor `false`, leaves automatic updates
+off, and `basert self auto-update` says why.
+
+Nothing updates without a terminal on stderr (an app such as Superfluid
+Desktop, a service), with `CI` set, as root (`sudo basert …`), or for a
+command that only tells something (`basert self …`, `--help`, `--version`,
+`list`, `inspect`, `verify`, `superfluid`, anything with `--json`).
+
+### By hand, and going back
+
+```sh
+basert self check            # is a newer release out?
+basert self update           # install the newest now, with the Superfluid it needs
+basert self update --dry-run # say what would change, change nothing
+basert self update --version 0.5.4   # go to a specific release, older ones too
+```
+
+`basert self update` goes to the newest release at once, three days old or
+not. For an install the script made, releases sit side by side under
+`~/.basert/versions/`:
 
 ```sh
 basert self list             # versions installed, and which is in use
-basert self use 0.5.0        # switch back to an installed version
+basert self use 0.5.4        # switch back to an installed version
 ```
 
-When the installed Superfluid cannot serve the new engine, `self update`
-installs the newest Superfluid release that can first; when none can yet,
-nothing changes.
+After going back with `basert self use` or `basert self update --version`,
+automatic updates leave that version in use until a release newer than the
+one you left is out; `basert self update` goes forward now. The same holds
+for Superfluid: `basert superfluid install <release>` (for example
+`basert superfluid install v0.2.1`) goes back to that release, and automatic
+updates leave it in place until a release newer than the one it replaced is
+out.
 
-A command run in a terminal checks for a newer release once a day and prints
-one line when there is one. Set `BASERT_NO_UPDATE_CHECK=1` to turn this off.
-
-A copy Homebrew, npm, pip, pipx, uv or cargo installed belongs to that
-manager. `basert self update` runs the manager's own update after asking
-(`--yes` skips the question, and is needed without a terminal), for example
-`brew upgrade basert` or `pip install --upgrade basert`.
+For a Homebrew, npm, pipx, uv or cargo install, `basert self update` runs the
+manager's own update after asking (`--yes` skips the question, and is needed
+without a terminal): `brew upgrade basert`,
+`npm install --global @basecompute/basert@latest`, `pipx upgrade basert`,
+`uv tool upgrade basert` or `cargo install basert-cli`. For pip it names
+`pip install --upgrade basert` and runs nothing. `--version` is the
+manager's to choose there.
 
 ## Superfluid, the server
 
@@ -161,12 +257,17 @@ manager. `basert self update` runs the manager's own update after asking
 an open-source inference server, with the engine beside `basert`. The install
 script installs it. Otherwise the first `basert serve` installs the newest
 Superfluid release that serves this engine (asking first in a terminal). To
-do it ahead of time, or to check what is installed:
+do it ahead of time, to go back to an earlier release, or to check what is
+installed:
 
 ```sh
-basert superfluid install    # --force installs again
-basert superfluid status     # exit 0: an installed Superfluid can serve this engine
+basert superfluid install            # the newest release that serves this engine; --force installs again
+basert superfluid install v0.2.1     # this release instead, an older one too
+basert superfluid status             # exit 0: an installed Superfluid can serve this engine
 ```
+
+basert keeps the Superfluid it installed up to date with its own updates (see
+[Superfluid follows the engine](#superfluid-follows-the-engine)).
 
 Superfluid lives in `superfluid/` beside `basert` for an install-script,
 hand-extracted or source-built copy. A copy a package manager installed keeps
@@ -245,7 +346,7 @@ basert superfluid status
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `BASERT_MODELS_DIR` | Where pulled and converted models are cached | `~/Library/Caches/baseRT/models` (macOS), `~/.cache/baseRT/models` (Linux) |
-| `BASERT_STATE_DIR` | Where `basert serve` keeps its state (request log, uploaded files) | `serve/` beside the model cache |
+| `BASERT_STATE_DIR` | Where `basert serve` keeps its state (request log, uploaded files), and basert its update check and `auto-update.log` | `serve/` beside the model cache |
 | `BASERT_LIB` | Directory holding the engine library `basert serve` uses | beside `basert`, or its `../lib` |
 | `BASERT_LIB_PATH` | Full path to the engine library, for the Python and Node bindings | the bundled or installed engine |
 | `BASERT_LIB_DIR` | Directory holding the engine library, for the Rust and Swift bindings | the installed engine |
@@ -255,7 +356,9 @@ basert superfluid status
 | `BASERT_HF_READ_TIMEOUT_SECS` | How long a download may stall before it is retried | `60` |
 | `BASERT_HF_MAX_RETRIES` | Retries per chunk (`0` fails on the first error) | `5` |
 | `BASERT_HF_XET` | Use Xet's CAS path for large files (deduplicated, but cannot resume) | unset |
-| `BASERT_NO_UPDATE_CHECK` | Set to `1` to stop the daily check for a newer release | unset |
+| `BASERT_NO_UPDATE` | Set to `1` to turn automatic updates off; the daily line saying a newer release is out stays (see [Updating](#updating)) | unset |
+| `BASERT_NO_UPDATE_CHECK` | Set to `1` to stop the daily look for a newer release: no automatic update and no line | unset |
+| `BASERT_CONFIG_DIR` | Where basert keeps `settings.json` (the `autoUpdate` setting) | `~/Library/Application Support/baseRT` (macOS), `~/.config/baseRT` (Linux) |
 | `BASERT_SUPERFLUID_AUTO_INSTALL` | `0` forbids `basert serve` to download Superfluid; `1` downloads without asking | ask in a terminal |
 | `BASERT_SUPERFLUID_DIR` | A directory of its own to run and install Superfluid in | see [above](#superfluid-the-server) |
 
