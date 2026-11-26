@@ -248,7 +248,8 @@ is ignored, and the setting is used), and `basert self auto-update` says so:
 A `settings.json` that cannot be read, whose `autoUpdate` is neither `true`
 nor `false`, or whose `updateWaitDays` is not a whole number from 0 to 365,
 leaves automatic updates off, and `basert self auto-update` says why (a newer
-release is then announced as soon as it is out). `basert self auto-update wait
+release is still announced, after the wait when the wait can be read, else as
+soon as it is out). `basert self auto-update wait
 <days>` mends the wait; a file that is not JSON is never written over.
 
 ### By hand, and going back
