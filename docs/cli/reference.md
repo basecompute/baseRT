@@ -169,7 +169,7 @@ release is out; see [Updating](../getting-started/installation.md#updating).
 | `basert self check` | Say whether a newer release exists, without installing it. |
 | `basert self list` | The versions installed here, and which is in use. |
 | `basert self use <version>` | Make an installed version the one in use (the one it replaces stays). Automatic updates then leave it in use until a release newer than the one it replaced is out. |
-| `basert self auto-update [on\|off]` | Say whether basert updates itself when a newer release is out (and, when it does not, why); `on` or `off` turns that on or off for every command (`autoUpdate` in `settings.json` in basert's config directory, or `$BASERT_CONFIG_DIR`). |
+| `basert self auto-update [on\|off]` | Say whether automatic updates are on (and, when off, which switch turned them off); `on` or `off` turns them on or off for every command (`autoUpdate` in `settings.json` in basert's config directory, or `$BASERT_CONFIG_DIR`). |
 | `basert self install --from <dir>` | Place an unpacked release bundle and make it the one in use (what the install script runs). |
 
 `basert self update` flags:
@@ -190,7 +190,7 @@ server `basert serve` runs.
 
 | Command | Purpose |
 | --- | --- |
-| `basert superfluid install [RELEASE] [--force]` | Install the newest Superfluid release that serves this engine where `basert serve` looks for it. `RELEASE` (e.g. `v0.2.1`) installs that release instead, an older one too: what goes back after an update, and automatic updates then leave it in place until a release newer than the one it replaced is out. `--force` installs again even when that release, or a newer one, is there. |
+| `basert superfluid install [RELEASE] [--force]` | Install the newest Superfluid release that serves this engine where `basert serve` looks for it. `RELEASE` (from 0.5.5; e.g. `v0.2.1`) installs that release instead, an older one too, provided it serves this engine: what goes back after an update. Superfluid's own automatic updates then leave it in place until a release newer than the one it replaced is out (an update of basert itself still brings it to the newest release that serves the new engine). `--force` installs again even when that release, or a newer one, is there. |
 | `basert superfluid status` | Show the release this basert was tested with, what is installed where, and whether it can serve the engine. Exits 0 when an installed Superfluid can, 1 when none is installed, 2 when none installed can. |
 
 ---

@@ -172,9 +172,9 @@ runs Superfluid, installing it on first use.
 | `basert inspect <model>` | Dump a `.base` header + tensor inventory |
 | `basert sign` / `verify` / `keygen` | ed25519 signing of `.base` bundles |
 | `basert computearena` | Run a ComputeArena benchmark and save a signed report |
-| `basert superfluid install [<release>]` / `status` | Install or check the server `basert serve` runs, or go back to an earlier release |
+| `basert superfluid install [<release>]` / `status` | Install or check the server `basert serve` runs, or (from 0.5.5) go back to an earlier release |
 | `basert self update` / `check` / `list` / `use` | Update basert now, or switch between installed versions |
-| `basert self auto-update [on\|off]` | Say whether basert updates itself, or turn that on or off (`--no-update` skips it for one run) |
+| `basert self auto-update [on\|off]` | Say whether automatic updates are on, or turn them on or off (`--no-update` skips them for one run) |
 
 Full flag reference: [CLI reference](docs/cli/reference.md).
 

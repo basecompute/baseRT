@@ -156,8 +156,11 @@ it replaces is kept for going back.
 
 An update brings the Superfluid `basert serve` runs to the newest release
 that serves the new engine; when none serves it yet, basert stays where it
-is. When basert is already the newest, a newer Superfluid that serves its
-engine comes by itself the same way, in the foreground:
+is. When basert is not updated first (it is the newest, it is a package
+manager's to update, or you went back to an older one), a newer Superfluid
+that serves its engine comes by itself the same way, in the foreground. That
+includes the Superfluid in basert's data directory for a Homebrew, npm, pip,
+pipx, uv or cargo install:
 
 ```text
 Updating superfluid v0.2.1 → v0.2.2 · release notes: https://github.com/basecompute/superfluid/releases/tag/v0.2.2
@@ -167,16 +170,21 @@ superfluid v0.2.2 is in use · `basert superfluid install v0.2.1` goes back · `
 
 A Superfluid a server runs from is never replaced: it stays until no server
 uses it, and the next command after that updates it. A Superfluid in a
-`BASERT_SUPERFLUID_DIR` that basert did not install is left alone.
+`BASERT_SUPERFLUID_DIR` that basert did not install does not come forward by
+itself; an update of basert still brings it to the newest release that serves
+the new engine, as `basert self update` does, unless its directory holds more
+than Superfluid.
 
 ### A package manager's install
 
 - **Homebrew, a global npm, pipx, uv or cargo.** When the install is yours
-  (no root needed to change it) and no server runs on its engine, basert runs
-  that manager's update in the background once the command is done, once per
-  release and pinned to that release, and prints one line:
+  (no root needed to change it) and (except for cargo) no server runs on its
+  engine, basert runs that manager's update in the background once the
+  command is done, once per release and pinned to that release, and prints
+  one line:
   `Updating basert 0.5.4 → 0.5.5 with Homebrew in the background (log: …)`.
-  While a server runs on it, it gets the line below instead.
+  While a server runs on its engine, it gets the line below instead (except
+  cargo, which replaces only the launcher and runs anyway).
   The commands are `brew upgrade basert` (only when the formula is that
   release), `npm install --global @basecompute/basert@<version>`,
   `pipx install --force basert==<version>`,
@@ -239,9 +247,10 @@ After going back with `basert self use` or `basert self update --version`,
 automatic updates leave that version in use until a release newer than the
 one you left is out; `basert self update` goes forward now. The same holds
 for Superfluid: `basert superfluid install <release>` (for example
-`basert superfluid install v0.2.1`) goes back to that release, and automatic
-updates leave it in place until a release newer than the one it replaced is
-out.
+`basert superfluid install v0.2.1`) goes back to that release, and
+Superfluid's own automatic updates then leave it in place until a release
+newer than the one it replaced is out. An update of basert itself still brings
+it to the newest release that serves the new engine.
 
 For a Homebrew, npm, pipx, uv or cargo install, `basert self update` runs the
 manager's own update after asking (`--yes` skips the question, and is needed
@@ -262,7 +271,7 @@ installed:
 
 ```sh
 basert superfluid install            # the newest release that serves this engine; --force installs again
-basert superfluid install v0.2.1     # this release instead, an older one too
+basert superfluid install v0.2.1     # from 0.5.5: this release instead (one that serves this engine), an older one too
 basert superfluid status             # exit 0: an installed Superfluid can serve this engine
 ```
 

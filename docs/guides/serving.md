@@ -54,7 +54,7 @@ server uses it. `basert self auto-update off`, `BASERT_NO_UPDATE=1` or
 | --- | --- |
 | `basert superfluid install` | Install the newest release that serves this engine ahead of time. Nothing to do when it is already there. |
 | `basert superfluid install --force` | Install again, even when that release or a newer one is there. |
-| `basert superfluid install <release>` | Install that release (e.g. `v0.2.1`) instead, an older one too: how to go back after an update. Automatic updates then leave it in place until a release newer than the one it replaced is out. |
+| `basert superfluid install <release>` | From 0.5.5: install that release (e.g. `v0.2.1`) instead (one that serves this engine, an older one too): how to go back after an update. Superfluid's own automatic updates then leave it in place until a release newer than the one it replaced is out (an update of basert itself still brings it to the newest release that serves the new engine). |
 | `basert superfluid status` | Show the release basert was tested with, what is installed where, and whether it can serve this engine. Exits 0 when an install can serve, 1 when none is installed, 2 when none installed can serve. |
 | `basert serve --version` | Print basert's version and the Superfluid a start would run. |
 | `basert self update` | Update basert now, and bring Superfluid to the newest release that serves the new engine. |
