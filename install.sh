@@ -8,7 +8,8 @@
 # and Strix Point) — the engine library + the basert CLI and runtime tools,
 # installs it to ~/.basert, then adds it to your PATH. Each
 # release goes to ~/.basert/versions/<v>/ (from 0.4.3 on), and ~/.basert holds
-# links to the one in use, so `basert self update` updates it later and
+# links to the one in use, so basert updates itself later (from 0.5.5, a
+# command run in a terminal; `basert self update` by hand) and
 # `basert self use <v>` goes back. Re-running installs the target release the
 # same way; it skips the download when you're already on it, and a copy an
 # earlier run placed directly in ~/.basert is kept as the version to go back
@@ -505,7 +506,16 @@ echo "    basert chat basecompute/Qwen3-0.6B"
 echo "    basert serve basecompute/Qwen3-0.6B   # an OpenAI-compatible server"
 if [ -n "$placer" ]; then
   echo
-  echo "  Later: basert self update   # the newest release, and the superfluid it needs"
+  # From 0.5.5 basert updates itself; an older release named by BASERT_VERSION does not.
+  if "$INSTALL_DIR/basert" self auto-update --help >/dev/null 2>&1; then
+    echo "  Updates: basert updates itself, with the superfluid it needs: a command run"
+    echo "  in a terminal installs a newer release as soon as it is out."
+    echo "    basert self auto-update wait 3   # wait 3 days after a release first"
+    echo "    basert self auto-update off      # turn that off (--no-update skips one run)"
+    echo "    basert self update               # the newest release, now"
+  else
+    echo "  Later: basert self update   # the newest release, and the superfluid it needs"
+  fi
 fi
 echo
 echo "  Docs: https://github.com/$REPO"

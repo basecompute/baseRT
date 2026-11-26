@@ -1,7 +1,13 @@
 # Command reference
 
-Every `basert` command and its flags, as of BaseRT 0.5.1. Run
-`basert <command> --help` for the authoritative, version-specific list.
+Every `basert` command and its flags, as of BaseRT 0.5.1, with the automatic
+updates of 0.5.5. Run `basert <command> --help` for the authoritative,
+version-specific list.
+
+Any command also takes `--no-update` (from 0.5.5): don't look for a newer
+release, update basert or Superfluid automatically, or say a release is out,
+on this run. See
+[Updating](../getting-started/installation.md#updating).
 
 ---
 
@@ -154,15 +160,18 @@ See [Signing & verification](../guides/signing.md).
 
 ## `basert self`
 
-Update basert, or switch between the versions installed here. See
-[Updating](../getting-started/installation.md#updating).
+Update basert, switch between the versions installed here, or turn
+automatic updates on or off. From 0.5.5 basert updates itself when a newer
+release is out; see [Updating](../getting-started/installation.md#updating).
 
 | Command | Purpose |
 | --- | --- |
 | `basert self update` | Install the newest release for this machine and make it the one in use, with the Superfluid it needs. |
-| `basert self check` | Say whether a newer release exists, without installing it. |
+| `basert self check` | Say whether a newer release exists, without installing it, and, when the wait holds it back, what an automatic update would take. |
 | `basert self list` | The versions installed here, and which is in use. |
-| `basert self use <version>` | Make an installed version the one in use (the one it replaces stays). |
+| `basert self use <version>` | Make an installed version the one in use (the one it replaces stays). Automatic updates then leave it in use until a release newer than the one it replaced is out. |
+| `basert self auto-update [on\|off]` | Say whether automatic updates are on (and, when off, which switch turned them off) and the wait; `on` or `off` turns them on or off for every command (`autoUpdate` in `settings.json` in basert's config directory, or `$BASERT_CONFIG_DIR`). |
+| `basert self auto-update wait <days>` | Have a release count as out, for automatic updates and the line saying one is, only that many days (0 to 365) after it is published (`updateWaitDays` in `settings.json`; 0, the default, takes a release as soon as it is out). `BASERT_UPDATE_WAIT_DAYS` sets it for a shell instead. `basert self update` takes the newest release at once, whatever the wait. |
 | `basert self install --from <dir>` | Place an unpacked release bundle and make it the one in use (what the install script runs). |
 
 `basert self update` flags:
@@ -183,7 +192,7 @@ server `basert serve` runs.
 
 | Command | Purpose |
 | --- | --- |
-| `basert superfluid install [--force]` | Install the newest Superfluid release that serves this engine where `basert serve` looks for it. `--force` installs again even when that release, or a newer one, is there. |
+| `basert superfluid install [RELEASE] [--force]` | Install the newest Superfluid release that serves this engine where `basert serve` looks for it. `RELEASE` (from 0.5.5; e.g. `v0.2.1`) installs that release instead, an older one too, provided it serves this engine: what goes back after an update. Superfluid's own automatic updates then leave it in place until a release newer than the one it replaced is out (an update of basert itself still brings it to the newest release that serves the new engine). `--force` installs again even when that release, or a newer one, is there. |
 | `basert superfluid status` | Show the release this basert was tested with, what is installed where, and whether it can serve the engine. Exits 0 when an installed Superfluid can, 1 when none is installed, 2 when none installed can. |
 
 ---

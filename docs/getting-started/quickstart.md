@@ -150,8 +150,20 @@ More in [Converting models](../guides/converting.md).
 
 ## Stay up to date
 
+From 0.5.5, basert updates itself: once a release is out, the next `basert`
+command you run in a terminal installs it, with the
+Superfluid it needs, and prints a link to the release notes and how to go
+back. A Homebrew, npm, pipx, uv or cargo install is updated by its manager in
+the background; for a pip install, basert names the command instead. To
+update now, to wait a few days after a release first, or to turn automatic
+updates off:
+
 ```sh
-basert self update
+basert self update             # the newest release, now
+basert self auto-update wait 3 # wait 3 days after a release (0, the default: as soon as it is out)
+basert self auto-update off    # no automatic updates (`on` turns them back on)
 ```
 
-See [Updating](installation.md#updating).
+`--no-update` on any command, or `BASERT_NO_UPDATE=1`, turns off the daily
+look, the updates and the line saying a release is out for that run or that
+shell. See [Updating](installation.md#updating).
